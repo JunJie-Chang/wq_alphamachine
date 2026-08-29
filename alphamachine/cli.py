@@ -310,6 +310,14 @@ def cmd_select(args):
                       "turnover": r["turnover"]})
     print(f"{qualified} metric-gate passing candidate(s); "
           f"{len(cands)} submittable with usable PnL; selecting {args.n}")
+    if cands:
+        # A distinct, greppable marker for scripts/autoloop.py: a candidate
+        # that cleared BOTH the metric and deep gates is the rare event this
+        # whole pipeline exists to surface, worth paging for even mid-loop.
+        # Two full days of running produced zero of these before today.
+        best = max(cands, key=lambda c: c["sharpe"])
+        print(f"CLEARED_DEEP_GATE: {len(cands)} candidate(s), "
+              f"best sharpe={best['sharpe']:.2f} alpha={best['alpha_id']}")
     if blocked_deep:
         print(f"  {len(blocked_deep)} blocked by the deep gate "
               f"(yearly consistency / PROD_CORRELATION):")

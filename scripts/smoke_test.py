@@ -1122,6 +1122,102 @@ check("rebuild is one-time, not once per open",
 for _f in (db35, db36, db37, db38):
     os.remove(_f)
 
+print("\n[29] autoloop: never --live, and halt vs. real-bug classification")
+_scripts_dir = os.path.dirname(os.path.abspath(__file__))
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+import autoloop as _al
+
+# Static check on the safety boundary itself: no code path in the file
+# constructs a --live argument, checked outside any triple-quoted string so
+# the module docstring mentioning --live in prose does not count as a hit.
+_src29 = open(os.path.join(_scripts_dir, "autoloop.py")).read()
+_in_doc29, _hits29 = False, []
+for _ln in _src29.splitlines():
+    if _ln.count(chr(34) * 3) % 2 == 1:
+        _in_doc29 = not _in_doc29
+        continue
+    if not _in_doc29 and "--live" in _ln and not _ln.strip().startswith("#"):
+        _hits29.append(_ln)
+check("no code path in autoloop.py constructs --live",
+      _hits29 == [], f"{_hits29}")
+check("submit is invoked exactly once, with only --n",
+      _src29.count(chr(34) + "submit" + chr(34)) == 1
+      and '"--n", str(args.submit_n)' in _src29)
+
+
+class _P29:
+    """Stand-in for subprocess.Popen: an iterable .stdout, then .wait()/.poll()."""
+    def __init__(self, returncode, lines=()):
+        self.returncode = returncode
+        self.stdout = iter([ln + "\n" for ln in lines])
+        self._done = False
+    def wait(self):
+        self._done = True
+    def poll(self):
+        return self.returncode if self._done else None
+
+
+def _stub29(results):
+    calls = []
+    def popen(cmd, **kw):
+        calls.append(cmd)
+        return results[min(len(calls) - 1, len(results) - 1)]
+    return calls, popen
+
+
+_real_sleep29, _real_wait29 = _al.time.sleep, _al.wait_for_session
+_al.time.sleep = lambda s: None
+
+# A startup crash (BiometricRequired traceback, exit 1) is an auth block:
+# retried after the session comes back, not treated as a bug.
+calls, _al.subprocess.Popen = _stub29([
+    _P29(1, ["Traceback...", "alphamachine.client.BiometricRequired: spent"]),
+    _P29(0, ["scan done"])])
+_al.session_alive = lambda: True
+_al.run_stage(3, "scan", ["--budget", "10"])
+check("BiometricRequired traceback is retried, not fatal", len(calls) == 2)
+
+# A silent mid-run halt (exit 0, but a HALTED line) is ALSO an auth block --
+# the dangerous case, because nothing about the exit code says so.
+calls, _al.subprocess.Popen = _stub29([
+    _P29(0, ["10/25 done", "HALTED: BRAIN requires a biometric check"]),
+    _P29(0, ["25/25 done"])])
+_al.run_stage(3, "refine", ["--top", "25"])
+check("a HALTED line with exit 0 is caught, not silently accepted", len(calls) == 2)
+
+# A clean run must never wait or retry.
+calls, _al.subprocess.Popen = _stub29([_P29(0, ["3 candidate(s)"])])
+_waited29 = []
+_al.wait_for_session = lambda: _waited29.append(1)
+_al.run_stage(3, "select", ["--n", "10"])
+check("a clean stage does not retry or wait for auth",
+      len(calls) == 1 and not _waited29)
+
+# The negative case that matters most: a REAL bug must stop the loop, not
+# spin on wait_for_session forever mistaking it for an auth block.
+calls, _al.subprocess.Popen = _stub29([
+    _P29(1, ["Traceback...", "ZeroDivisionError: boom"])])
+check("a non-auth crash raises SystemExit instead of retrying forever",
+      _raises(lambda: _al.run_stage(3, "scan", ["--budget", "10"]), SystemExit))
+
+_al.time.sleep, _al.wait_for_session = _real_sleep29, _real_wait29
+
+# The orphan-child bug this session actually hit: killing autoloop.py while a
+# stage subprocess is running must terminate that child too, or a later clean
+# launch runs a second one against the same account concurrently.
+class _Term29:
+    def __init__(self): self.terminated = False
+    def poll(self): return None            # still running
+    def terminate(self): self.terminated = True
+_child29 = _Term29()
+_al._current_proc = _child29
+check("SIGTERM/SIGINT is wired to terminate the running child",
+      _al.signal.getsignal(_al.signal.SIGTERM) is _al._handle_signal)
+check("the signal handler actually terminates the tracked child",
+      _raises(lambda: _al._handle_signal(15, None), SystemExit) and _child29.terminated)
+_al._current_proc = None
+
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")
 sys.exit(1 if fail else 0)
