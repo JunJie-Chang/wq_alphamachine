@@ -229,7 +229,10 @@ def cmd_refine(args):
         arm = arm_name(r.get("theme", ""), r.get("template", ""))
         root = s.root_id
         qv = quality_verdict(best, g)
-        print(f"\n{r.get('template')}/{r.get('theme')} on {r.get('field')}"
+        on = r.get("field") or ""
+        if r.get("field2"):
+            on = f"{on} x {r['field2']}"      # which pairing produced the hit
+        print(f"\n{r.get('template')}/{r.get('theme')} on {on}"
               f"  -> sharpe={best.get('sharpe', 0):.2f} "
               f"fitness={best.get('fitness', 0):.2f} "
               f"turnover={best.get('turnover', 0):.3f} "
@@ -433,9 +436,63 @@ def cmd_priors(args):
         print(f"  {arm:<36}{a/(a+b):>7.2f}")
 
 
+def _prod_corr_table(store) -> None:
+    """Observed PROD_CORRELATION values, split by one-field vs two-field.
+
+    The whole point of the two-field templates. That check reports the MAXIMUM
+    correlation against any single alpha already live in production, so it is
+    the one number that measures crowding directly -- and it is already on
+    disk: deep_checks.checks stores BRAIN's verbatim /check payload, values
+    included, and gate_history carries both alpha_id and candidate_id so a
+    verdict can be traced back to the expression that earned it.
+
+    Read-only and free. No API call, no re-check -- purely what we have paid
+    for already. Deduplicated by expression, since a lineage re-simulates the
+    same idea across refine rungs and would otherwise vote several times.
+    """
+    rows = store.conn().execute(
+        "SELECT DISTINCT c.expr, c.field2, d.checks FROM deep_checks d"
+        " JOIN gate_history h ON h.alpha_id = d.alpha_id"
+        " JOIN candidates c ON c.id = h.candidate_id").fetchall()
+    buckets: dict[str, list[float]] = {"one field": [], "two fields": []}
+    seen: set[str] = set()
+    for r in rows:
+        if r["expr"] in seen:
+            continue
+        try:
+            checks = json.loads(r["checks"] or "[]")
+        except ValueError:
+            continue
+        v = next((ch.get("value") for ch in checks
+                  if ch.get("name") == "PROD_CORRELATION"), None)
+        if v is None:
+            continue
+        seen.add(r["expr"])
+        buckets["two fields" if r["field2"] else "one field"].append(float(v))
+    print("\nPROD_CORRELATION observed (limit 0.70; lower is less crowded)")
+    if not seen:
+        print("  no deep checks on file yet -- run gatelog --passing first\n")
+        return
+    print(f"  {'shape':<12}{'n':>4}{'min':>8}{'median':>8}{'max':>8}"
+          f"{'under .70':>11}")
+    for name, vals in buckets.items():
+        if not vals:
+            print(f"  {name:<12}{0:>4}{'--':>8}{'--':>8}{'--':>8}{'--':>11}")
+            continue
+        s = sorted(vals)
+        med = s[len(s) // 2] if len(s) % 2 else (s[len(s)//2 - 1] + s[len(s)//2]) / 2
+        ok = sum(1 for x in s if x < 0.70)
+        print(f"  {name:<12}{len(s):>4}{s[0]:>8.3f}{med:>8.3f}{s[-1]:>8.3f}"
+              f"{ok:>7}/{len(s):<4}")
+    print()
+
+
 def cmd_report(args):
     cfg, store, client = _setup(args) if args.online else (
         RunConfig(db_path=args.db), Store(args.db), None)
+    if args.corr:
+        _prod_corr_table(store)
+        return
     c = store.conn()
     n_cand = c.execute("SELECT COUNT(*) n FROM candidates").fetchone()["n"]
     n_sim = c.execute("SELECT COUNT(*) n FROM sims WHERE status='OK'").fetchone()["n"]
@@ -585,6 +642,9 @@ def main(argv=None):
 
     s = sub.add_parser("report")
     s.add_argument("--online", action="store_true")
+    s.add_argument("--corr", action="store_true",
+                   help="observed PROD_CORRELATION values, one-field vs "
+                        "two-field (free: reads deep_checks already on disk)")
     s.set_defaults(fn=cmd_report)
 
     s = sub.add_parser("gatelog",
@@ -616,7 +676,8 @@ def cmd_run(args):
     cmd_refine(args)
     cmd_select(args)
     cmd_submit(args)
-    cmd_report(argparse.Namespace(**{**vars(args), "online": False}))
+    cmd_report(argparse.Namespace(**{**vars(args), "online": False,
+                                     "corr": False}))
 
 
 if __name__ == "__main__":

@@ -22,7 +22,24 @@ below is a distinct economic hypothesis, not a parameter tweak:
   CONSISTENCY   trailing co-movement of field with returns
   EVENT         signal only traded when a condition fires (turnover killer)
 
-Placeholders: {f} field, {g} group, {d}/{d2} lookback days, {alpha} inner expr.
+The second axis: HOW MANY data sources
+---------------------------------------
+The taxonomy above took the transform axis seriously and the field-count axis
+not at all -- every template above names exactly one field. That ceiling is now
+measured, not suspected. PROD_CORRELATION is the MAXIMUM correlation against
+any single alpha already live in BRAIN's production pool; the limit is 0.70.
+Across the 16 distinct one-field ideas whose value we have paid to measure
+(`report --corr`), the distribution was min 0.778, median 0.844, max 0.895 --
+NOT ONE under the limit, not one close to it. That is not bad luck on a few
+candidates, it is the shape being crowded, and no amount of Sharpe/turnover
+tuning moves it.
+
+So `needs_field2` templates pair TWO fields. Four of the five are minimal
+generalisations of shapes already above (`returns` -> a chosen data field; one
+field -> two), and every one reuses an existing family so that priors.py, which
+scores families per dataset, gives them a prior with no extra LLM call.
+
+Placeholders: {f} field, {f2} second field, {g} group, {d}/{d2} lookback days.
 
 FASTEXPR notes, learned by having 20 simulations rejected at once:
   * scientific notation is a PARSE ERROR -- "Unexpected character 'e'".
@@ -54,10 +71,14 @@ class Template:
     # a slot. "low" ~ quarterly data, "high" ~ daily price/volume.
     turnover_prior: str = "mid"
     hypothesis: str = ""
+    # Does the expression name a SECOND data field? The generator has to draw a
+    # partner before it can render one of these; see generator._partner_pool.
+    needs_field2: bool = False
 
     def render(self, field: str, *, days: int = 126, group: str = "subindustry",
-               days2: int | None = None) -> str:
+               days2: int | None = None, field2: str = "") -> str:
         return (self.expr
+                .replace("{f2}", field2)
                 .replace("{f}", field)
                 .replace("{g}", group)
                 .replace("{d2}", str(days2 or max(5, days // 5)))
@@ -140,6 +161,37 @@ LIBRARY: tuple[Template, ...] = (
              "trade_when(volume > adv20, group_rank(ts_rank({f}, {d}), {g}), -1)",
              (66, 126), True, "mid",
              "Take the position only when there is liquidity to take it in."),
+
+    # ------------------------------------------------ TWO-FIELD (see docstring)
+    # Families are reused deliberately: priors.py scores FAMILIES per dataset,
+    # so an existing family means these arms inherit a real prior on day one
+    # instead of falling back to the pessimistic (1, 6) that would starve them.
+    Template("ratio_fields", "YIELD",
+             "group_rank(divide({f}, {f2}), {g})", (0,), True, "low",
+             "Field A per unit of field B -- an intensity neither states alone.",
+             needs_field2=True),
+    Template("resid_vs_field", "RESIDUAL",
+             "group_rank(ts_regression({f}, {f2}, {d}, rettype=0), {g})",
+             (126, 252), True, "mid",
+             "The part of A that B does not explain. Everyone regresses against "
+             "returns; almost nobody against a second dataset.",
+             needs_field2=True),
+    Template("gated_by_field", "EVENT",
+             "trade_when(ts_zscore({f2}, {d}) > 1, group_rank({f}, {g}), -1)",
+             (66, 126), True, "low",
+             "A is only informative in the regime where B is unusually elevated.",
+             needs_field2=True),
+    Template("divergence", "SURPRISE",
+             "group_rank(ts_rank({f}, {d}) - ts_rank({f2}, {d}), {g})",
+             (126, 252), True, "mid",
+             "A is high in its own history while B is not -- the two sources "
+             "disagree, and disagreement is where the mispricing lives.",
+             needs_field2=True),
+    Template("confirmation", "CONSISTENCY",
+             "group_rank(ts_corr({f}, {f2}, {d}), {g})", (126, 252), True, "mid",
+             "A and B have been moving together -- mutual confirmation from "
+             "two independent sources.",
+             needs_field2=True),
 )
 
 BY_FAMILY: dict[str, list[Template]] = {}
@@ -154,8 +206,36 @@ BY_NAME: dict[str, Template] = {t.name: t for t in LIBRARY}
 # Each is a cheap, well-understood edit that targets one specific IS failure.
 # --------------------------------------------------------------------------
 def wrap_backfill(expr: str, field: str, days: int = 120) -> str:
-    """Fixes sparse fields (CONCENTRATED_WEIGHT, low coverage, NaN drag)."""
-    return expr.replace(field, f"ts_backfill({field}, {days})", 1)
+    """Fixes sparse fields (CONCENTRATED_WEIGHT, low coverage, NaN drag).
+
+    Wraps EVERY standalone occurrence of `field`, matched on identifier
+    boundaries. The old `expr.replace(field, ..., 1)` was wrong twice over:
+
+      * str.replace matches substrings, not identifiers. A field id that is a
+        prefix of another token in the same expression (`fnd6_x` inside
+        `fnd6_x_ttm`) had the replacement land INSIDE the neighbour --
+        `ts_backfill(fnd6_x, 120)_ttm`. lint() cannot catch that: parens
+        balance, no placeholder, no scientific notation. So the slot gets paid
+        for a parse error, which is exactly what lint() exists to prevent.
+        Two fields drawn from two different datasets make a collision far
+        likelier than one field ever did.
+      * count=1 backfilled only the FIRST occurrence, so a template naming its
+        field twice (change_pct, stability) left the second one raw.
+
+    Idempotent per field: if this field already sits inside a ts_backfill(...)
+    the expression is returned untouched. That per-field guard is what lets a
+    caller fold over two fields without the first wrap blocking the second --
+    which a whole-expression `"ts_backfill" not in expr` test does not.
+    """
+    if not field:
+        return expr
+    esc = re.escape(field)
+    if re.search(rf"ts_backfill\(\s*{esc}\s*,", expr):
+        return expr
+    # A callable replacement, not a string: re.sub would otherwise interpret
+    # backslash escapes in the field name.
+    return re.sub(rf"(?<![A-Za-z0-9_]){esc}(?![A-Za-z0-9_])",
+                  lambda _m: f"ts_backfill({field}, {days})", expr)
 
 
 def wrap_winsorize(expr: str, std: float = 4.0) -> str:
@@ -212,9 +292,16 @@ def lint(expr: str) -> list[str]:
 
 
 def iter_variants(field: str, templates=LIBRARY, groups=("subindustry", "industry"),
-                  ) -> Iterator[tuple[Template, str, int, str]]:
-    """Yield (template, expr, days, group) across the transform grid."""
+                  field2: str = "") -> Iterator[tuple[Template, str, int, str]]:
+    """Yield (template, expr, days, group) across the transform grid.
+
+    Two-field templates are skipped unless a partner is supplied -- rendering
+    one without a `field2` would leave `{f2}` in the expression for lint() to
+    reject downstream.
+    """
     for t in templates:
+        if t.needs_field2 and not field2:
+            continue
         for g in (groups if t.needs_group else (groups[0],)):
             for d in (t.windows or (0,)):
-                yield t, t.render(field, days=d, group=g), d, g
+                yield t, t.render(field, days=d, group=g, field2=field2), d, g

@@ -200,6 +200,7 @@ class Refiner:
         expr = row["expr"]
         s = SimSettings(**json.loads(row["settings"]))
         field = row["field"] or ""
+        field2 = row["field2"] or ""
         sharpe = rec.get("sharpe") or 0.0
         to = rec.get("turnover") or 0.0
         checks = rec.get("checks") or []
@@ -214,10 +215,20 @@ class Refiner:
 
         if rung == 2:  # ROBUSTNESS
             v = []
-            if field and "ts_backfill" not in expr:
-                # Only reachable for dense fields now -- the generator
-                # backfills sparse ones before they are ever scanned.
-                v.append(Variant(T.wrap_backfill(expr, field), s, "ts_backfill"))
+            # Only reachable for dense fields now -- the generator backfills
+            # sparse ones before they are ever scanned. Folded over BOTH fields
+            # because the old whole-expression `"ts_backfill" not in expr` test
+            # skipped the rung entirely once either field had been wrapped,
+            # leaving the other raw; wrap_backfill carries its own per-field
+            # guard. The `bf != expr` test is load-bearing: a variant identical
+            # to its parent hashes to the PARENT'S id (sha1(expr+settings)), so
+            # the rung would silently re-crown the incumbent as its own child.
+            bf = expr
+            for fd in (field, field2):
+                if fd:
+                    bf = T.wrap_backfill(bf, fd)
+            if bf != expr:
+                v.append(Variant(bf, s, "ts_backfill"))
             if "winsorize" not in expr:
                 v.append(Variant(T.wrap_winsorize(expr), s, "winsorize std=4"))
             if "CONCENTRATED_WEIGHT" in fails or (rec.get("longCount") or 0) < 200:
@@ -281,7 +292,8 @@ class Refiner:
             out.append(self.store.add_candidate(
                 expr=v.expr, settings=v.settings.payload(),
                 theme=parent["theme"], template=parent["template"],
-                field=parent["field"], stage="refine", parent_id=parent_id,
+                field=parent["field"], field2=parent["field2"],
+                stage="refine", parent_id=parent_id,
                 settings_key=v.settings.key()))
         return out
 

@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS candidates (
     theme         TEXT,
     template      TEXT,
     field         TEXT,
+    field2        TEXT,                  -- two-field templates only
     stage         TEXT DEFAULT 'scan',   -- scan | refine | gated
     parent_id     TEXT,
     created       REAL
@@ -200,6 +201,7 @@ class Store:
                  ("deep_pass", "INTEGER DEFAULT 0")],
         "gate_history": [("deep_ok", "INTEGER"),
                          ("deep_reasons", "TEXT")],
+        "candidates": [("field2", "TEXT")],
     }
 
     def _migrate(self, pre_existing: set[str] | None = None) -> None:
@@ -314,16 +316,17 @@ class Store:
     # ---------------------------------------------------------- candidates
     def add_candidate(self, *, expr: str, settings: dict, theme: str = "",
                       template: str = "", field: str = "", stage: str = "scan",
-                      parent_id: str | None = None, settings_key: str = "") -> str:
+                      parent_id: str | None = None, settings_key: str = "",
+                      field2: str = "") -> str:
         key = settings_key or json.dumps(settings, sort_keys=True)
         _id = cid(expr, key)
         with self.conn() as c:
             c.execute(
                 "INSERT OR IGNORE INTO candidates"
-                "(id,expr,settings,theme,template,field,stage,parent_id,created)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
+                "(id,expr,settings,theme,template,field,field2,stage,parent_id,"
+                "created) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (_id, expr, json.dumps(settings), theme, template, field,
-                 stage, parent_id, time.time()))
+                 field2, stage, parent_id, time.time()))
         return _id
 
     def pending(self, stage: str = "scan", limit: int = 1000) -> list[sqlite3.Row]:

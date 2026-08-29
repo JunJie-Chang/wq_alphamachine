@@ -40,7 +40,8 @@ print("\n[2] templates render legal FastExpr")
 t = T.BY_NAME["surprise_z"]
 e = t.render("operating_income", days=126, group="subindustry")
 check("surprise_z renders", "operating_income" in e and "126" in e, f"-> {e[:70]}")
-check("all templates render", all(x.render("fld", days=66) for x in T.LIBRARY))
+check("all templates render",
+      all(x.render("fld", days=66, field2="fld2") for x in T.LIBRARY))
 check("negate wraps", T.negate("rank(x)") == "-(rank(x))")
 check("hump wraps", T.wrap_hump("a", 0.01) == "hump(a, hump=0.01)")
 check("backfill targets the field only",
@@ -399,7 +400,8 @@ check("unrendered placeholders are rejected",
 check("valid expressions pass clean",
       T.lint("group_rank(ts_zscore(fnd6_x, 126), industry)") == [])
 _bad = [t.name for t in T.LIBRARY
-        if T.lint(t.render("fnd6_x", days=126, group="industry"))]
+        if T.lint(t.render("fnd6_x", days=126, group="industry",
+                           field2="anl4_y"))]
 check("EVERY template in the library renders to valid FASTEXPR", not _bad, f"{_bad}")
 check("no template uses scientific notation",
       not any("e-9" in t.expr or "e+" in t.expr for t in T.LIBRARY))
@@ -1217,6 +1219,153 @@ check("SIGTERM/SIGINT is wired to terminate the running child",
 check("the signal handler actually terminates the tracked child",
       _raises(lambda: _al._handle_signal(15, None), SystemExit) and _child29.terminated)
 _al._current_proc = None
+
+print("\n[30] two-field templates: the PROD_CORRELATION escape hatch")
+import sqlite3 as _sq30
+from alphamachine import priors as _P30
+
+_pair30 = [t for t in T.LIBRARY if t.needs_field2]
+check("the library carries two-field templates", len(_pair30) >= 5,
+      f"{[t.name for t in _pair30]}")
+_r30 = [t.render("fnd6_a", days=126, group="industry", field2="anl4_b")
+        for t in _pair30]
+check("both fields are substituted, no placeholder survives",
+      all("fnd6_a" in e and "anl4_b" in e and "{" not in e for e in _r30))
+check("every two-field template lints clean",
+      not [t.name for t, e in zip(_pair30, _r30) if T.lint(e)],
+      f"{[t.name for t, e in zip(_pair30, _r30) if T.lint(e)]}")
+# Families are reused on purpose: priors.py scores FAMILIES per dataset, so a
+# new family name would mean no prior and the pessimistic (1,6) fallback.
+check("two-field templates reuse existing families (so priors apply)",
+      {t.family for t in _pair30}
+      <= {t.family for t in T.LIBRARY if not t.needs_field2})
+
+# A. wrap_backfill: the substring bug that lint() could never have caught.
+# `fnd6_x` is a prefix of `fnd6_x_ttm`; str.replace would have produced
+# ts_backfill(fnd6_x, 120)_ttm -- balanced parens, no placeholder, so the slot
+# gets paid for a parse error.
+_col30 = T.wrap_backfill("group_rank(fnd6_x_ttm - fnd6_x, sector)", "fnd6_x")
+check("backfill matches identifiers, not substrings",
+      "fnd6_x_ttm -" in _col30 and "ts_backfill(fnd6_x, 120)" in _col30,
+      f"-> {_col30}")
+_twice30 = T.wrap_backfill(
+    "group_rank(divide(ts_delta(fx, 66), abs(ts_mean(fx, 66))), ind)", "fx")
+check("backfill wraps EVERY occurrence, not just the first",
+      _twice30.count("ts_backfill(fx, 120)") == 2, f"-> {_twice30}")
+check("backfill is idempotent per field",
+      T.wrap_backfill(_twice30, "fx") == _twice30)
+_two30 = T.wrap_backfill(T.wrap_backfill(
+    "group_rank(divide(fa, fb), sector)", "fa"), "fb")
+check("two fields are wrapped independently",
+      "ts_backfill(fa, 120)" in _two30 and "ts_backfill(fb, 120)" in _two30
+      and "ts_backfill(ts_backfill" not in _two30, f"-> {_two30}")
+
+# B. Storage: field2 needs its own column. Comma-joining into `field` would
+# make wrap_backfill a silent no-op in refine, and a variant identical to its
+# parent hashes to the PARENT'S id -- the rung would re-crown the incumbent.
+db30 = tempfile.mktemp(suffix=".db"); st30 = Store(db30)
+_c30 = st30.add_candidate(expr="group_rank(divide(fa, fb), sector)",
+                          settings=SimSettings().payload(), theme="analyst",
+                          template="ratio_fields", field="fa", field2="fb")
+check("field2 round-trips through the store",
+      st30.candidate(_c30)["field2"] == "fb")
+
+db31 = tempfile.mktemp(suffix=".db")                 # old schema, no field2
+_o30 = _sq30.connect(db31)
+_o30.executescript("""
+CREATE TABLE candidates (id TEXT PRIMARY KEY, expr TEXT, settings TEXT,
+  theme TEXT, template TEXT, field TEXT, stage TEXT, parent_id TEXT, created REAL);
+""")
+_o30.commit(); _o30.close()
+st31 = Store(db31)                                   # migration runs on open
+check("migration adds field2 to a database that predates it",
+      "field2" in {r[1] for r in
+                   st31.conn().execute("PRAGMA table_info(candidates)")})
+
+# C. Refine rung 2 on a two-field candidate. The old whole-expression guard
+# (`"ts_backfill" not in expr`) skipped the rung once EITHER field was wrapped,
+# leaving the other raw for good.
+class _Ex30:                       # plan() never touches the executor
+    pass
+ref30 = Refiner(st30, _Ex30(), Gates())
+_p30 = st30.candidate(_c30)
+_v30 = ref30.plan(_c30, {"sharpe": 1.6, "turnover": 0.2, "longCount": 900,
+                         "checks": []}, 2)
+_bf30 = [v for v in _v30 if "ts_backfill" in v.expr]
+check("rung 2 backfills BOTH fields of a two-field candidate",
+      len(_bf30) == 1 and "ts_backfill(fa, 120)" in _bf30[0].expr
+      and "ts_backfill(fb, 120)" in _bf30[0].expr,
+      f"-> {_bf30[0].expr if _bf30 else None}")
+check("no rung-2 variant is byte-identical to its parent",
+      all(v.expr != _p30["expr"] for v in _v30))
+# The half-wrapped case: one field already backfilled at scan time must not
+# block the other, which is exactly what the old guard did.
+_half30 = st30.add_candidate(
+    expr="group_rank(divide(ts_backfill(fa, 120), fb), sector)",
+    settings=SimSettings().payload(), theme="analyst",
+    template="ratio_fields", field="fa", field2="fb")
+_hv30 = [v for v in ref30.plan(_half30, {"sharpe": 1.6, "turnover": 0.2,
+                                         "longCount": 900, "checks": []}, 2)
+         if "ts_backfill(fb" in v.expr]
+check("an already-backfilled first field does not block the second",
+      len(_hv30) == 1 and _hv30[0].expr.count("ts_backfill") == 2,
+      f"-> {_hv30[0].expr if _hv30 else None}")
+
+# D. Generation: the partner must come from a DIFFERENT theme, because
+# PROD_CORRELATION fires when a conventional transform meets a conventional
+# data source -- a cross-theme pairing is what is unlikely to already exist.
+_fields30 = [{"id": "an_a", "_theme": "analyst", "coverage": 1.0,
+              "dataset": {"id": "d1"}, "alphaCount": 10},
+             {"id": "an_b", "_theme": "analyst", "coverage": 1.0,
+              "dataset": {"id": "d1"}, "alphaCount": 10},
+             {"id": "op_a", "_theme": "option", "coverage": 1.0,
+              "dataset": {"id": "d2"}, "alphaCount": 10},
+             {"id": "op_b", "_theme": "option", "coverage": 1.0,
+              "dataset": {"id": "d2"}, "alphaCount": 500000}]
+db32 = tempfile.mktemp(suffix=".db"); st32 = Store(db32)
+generate(st32, _fields30, budget=60, base=SimSettings(), seed=11,
+         templates=_pair30)
+_rows30 = st32.conn().execute(
+    "SELECT theme, template, field, field2, expr FROM candidates").fetchall()
+_themes30 = {f["id"]: f["_theme"] for f in _fields30}
+check("generation produces two-field candidates", len(_rows30) > 0,
+      f"{len(_rows30)} rows")
+check("every two-field candidate records its partner",
+      all(r["field2"] for r in _rows30))
+check("the partner never repeats the primary field",
+      all(r["field"] != r["field2"] for r in _rows30))
+check("the partner always comes from a different theme",
+      all(_themes30[r["field2"]] != r["theme"] for r in _rows30),
+      f"{[(r['theme'], r['field2']) for r in _rows30[:3]]}")
+check("both fields appear in the generated expression",
+      all(r["field"] in r["expr"] and r["field2"] in r["expr"] for r in _rows30))
+check("generated two-field expressions lint clean",
+      not any(T.lint(r["expr"]) for r in _rows30))
+# op_b carries 500k existing alphas; Catalog.field_value divides by
+# 1+log10(1+alphaCount), so it should be drawn far less than the uncrowded op_a.
+_partners30 = [r["field2"] for r in _rows30 if r["theme"] == "analyst"]
+if _partners30:
+    check("a crowded partner is drawn less often than an uncrowded one",
+          _partners30.count("op_b") < _partners30.count("op_a"),
+          f"op_a={_partners30.count('op_a')} op_b={_partners30.count('op_b')}")
+
+# E. Priors reach the new arms with no LLM call, purely from the cached
+# per-dataset family scores -- the reason the families were reused.
+_pc30 = tempfile.mktemp(suffix=".json")
+with open(_pc30, "w") as _fh30:
+    json.dump({"d1": {"scores": {f.family: 0.8 for f in T.LIBRARY},
+                      "rationale": ""}}, _fh30)
+_pri30 = _P30.arm_priors(_fields30, cache_path=_pc30)
+check("two-field arms inherit a prior from the existing family scores",
+      all(arm_name("analyst", t.name) in _pri30 for t in _pair30),
+      f"{[t.name for t in _pair30 if arm_name('analyst', t.name) not in _pri30]}")
+check("that prior is better than the pessimistic (1,6) fallback",
+      all(_pri30[arm_name("analyst", t.name)][0]
+          / sum(_pri30[arm_name("analyst", t.name)]) > 1.0 / 7.0
+          for t in _pair30))
+os.remove(_pc30)
+for _f30 in (db30, db31, db32):
+    os.remove(_f30)
 
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")
