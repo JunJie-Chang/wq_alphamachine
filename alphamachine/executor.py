@@ -54,6 +54,15 @@ class Executor:
         self._halt = threading.Event()
         self._open_bundles: set[str] = set()
 
+    def halted(self) -> bool:
+        """Did BRAIN demand a persona check during the last run?
+
+        A caller that dispatches in several rounds needs this: `run()` reports
+        the halt for its own batch, but only the caller can decide to stop
+        queueing further work rather than march the whole plan into a wall.
+        """
+        return self._halt.is_set()
+
     def client(self) -> BrainClient:
         c = getattr(self._tls, "client", None)
         if c is None:

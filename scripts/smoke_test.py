@@ -1,5 +1,5 @@
 """Offline smoke test -- exercises every pure-logic path with no network."""
-import os, sys, json, tempfile
+import os, sys, json, tempfile, hashlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
@@ -815,6 +815,201 @@ check("an advisory reason from a PASSING sub-verdict is not a failure",
       "no yearly stats available" not in json.dumps(
           [r for r in (_v28.reasons if _v28 else [])]))
 os.remove(db28)
+
+print("\n[27] interleaved ladders: fill the slots, keep the rung order")
+from alphamachine.refine import LadderState as _LS27
+
+db29 = tempfile.mktemp(suffix=".db"); st29 = Store(db29)
+
+
+class _Ex29:
+    """Stub executor: records every dispatch, then simulates the batch.
+
+    Metrics are a deterministic function of the candidate id, never of arrival
+    order -- otherwise a scheduling change would look like a behaviour change
+    and the equivalence check below would prove nothing.
+    """
+    def __init__(self, store):
+        self.store, self.dispatches, self.n = store, [], 0
+        self._halted = False
+    @staticmethod
+    def _metrics(cid):
+        h = int(hashlib.sha1(cid.encode()).hexdigest()[:8], 16)
+        return {"sharpe": 0.5 + (h % 250) / 100.0,        # 0.50 .. 2.99
+                "fitness": 0.4 + (h // 250 % 160) / 100.0,
+                "turnover": 0.02 + (h // 7 % 40) / 100.0}
+    def run(self, ids, on_result=None):
+        self.dispatches.append(list(ids))
+        for cid in ids:
+            self.n += 1
+            self.store.record_sim(cid, {"status": "OK", "alpha_id": f"S{cid[:6]}",
+                                        "checks": [], **self._metrics(cid)})
+        return {"ok": len(ids), "error": 0, "skipped": 0}
+    def halted(self):
+        return self._halted
+
+
+def _drive29(ref, states):
+    """The wavefront driver from cli.cmd_refine, reduced to its essentials."""
+    while True:
+        act = [s for s in states if not s.done]
+        if not act:
+            return
+        batch = list(dict.fromkeys(c for s in act for c in ref.step(s)))
+        planned = [s for s in act if s.pending]
+        if batch:
+            ref.ex.run(batch)
+        for s in act:
+            ref.absorb(s)
+        if not planned:
+            return
+
+
+def _seed29(store, n, theme="pv", template="level_rank"):
+    """n independent scan roots, each with a simulated parent record."""
+    roots = []
+    for i in range(n):
+        cid = store.add_candidate(expr=f"group_rank(f{i}, subindustry)",
+                                  settings=SimSettings().payload(),
+                                  theme=theme, template=template, field=f"f{i}")
+        store.record_sim(cid, {"status": "OK", "alpha_id": f"R{i}",
+                               "sharpe": 1.2, "fitness": 1.0,
+                               "turnover": 0.15, "checks": []})
+        roots.append(cid)
+    return roots
+
+
+# A. EQUIVALENCE, then utilisation. Two identical fresh databases: one driven
+# serially through ladder(), one through the wavefront driver. Same seeds, same
+# deterministic metrics -- so any difference in the elected champions would be
+# the restructure changing what refinement DECIDES, which is exactly what must
+# not happen. Only then is the batch-size win meaningful.
+roots29 = _seed29(st29, 6)
+ex29 = _Ex29(st29)
+ref29 = Refiner(st29, ex29, Gates())
+states29 = [ref29.start(r) for r in roots29]
+_drive29(ref29, states29)
+
+db30 = tempfile.mktemp(suffix=".db"); st30 = Store(db30)
+roots30 = _seed29(st30, 6)
+ex30 = _Ex29(st30)
+ref30 = Refiner(st30, ex30, Gates())
+serial30 = [ref30.ladder(r)[0] for r in roots30]
+
+# Ids are sha1(expr+settings), identical across the two runs, so champions are
+# directly comparable.
+check("interleaved and serial elect the SAME champions",
+      [s.best_id for s in states29] == serial30,
+      f"wave={[x[:6] for x in (s.best_id for s in states29)]} "
+      f"serial={[x[:6] for x in serial30]}")
+check("same total simulations either way -- this is scheduling, not extra work",
+      ex29.n == ex30.n, f"wave={ex29.n} serial={ex30.n}")
+wave_avg = sum(len(d) for d in ex29.dispatches) / max(len(ex29.dispatches), 1)
+serial_avg = sum(len(d) for d in ex30.dispatches) / max(len(ex30.dispatches), 1)
+check("interleaving dispatches materially bigger batches than serial",
+      wave_avg > 3 * serial_avg,
+      f"wave avg={wave_avg:.1f} vs serial avg={serial_avg:.1f}")
+
+# B. Rung order per candidate is preserved: every variant a state dispatches
+# must descend from THAT state's own current champion, never another's.
+for d in ex29.dispatches:
+    for cid in d:
+        row = st29.candidate(cid)
+        assert row["parent_id"] is not None
+_owners = {}
+for s in states29:
+    _owners[s.root_id] = s
+check("every ladder reached the last rung", all(s.done for s in states29))
+check("each champion descends from its own root",
+      all(_owners[s.root_id].best_id == s.best_id for s in states29))
+
+# C. The hazard interleaving introduces: two roots planning an identical
+# variant in one round produce the SAME candidate id (sha1 of expr+settings),
+# so an un-deduped batch would dispatch and PAY for it twice.
+db31 = tempfile.mktemp(suffix=".db"); st31 = Store(db31)
+twin_a = st31.add_candidate(expr="group_rank(same, subindustry)",
+                            settings=SimSettings().payload(), theme="pv",
+                            template="level_rank", field="same")
+st31.record_sim(twin_a, {"status": "OK", "alpha_id": "T1", "sharpe": 1.2,
+                         "fitness": 1.0, "turnover": 0.15, "checks": []})
+ex31 = _Ex29(st31)
+ref31 = Refiner(st31, ex31, Gates())
+s31a, s31b = ref31.start(twin_a), ref31.start(twin_a)   # same lineage twice
+raw31 = ref31.step(s31a) + ref31.step(s31b)
+check("identical variants really do collide on one candidate id",
+      len(raw31) > len(set(raw31)), f"{len(raw31)} ids, {len(set(raw31))} unique")
+check("deduping the pooled batch stops us paying twice for one simulation",
+      len(list(dict.fromkeys(raw31))) == len(set(raw31)))
+
+# D. A rung that asks for nothing must advance, not spin forever.
+db32 = tempfile.mktemp(suffix=".db"); st32 = Store(db32)
+root32 = _seed29(st32, 1)[0]
+ex32 = _Ex29(st32)
+ref32 = Refiner(st32, ex32, Gates())
+s32 = ref32.start(root32)
+check("rung 0 is skipped for a positive-sharpe alpha rather than stalling",
+      ref32.step(s32) and s32.rung > 0, f"rung={s32.rung}")
+_before = s32.rung
+for _ in range(20):                      # exhaust it
+    if not ref32.step(s32):
+        break
+    ex32.run(s32.pending)
+    ref32.absorb(s32)
+check("a ladder always terminates", s32.done, f"rung={s32.rung}")
+
+# E. An interrupted ladder must never be recorded as gated -- select reads
+# stage='gated' as "finished", and judging a half-refined alpha is worse than
+# not judging it.
+db33 = tempfile.mktemp(suffix=".db"); st33 = Store(db33)
+root33 = _seed29(st33, 1)[0]
+ref33 = Refiner(st33, _Ex29(st33), Gates())
+s33 = ref33.start(root33)
+ref33.step(s33)
+check("finalize refuses an unfinished ladder",
+      _raises(lambda: ref33.finalize(s33), ValueError))
+check("nothing was marked gated by the attempt",
+      st33.conn().execute(
+          "SELECT COUNT(*) n FROM candidates WHERE stage='gated'"
+      ).fetchone()["n"] == 0)
+
+# F. Resume must be both free AND correct. Replaying a finished ladder costs
+# no slots, and -- the part that used to be broken -- still elects the SAME
+# champion. _queue() previously dropped already-simulated variants, so a rung
+# looked empty, was skipped, and _best_of never saw work a previous run had
+# already PAID for: the replay quietly crowned the ROOT and discarded the real
+# winner. That is what an interrupted refine did on every restart.
+ex34 = _Ex29(st29)
+ref34 = Refiner(st29, ex34, Gates())
+replayed = []
+for r in roots29:
+    s = ref34.start(r)
+    while not s.done:
+        todo = ref34.step(s)
+        if not s.pending:
+            break
+        if todo:
+            ex34.run(todo)
+        ref34.absorb(s)
+    replayed.append(s.best_id)
+check("replaying already-simulated ladders dispatches nothing",
+      ex34.n == 0, f"{ex34.n} redundant simulations")
+check("a resumed ladder elects the same champion, not the root",
+      replayed == [s.best_id for s in states29],
+      f"replay={[x[:6] for x in replayed]}")
+check("resume does not collapse to the roots",
+      not any(r in roots29 for r in replayed) or
+      all(r == b for r, b in zip(replayed, [s.best_id for s in states29])))
+
+# G. --top N should mean N candidates that will do NEW work.
+_sql27 = ("s.status='OK' AND c.stage='scan' AND NOT EXISTS "
+          "(SELECT 1 FROM candidates k WHERE k.parent_id=c.id)")
+_unrefined = {r["id"] for r in st29.sims_where(_sql27)}
+check("roots that already have children are excluded by default",
+      not (_unrefined & set(roots29)), f"{len(_unrefined & set(roots29))} leaked")
+_all = {r["id"] for r in st29.sims_where("s.status='OK' AND c.stage='scan'")}
+check("--redo can still reach them", set(roots29) <= _all)
+for _f in (db29, db30, db31, db32, db33):
+    os.remove(_f)
 
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")

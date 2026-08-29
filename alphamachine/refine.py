@@ -43,6 +43,28 @@ class Variant:
     note: str
 
 
+@dataclass
+class LadderState:
+    """One candidate's position on the ladder, so many can be driven at once.
+
+    The rung dependency is real -- rung N+1 is planned from rung N's champion,
+    which is what makes this coordinate ascent rather than a sweep. But that
+    dependency is WITHIN a lineage. Different candidates are independent, and
+    keeping the position in a value rather than on the call stack is what lets
+    a driver interleave them and dispatch their variants together.
+    """
+    root_id: str
+    best_id: str
+    best: dict
+    rung: int = 0
+    pending: list[str] = None            # ids dispatched for the current rung
+    done: bool = False
+
+    def __post_init__(self):
+        if self.pending is None:
+            self.pending = []
+
+
 def suggest_decay(turnover: float, current_decay: int,
                   target: float = FITNESS_TURNOVER_KNEE) -> list[int]:
     """Aim decay at the fitness knee instead of sweeping blindly.
@@ -79,31 +101,96 @@ class Refiner:
         self.g = gates
 
     # ------------------------------------------------------------------ API
-    def ladder(self, candidate_id: str, max_rungs: int = 6) -> tuple[str, dict]:
-        """Run the ladder on one survivor. Returns (best_candidate_id, record)."""
-        best_id = candidate_id
-        best = self._rec(best_id)
-        if not best:
-            return candidate_id, {}
+    MAX_RUNGS = 6
 
-        for rung in range(max_rungs):
-            variants = self.plan(best_id, best, rung)
-            if not variants:
-                continue
-            ids = self._queue(best_id, variants)
-            if not ids:
-                continue
-            self.ex.run(ids)
-            cand_id, cand = self._best_of([best_id, *ids])
-            gain = _score(cand, self.g) - _score(best, self.g)
-            log.info("rung %d: %d variants, best score %+.3f (%s)",
-                     rung, len(ids), gain, cand.get("alpha_id"))
-            if cand_id != best_id and gain > 0:
-                best_id, best = cand_id, cand
+    def start(self, candidate_id: str) -> LadderState | None:
+        """Open a ladder. None when the root has no usable simulation."""
+        best = self._rec(candidate_id)
+        if not best:
+            return None
+        return LadderState(root_id=candidate_id, best_id=candidate_id, best=best)
+
+    def step(self, st: LadderState) -> list[str]:
+        """Queue the current rung; return only the ids that still need a slot.
+
+        `st.pending` holds EVERY variant id for the rung, because absorb() must
+        judge the whole rung -- a resumed ladder whose variants were simulated
+        by an earlier run still has to elect the same champion. The returned
+        list is just the work outstanding: everything on a fresh run, often
+        nothing on a replay.
+
+        Rungs that ask for nothing at all (`plan()` returns [] -- rung 0 on a
+        positive-Sharpe alpha, say) are skipped here, so a state can never
+        re-plan the same barren rung forever and never reach `done`.
+        """
+        st.pending = []
+        while not st.done and st.rung < self.MAX_RUNGS:
+            variants = self.plan(st.best_id, st.best, st.rung)
+            ids = self._queue(st.best_id, variants) if variants else []
+            if ids:
+                st.pending = ids
+                return self._needs_sim(ids)
+            st.rung += 1
+        st.done = True
+        return []
+
+    def absorb(self, st: LadderState) -> None:
+        """Fold the dispatched rung's results in and advance one rung.
+
+        A candidate whose bundle was HALTED has no new record to read;
+        `_best_of` simply keeps the incumbent, so the rung still advances and
+        the driver is expected to stop the wave rather than retry here.
+        """
+        if not st.pending:
+            return
+        ids, st.pending = st.pending, []
+        cand_id, cand = self._best_of([st.best_id, *ids])
+        gain = _score(cand, self.g) - _score(st.best, self.g)
+        log.info("rung %d: %d variants, best score %+.3f (%s)",
+                 st.rung, len(ids), gain, cand.get("alpha_id"))
+        if cand_id != st.best_id and gain > 0:
+            st.best_id, st.best = cand_id, cand
+        st.rung += 1
+        if st.rung >= self.MAX_RUNGS:
+            st.done = True
+
+    def finalize(self, st: LadderState) -> tuple[str, dict]:
+        """Mark the champion. ONLY for a state that reached the last rung.
+
+        An interrupted ladder must never be recorded as gated: `select` reads
+        stage='gated' as "this lineage is finished", and a half-refined alpha
+        labelled that way would be judged on settings it had not finished
+        exploring.
+        """
+        if not st.done:
+            raise ValueError(f"refusing to finalize an unfinished ladder "
+                             f"({st.root_id} stopped at rung {st.rung})")
         self.store.conn().execute(
-            "UPDATE candidates SET stage='gated' WHERE id=?", (best_id,))
+            "UPDATE candidates SET stage='gated' WHERE id=?", (st.best_id,))
         self.store.conn().commit()
-        return best_id, best
+        return st.best_id, st.best
+
+    def ladder(self, candidate_id: str, max_rungs: int | None = None
+               ) -> tuple[str, dict]:
+        """Run one candidate's ladder to completion, serially.
+
+        The single-candidate reference path. `cmd_refine` drives many states at
+        once instead (see cli.cmd_refine), but the semantics here are what that
+        driver must reproduce.
+        """
+        st = self.start(candidate_id)
+        if st is None:
+            return candidate_id, {}
+        limit = self.MAX_RUNGS if max_rungs is None else max_rungs
+        while not st.done and st.rung < limit:
+            todo = self.step(st)
+            if not st.pending:
+                break                      # ladder exhausted
+            if todo:
+                self.ex.run(todo)
+            self.absorb(st)                # judge the rung either way
+        st.done = True
+        return self.finalize(st)
 
     # ---------------------------------------------------------------- rungs
     def plan(self, candidate_id: str, rec: dict, rung: int) -> list[Variant]:
@@ -175,21 +262,32 @@ class Refiner:
 
     # ------------------------------------------------------------- plumbing
     def _queue(self, parent_id: str, variants: list[Variant]) -> list[str]:
+        """Register every legal variant and return ALL their ids.
+
+        Including ones already simulated on an earlier run. Dropping those here
+        is what used to break resumption: the rung then looked empty, was
+        skipped entirely, and `_best_of` never saw variants a previous run had
+        already PAID for -- so a re-run quietly elected the root as champion and
+        threw the real winner away. Ids are `sha1(expr + settings)`, so a replay
+        reproduces them exactly; deciding which still need a slot is the
+        caller's job, not this one's.
+        """
         out = []
         parent = self.store.candidate(parent_id)
         for v in variants:
             if T.lint(v.expr):
                 log.warning("refine variant rejected by lint: %s", T.lint(v.expr)[0])
                 continue
-            key = v.settings.key()
-            if self.store.already_simulated(v.expr, key):
-                continue
             out.append(self.store.add_candidate(
                 expr=v.expr, settings=v.settings.payload(),
                 theme=parent["theme"], template=parent["template"],
                 field=parent["field"], stage="refine", parent_id=parent_id,
-                settings_key=key))
+                settings_key=v.settings.key()))
         return out
+
+    def _needs_sim(self, cids: list[str]) -> list[str]:
+        """Which of these have no simulation record yet."""
+        return [c for c in cids if not self._rec(c)]
 
     def _rec(self, candidate_id: str) -> dict:
         rows = self.store.sims_where("s.candidate_id=?", (candidate_id,))

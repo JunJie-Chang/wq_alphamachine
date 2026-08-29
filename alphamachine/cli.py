@@ -121,32 +121,96 @@ def cmd_scan(args):
 def cmd_refine(args):
     cfg, store, client = _setup(args)
     g = cfg.gates
+    # By default only roots that have never been laddered. ladder() marks the
+    # CHAMPION gated, not the root, so a refined root keeps stage='scan' and
+    # would otherwise be re-picked by every later run -- costing no simulation
+    # quota (already_simulated dedupes) but spending the --top budget on
+    # finished work while lower-ranked survivors never get a turn.
+    fresh = ("" if getattr(args, "redo", False) else
+             " AND NOT EXISTS (SELECT 1 FROM candidates k WHERE k.parent_id=c.id)")
     rows = store.sims_where(
-        "s.status='OK' AND abs(s.sharpe) >= ? AND c.stage='scan' "
-        "ORDER BY abs(s.sharpe) DESC LIMIT ?", (g.scan_abs_sharpe, args.top))
+        "s.status='OK' AND abs(s.sharpe) >= ? AND c.stage='scan'" + fresh +
+        " ORDER BY abs(s.sharpe) DESC LIMIT ?", (g.scan_abs_sharpe, args.top))
     if not rows:
-        print("no scan survivors to refine -- run `scan` first")
+        print("no un-refined scan survivors -- run `scan`, or pass --redo "
+              "to re-ladder ones already done")
         return
     ex = Executor(cfg, store)
     rc = ex.reclaim()
     if rc["reclaimed"]:
         print(f"reclaimed {rc['reclaimed']} in-flight sims from a previous run")
-    print(f"refining {len(rows)} survivors")
     ref = Refiner(store, ex, g)
     bandit = Bandit(store, [], seed=args.seed)
     sub = Submitter(cfg, store, client)
     deep_budget = cfg.max_deep_checks_per_refine if cfg.deep_check_in_refine else 0
 
-    for i, r in enumerate(rows, 1):
-        print(f"\n[{i}/{len(rows)}] {r['template']}/{r['theme']} on {r['field']}"
-              f"  sharpe={r['sharpe']:.2f}")
-        best_id, best = ref.ladder(r["id"])
+    # Drive every ladder at once. Each candidate still walks its rungs in order
+    # and still plans each rung from its OWN previous champion; what changes is
+    # that a round pools every active candidate's variants into one dispatch.
+    # Serially, a rung offered the executor 1-6 candidates against a capacity of
+    # concurrency x 10, so most slots sat idle for most of the run.
+    states, meta = [], {}
+    for r in rows:
+        st = ref.start(r["id"])
+        if st is None:
+            continue
+        states.append(st)
+        meta[st.root_id] = r
+    print(f"refining {len(states)} survivors, ladders interleaved")
+
+    finished, rounds = [], 0
+    while True:
+        active = [s for s in states if not s.done]
+        if not active:
+            break
+        # Two roots can plan an identical variant in the same round, and the
+        # candidate id is sha1(expr + settings) -- so the pooled batch can hold
+        # the same id twice and pay for that simulation twice. Serial refine
+        # never hit this because the first copy was always already simulated by
+        # the time the second was planned.
+        batch = list(dict.fromkeys(
+            cid for s in active for cid in ref.step(s)))
+        planned = [s for s in active if s.pending]
+        if batch:
+            rounds += 1
+            reused = sum(len(s.pending) for s in planned) - len(batch)
+            print(f"\n-- round {rounds}: {len(batch)} to simulate across "
+                  f"{len(planned)} candidate(s)"
+                  + (f" ({reused} variants already on file)" if reused > 0 else ""))
+            ex.run(batch)
+        # Absorb whether or not anything was dispatched: on a resumed run the
+        # rung's variants are already simulated, and the champion still has to
+        # be elected from them.
+        for s in active:
+            ref.absorb(s)
+        # step() sets done on a state whose remaining rungs asked for nothing;
+        # absorb() sets it on one that just cleared the last rung.
+        for s in active:
+            if s.done:
+                ref.finalize(s)
+                finished.append(s)
+        if ex.halted():
+            print("\nHALTED mid-wave. Every simulation already run is stored, "
+                  "so re-running this command replays the ladders from the "
+                  "database without re-paying for a slot.")
+            break
+        if not planned:
+            break
+
+    # Judge the champions after the wave. The deep verdict polls a lazily
+    # computed endpoint, so it is kept out of the dispatch loop.
+    print(f"\n{len(finished)} ladder(s) complete in {rounds} round(s)")
+    for s in finished:
+        best = s.best
+        best_id = s.best_id
+        r = meta.get(s.root_id) or {}
+        arm = arm_name(r.get("theme", ""), r.get("template", ""))
         qv = quality_verdict(best, g)
-        print(f"    -> sharpe={best.get('sharpe', 0):.2f} "
+        print(f"\n{r.get('template')}/{r.get('theme')} on {r.get('field')}"
+              f"  -> sharpe={best.get('sharpe', 0):.2f} "
               f"fitness={best.get('fitness', 0):.2f} "
               f"turnover={best.get('turnover', 0):.3f} "
               f"| gate: {'PASS' if qv.ok else '; '.join(qv.reasons[:2])}")
-        arm = arm_name(r["theme"], r["template"])
         bandit.update(arm, stage="gate", passed=qv.ok,
                       sharpe=abs(best.get("sharpe") or 0))
 
@@ -166,7 +230,8 @@ def cmd_refine(args):
                 print(f"       deep: "
                       f"{'PASS' if dv.ok else '; '.join(dv.reasons[:2])}")
                 bandit.update(arm, stage="deep", passed=dv.ok)
-        store.record_gate_check(best_id, aid, r["expr"], best, qv, g, deep=dv)
+        store.record_gate_check(best_id, aid, r.get("expr", ""), best, qv, g,
+                                deep=dv)
 
 
 def cmd_select(args):
@@ -447,7 +512,12 @@ def main(argv=None):
     s.add_argument("--per-dataset", type=int, default=8)
     s.set_defaults(fn=cmd_scan)
 
-    s = sub.add_parser("refine"); s.add_argument("--top", type=int, default=20)
+    s = sub.add_parser("refine")
+    s.add_argument("--top", type=int, default=20)
+    s.add_argument("--redo", action="store_true",
+                   help="also re-ladder candidates already refined; costs no "
+                        "simulation quota (variants are deduped) but can pick "
+                        "a different champion after a Gates change")
     s.set_defaults(fn=cmd_refine)
 
     s = sub.add_parser("select"); s.add_argument("--n", type=int, default=10)
