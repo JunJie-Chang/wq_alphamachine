@@ -1,0 +1,77 @@
+# ---------------------------------------------------------------- secrets
+# WQ_EMAIL / WQ_PASSWORD. .env.example is the tracked template.
+.env
+.env.*
+!.env.example
+
+# ------------------------------------------------------------ runtime data
+# EVERYTHING under data/ is ignored by default, deliberately.
+#
+# Nothing in there belongs in version control, and the three reasons overlap:
+#
+#   secret        cookies.json is a live BRAIN session (mode 600);
+#                 persona_url.txt and auth_wait.log carry persona inquiry URLs
+#                 and the account's BRAIN user id; and EVERY *.log line like
+#                 "reusing persisted session for <you>@example.com" leaks the
+#                 account email. Logs here are a credential leak, not noise.
+#
+#   local state   machine.db is this machine's memory -- 1,500+ candidates,
+#                 sims, in-flight slots. biometric_attempts.json is a rolling
+#                 24h quota counter that is only meaningful on this host.
+#
+#   regenerable   data/cache/fields_*.json is ~49 MB of catalog that `catalog`
+#                 rebuilds on demand.
+#
+# Deny-by-default rather than an enumerated list: new logs, caches and sidecar
+# files appear here constantly, and the failure mode of forgetting one is
+# committing a session cookie. Every writer calls makedirs(exist_ok=True), so
+# the directory rebuilds itself on a fresh clone -- nothing needs tracking to
+# keep the layout.
+data/*
+
+# If you ever want the LLM dataset priors in the repo, this is the one file
+# worth the argument: ~$0.70 of claude-sonnet-5 calls, account-independent, and
+# a fresh clone otherwise re-pays for it. Re-including it needs the whole path
+# chain unignored, so it is left commented rather than half-done:
+#   !data/cache/
+#   data/cache/*
+#   !data/cache/arm_priors.json
+
+# ------------------------------------------------- databases (also outside data/)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ------------------------------------------------------------------ python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ------------------------------------------------------------- os / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# ------------------------------------------------------------------ scratch
+*.bak
+*.orig
+*.tmp
+*.log
