@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Catalog progress at a glance. Usage: scripts/progress.sh [-w]
 cd "$(dirname "$0")/.." || exit 1
-LOG=data/catalog.log
+LOG=data/logs/catalog.log
 PARTS=data/cache/parts_USA_TOP3000_d1
 
 show() {

@@ -11,7 +11,7 @@ show() {
   echo "  執行中  : ${r:-(無)}"
   python3 scripts/_status.py
   echo
-  echo "  log 檔  : data/{catalog,scan,refine,priors_full}.log"
+  echo "  log 檔  : data/logs/"
   echo
 }
 

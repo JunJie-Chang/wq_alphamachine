@@ -14,7 +14,7 @@ os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 # --- catalog -----------------------------------------------------------
 try:
-    log = open("data/catalog.log").read()
+    log = open("data/logs/catalog.log").read()
     n = len(re.findall(r"\[ *\d+/", log))
     f = sum(int(x) for x in re.findall(r"(\d+) fields", log))
     print(f"  catalog : {n}/299 資料集, {f:,} 欄位")
@@ -28,7 +28,7 @@ try:
 except (OSError, ValueError):
     pass
 try:
-    plog = open("data/priors_full.log").read()
+    plog = open("data/logs/priors_full.log").read()
     last = plog.rstrip().splitlines()[-1]
     if "in_progress" in last or "submitted" in last:
         print(f"            (batch 進行中，已輪詢 {plog.count('in_progress')} 次)")
