@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import threading
 import time
 from typing import Any, Iterable
+
+log = logging.getLogger("alphamachine.store")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS candidates (
@@ -112,6 +115,28 @@ CREATE TABLE IF NOT EXISTS deep_checks (
 
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 
+-- Which bandit trials have already been counted, so a verdict teaches exactly
+-- once no matter how many times it is recomputed.
+--
+-- `select` and `gatelog --passing` both run a full deep_verdict() -- real API
+-- calls against yearly-stats and /check -- and used to discard the answer,
+-- because teaching from a command someone runs repeatedly would inflate the
+-- arm. Silence was the wrong fix for that: 21 deep checks were run and 1
+-- reached the bandit, so four arms whose only deep result was a failure still
+-- ranked near the top of the allocation. Idempotency is the right fix.
+--
+-- `key` is the LINEAGE ROOT, not the alpha: on real data those 21 alphas
+-- collapse to 6 roots, and a root is the independent sample -- one scan
+-- candidate, one ladder, one verdict. Keying on alpha_id would count a single
+-- idea four times over its rung variants and re-ladders.
+CREATE TABLE IF NOT EXISTS bandit_taught (
+    stage         TEXT NOT NULL,         -- 'gate' | 'deep'
+    key           TEXT NOT NULL,         -- lineage root candidate id
+    arm           TEXT,
+    ts            REAL,
+    PRIMARY KEY (stage, key)
+);
+
 -- Independent, append-only trail of "did this candidate clear the gate"
 -- decisions. Neither `candidates.stage='gated'` (just "refine's final answer
 -- for this lineage") nor a dry-run `submit` (prints and writes nothing) leaves
@@ -154,9 +179,15 @@ class Store:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.path = path
         self._local = threading.local()
+        # Which tables existed BEFORE the schema ran. SCHEMA is
+        # CREATE TABLE IF NOT EXISTS, so afterwards everything looks present and
+        # a migration keyed on a missing TABLE (rather than a missing column)
+        # would never fire.
         with self.conn() as c:
+            before = {r[0] for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
             c.executescript(SCHEMA)
-        self._migrate()
+        self._migrate(pre_existing=before)
 
     # ------------------------------------------------------------- migration
     # SCHEMA uses CREATE TABLE IF NOT EXISTS, so an existing database never
@@ -171,7 +202,7 @@ class Store:
                          ("deep_reasons", "TEXT")],
     }
 
-    def _migrate(self) -> None:
+    def _migrate(self, pre_existing: set[str] | None = None) -> None:
         c = self.conn()
         added: set[str] = set()
         for table, cols in self.MIGRATIONS.items():
@@ -185,6 +216,54 @@ class Store:
         c.commit()
         if "arms.scan_trials" in added:
             self._backfill_arm_stages()
+        # A database that already had gate_history but not the ledger has deep
+        # verdicts on file that were never counted -- rebuild them once.
+        pre = pre_existing or set()
+        if "gate_history" in pre and "bandit_taught" not in pre:
+            self._rebuild_deep_trials()
+
+    def _rebuild_deep_trials(self) -> None:
+        """Recount the deep stage from gate_history, one trial per lineage.
+
+        gate_history is the authoritative log: record_gate_check(..., deep=)
+        runs at every site that computes a deep verdict. Before the ledger
+        existed only `refine` taught the bandit, so verdicts computed by
+        `select` and `gatelog` -- which cost real API calls -- were discarded.
+
+        REBUILD rather than increment: whatever `refine` did manage to teach is
+        already in these counters, and adding the full history on top would
+        double-count it.
+
+        The gate stage is deliberately NOT rebuilt. gate_history holds a
+        quality_verdict for every simulation `gatelog` walks, including
+        non-champions, so it is not a sample of the "lineages that finished a
+        ladder" population that stage models. Gate only becomes idempotent from
+        here on.
+        """
+        c = self.conn()
+        rows = c.execute(
+            "SELECT g.candidate_id, g.deep_ok, cn.theme, cn.template"
+            "  FROM gate_history g JOIN candidates cn ON cn.id = g.candidate_id"
+            " WHERE g.deep_ok IS NOT NULL ORDER BY g.ts").fetchall()
+        by_root: dict[str, tuple[str, int]] = {}
+        for r in rows:
+            root = self.lineage_root(r["candidate_id"])
+            arm = f"{r['theme']}::{r['template']}"
+            # Last verdict wins: a re-check reflects the current book.
+            by_root[root] = (arm, int(bool(r["deep_ok"])))
+        c.execute("UPDATE arms SET deep_trials=0, deep_pass=0")
+        c.execute("DELETE FROM bandit_taught WHERE stage='deep'")
+        for root, (arm, ok) in by_root.items():
+            c.execute("INSERT OR IGNORE INTO arms(arm,updated) VALUES (?,?)",
+                      (arm, time.time()))
+            c.execute("UPDATE arms SET deep_trials=deep_trials+1,"
+                      " deep_pass=deep_pass+? WHERE arm=?", (ok, arm))
+            c.execute("INSERT OR IGNORE INTO bandit_taught VALUES (?,?,?,?)",
+                      ("deep", root, arm, time.time()))
+        c.commit()
+        if by_root:
+            log.info("rebuilt deep-stage evidence from gate_history: "
+                     "%d lineage(s)", len(by_root))
 
     def _backfill_arm_stages(self) -> None:
         """Split the old pooled `trials` counter into per-stage denominators.
@@ -367,6 +446,41 @@ class Store:
 
     def arms(self) -> list[sqlite3.Row]:
         return self.conn().execute("SELECT * FROM arms").fetchall()
+
+    # ------------------------------------------------------- bandit ledger
+    def lineage_root(self, candidate_id: str) -> str:
+        """Walk a candidate back to the scan candidate its ladder started from.
+
+        The lineage is the bandit's unit of evidence: one scan candidate, one
+        ladder, one verdict. An alpha id is the wrong key -- a single idea
+        appears once per rung variant and once per re-ladder, so on real data 21
+        deep-checked alphas were only 6 independent lineages.
+        """
+        seen: set[str] = set()
+        cur = candidate_id
+        while cur and cur not in seen:
+            seen.add(cur)                      # also breaks a cyclic parent
+            row = self.candidate(cur)
+            if row is None or not row["parent_id"]:
+                return cur
+            cur = row["parent_id"]
+        return cur
+
+    def claim_bandit_trial(self, stage: str, key: str, arm: str = "") -> bool:
+        """Claim the right to count this trial. True only for the first caller.
+
+        Lets every site that computes a verdict teach the bandit without any of
+        them having to know whether another already did. `INSERT OR IGNORE` on
+        the primary key makes the claim atomic, so concurrent processes cannot
+        both win it.
+        """
+        if not key:
+            return False
+        with self.conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO bandit_taught(stage,key,arm,ts) "
+                "VALUES (?,?,?,?)", (stage, key, arm, time.time()))
+            return cur.rowcount > 0
 
     # --------------------------------------------------------- deep_checks
     def save_deep(self, alpha_id: str, *, yearly: Any = None,

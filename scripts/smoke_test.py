@@ -1000,7 +1000,17 @@ check("resume does not collapse to the roots",
       not any(r in roots29 for r in replayed) or
       all(r == b for r, b in zip(replayed, [s.best_id for s in states29])))
 
-# G. --top N should mean N candidates that will do NEW work.
+# G. sqlite3.Row has no .get(). cmd_refine keeps a per-root record and reads it
+# defensively AFTER the wave finishes, so storing the raw Row crashed the whole
+# judging phase -- every simulation paid for, no champion judged.
+_row29 = st29.sims_where("s.status='OK'")[0]
+check("sqlite3.Row genuinely lacks .get(), so it must not be stored raw",
+      not hasattr(_row29, "get"))
+_meta29 = {k: _row29[k] for k in _row29.keys()}
+check("the dict cmd_refine stores instead supports defensive reads",
+      _meta29.get("theme") is not None and _meta29.get("nope", "d") == "d")
+
+# H. --top N should mean N candidates that will do NEW work.
 _sql27 = ("s.status='OK' AND c.stage='scan' AND NOT EXISTS "
           "(SELECT 1 FROM candidates k WHERE k.parent_id=c.id)")
 _unrefined = {r["id"] for r in st29.sims_where(_sql27)}
@@ -1009,6 +1019,107 @@ check("roots that already have children are excluded by default",
 _all = {r["id"] for r in st29.sims_where("s.status='OK' AND c.stage='scan'")}
 check("--redo can still reach them", set(roots29) <= _all)
 for _f in (db29, db30, db31, db32, db33):
+    os.remove(_f)
+
+print("\n[28] deep verdicts teach the bandit exactly once per lineage")
+import sqlite3 as _sq28
+from alphamachine.cli import _teach_deep as _td28
+from alphamachine.bandit import Bandit as _B28, arm_name as _an28
+from alphamachine.metrics import Verdict as _V28
+
+db35 = tempfile.mktemp(suffix=".db"); st35 = Store(db35)
+_ARM = _an28("pv", "level_rank")
+
+
+def _lineage35(store, depth=3):
+    """A scan root plus `depth` descendants, as a real ladder produces."""
+    root = store.add_candidate(expr="group_rank(close, subindustry)",
+                               settings=SimSettings().payload(), theme="pv",
+                               template="level_rank", field="close")
+    chain, parent = [root], root
+    for i in range(depth):
+        c = store.add_candidate(expr=f"winsorize(group_rank(close, subindustry), {i})",
+                                settings=SimSettings().payload(), theme="pv",
+                                template="level_rank", field="close",
+                                stage="refine", parent_id=parent)
+        chain.append(c); parent = c
+    return chain
+
+
+chain35 = _lineage35(st35)
+check("lineage_root walks any depth back to the scan root",
+      all(st35.lineage_root(c) == chain35[0] for c in chain35))
+check("lineage_root of the root is itself",
+      st35.lineage_root(chain35[0]) == chain35[0])
+
+# A. The regression: a verdict computed OUTSIDE refine must reach the arm.
+b35 = _B28(st35, [_ARM])
+_td28(st35, b35, chain35[-1], _ARM, _V28(False, ["only 18% of years positive"]))
+_row = {r["arm"]: r for r in st35.arms()}[_ARM]
+check("a deep verdict from outside refine reaches the arm",
+      _row["deep_trials"] == 1 and _row["deep_pass"] == 0)
+
+# B. Idempotency -- the whole reason teaching from a query command is safe.
+for c in chain35:                        # every rung of the same ladder
+    _td28(st35, b35, c, _ARM, _V28(False, ["x"]))
+for _ in range(5):                       # and gatelog run five more times
+    _td28(st35, b35, chain35[-1], _ARM, _V28(False, ["x"]))
+_row = {r["arm"]: r for r in st35.arms()}[_ARM]
+check("one lineage is one trial, however many alphas or reruns it produces",
+      _row["deep_trials"] == 1, f"deep_trials={_row['deep_trials']}")
+
+# C. Inconclusive teaches nothing AND claims nothing, so a later real verdict
+# for that same lineage can still be counted.
+db36 = tempfile.mktemp(suffix=".db"); st36 = Store(db36)
+chain36 = _lineage35(st36)
+b36 = _B28(st36, [_ARM])
+_td28(st36, b36, chain36[-1], _ARM, None)
+_rows36 = {r["arm"]: r for r in st36.arms()}
+check("an inconclusive verdict teaches nothing",
+      _ARM not in _rows36 or _rows36[_ARM]["deep_trials"] == 0,
+      f"arms={list(_rows36)}")
+check("...and does not burn the claim",
+      st36.claim_bandit_trial("deep", chain36[0], _ARM) is True)
+
+# D. The claim is won exactly once.
+db37 = tempfile.mktemp(suffix=".db"); st37 = Store(db37)
+check("two claimants, one winner",
+      [st37.claim_bandit_trial("deep", "k1", "a::b") for _ in range(3)]
+      == [True, False, False])
+check("a different stage is a different claim",
+      st37.claim_bandit_trial("gate", "k1", "a::b") is True)
+
+# E. Rebuild from gate_history: one trial per lineage, idempotent, and the
+# gate stage is left alone (gate_history includes non-champions, so it is not
+# a clean sample of the population that stage models).
+db38 = tempfile.mktemp(suffix=".db")
+st38 = Store(db38)
+chain38 = _lineage35(st38)
+st38.conn().execute("UPDATE arms SET refine_trials=7, gate_pass=3, deep_trials=1"
+                    " WHERE arm=?", (_ARM,))
+st38.conn().execute("INSERT OR IGNORE INTO arms(arm,updated) VALUES (?,?)",
+                    (_ARM, 0.0))
+st38.conn().execute("UPDATE arms SET refine_trials=7, gate_pass=3, deep_trials=1"
+                    " WHERE arm=?", (_ARM,))
+_g38 = Gates()
+for c in chain38:                        # 4 alphas, all one lineage
+    st38.record_gate_check(c, f"A{c[:4]}", "e", {"sharpe": 2.0, "fitness": 1.5,
+                                                 "turnover": 0.15},
+                           _V28(True, []), _g38, deep=_V28(False, ["lucky"]))
+st38.conn().execute("DROP TABLE bandit_taught")   # simulate a pre-ledger db
+st38.conn().commit()
+st39 = Store(db38)                       # reopen -> migration rebuilds
+_a39 = {r["arm"]: r for r in st39.arms()}[_ARM]
+check("rebuild counts one deep trial per lineage, not per alpha",
+      _a39["deep_trials"] == 1 and _a39["deep_pass"] == 0,
+      f"trials={_a39['deep_trials']} pass={_a39['deep_pass']}")
+check("rebuild leaves the gate stage untouched",
+      _a39["refine_trials"] == 7 and _a39["gate_pass"] == 3)
+st40 = Store(db38)                       # reopen again -> no double count
+_a40 = {r["arm"]: r for r in st40.arms()}[_ARM]
+check("rebuild is one-time, not once per open",
+      _a40["deep_trials"] == 1, f"deep_trials={_a40['deep_trials']}")
+for _f in (db35, db36, db37, db38):
     os.remove(_f)
 
 os.remove(db)

@@ -118,6 +118,26 @@ def cmd_scan(args):
           f"{len(survivors)}")
 
 
+def _teach_deep(store, bandit, candidate_id, arm, dv) -> None:
+    """Count one deep verdict against its arm, at most once per lineage.
+
+    Every site that computes a deep verdict calls this -- refine, select and
+    gatelog alike. Those calls cost real yearly-stats and /check requests, and
+    before the ledger existed only refine's were kept: 21 deep checks ran and 1
+    reached the bandit, leaving arms whose sole deep result was a failure still
+    near the top of the allocation.
+
+    An inconclusive verdict (None) teaches nothing AND claims nothing, so a
+    later real answer for the same lineage can still be counted -- our failed
+    fetch is not the arm's fault.
+    """
+    if dv is None or not candidate_id:
+        return
+    root = store.lineage_root(candidate_id)
+    if store.claim_bandit_trial("deep", root, arm):
+        bandit.update(arm, stage="deep", passed=dv.ok)
+
+
 def cmd_refine(args):
     cfg, store, client = _setup(args)
     g = cfg.gates
@@ -155,7 +175,9 @@ def cmd_refine(args):
         if st is None:
             continue
         states.append(st)
-        meta[st.root_id] = r
+        # Plain dict, not the sqlite3.Row: Row has no .get(), and the champion
+        # judging below reads these defensively long after the wave has moved on.
+        meta[st.root_id] = {k: r[k] for k in r.keys()}
     print(f"refining {len(states)} survivors, ladders interleaved")
 
     finished, rounds = [], 0
@@ -205,14 +227,16 @@ def cmd_refine(args):
         best_id = s.best_id
         r = meta.get(s.root_id) or {}
         arm = arm_name(r.get("theme", ""), r.get("template", ""))
+        root = s.root_id
         qv = quality_verdict(best, g)
         print(f"\n{r.get('template')}/{r.get('theme')} on {r.get('field')}"
               f"  -> sharpe={best.get('sharpe', 0):.2f} "
               f"fitness={best.get('fitness', 0):.2f} "
               f"turnover={best.get('turnover', 0):.3f} "
               f"| gate: {'PASS' if qv.ok else '; '.join(qv.reasons[:2])}")
-        bandit.update(arm, stage="gate", passed=qv.ok,
-                      sharpe=abs(best.get("sharpe") or 0))
+        if store.claim_bandit_trial("gate", root, arm):
+            bandit.update(arm, stage="gate", passed=qv.ok,
+                          sharpe=abs(best.get("sharpe") or 0))
 
         # The deep gate is only informative for champions that got past the
         # metric gate -- below it the reward is already 0, so paying for the
@@ -229,7 +253,7 @@ def cmd_refine(args):
             else:
                 print(f"       deep: "
                       f"{'PASS' if dv.ok else '; '.join(dv.reasons[:2])}")
-                bandit.update(arm, stage="deep", passed=dv.ok)
+                _teach_deep(store, bandit, best_id, arm, dv)
         store.record_gate_check(best_id, aid, r.get("expr", ""), best, qv, g,
                                 deep=dv)
 
@@ -241,6 +265,7 @@ def cmd_select(args):
     rows = store.sims_where(
         "s.status='OK' AND c.stage='gated' ORDER BY abs(s.sharpe) DESC LIMIT 200")
     sub = Submitter(cfg, store, client)
+    bandit = Bandit(store, [], seed=getattr(args, "seed", 0))
     cands = []
     qualified = 0            # cleared quality_verdict, regardless of PnL
     blocked_deep = []         # cleared the metrics but not the deep gate
@@ -254,6 +279,8 @@ def cmd_select(args):
         # a basket of three "passing" alphas got blocked three ways at submit.
         dv = sub.deep_verdict(aid) if (qv.ok and aid) else None
         store.record_gate_check(r["id"], aid, r["expr"], rec, qv, g, deep=dv)
+        _teach_deep(store, bandit, r["id"],
+                    arm_name(r["theme"], r["template"]), dv)
         if not qv.ok:
             continue
         qualified += 1
@@ -447,6 +474,9 @@ def cmd_gatelog(args):
             cfg, store, client = _setup(args)
             g = cfg.gates
             sub = Submitter(cfg, store, client)
+        # After `store` is final: _setup rebinds it, and the bandit reads the
+        # arm table at construction.
+        bandit = Bandit(store, [], seed=0)
         for r in store.sims_where("s.status='OK'"):
             rec = {k: r[k] for k in r.keys()}
             rec["checks"] = json.loads(r["checks"] or "[]")
@@ -463,6 +493,8 @@ def cmd_gatelog(args):
                     unverified += 1
             store.record_gate_check(r["id"], r["alpha_id"], r["expr"], rec,
                                     qv, g, deep=dv)
+            _teach_deep(store, bandit, r["id"],
+                        arm_name(r["theme"], r["template"]), dv)
         rows = store.gate_passing_now(limit=args.limit)
         print(f"\n{len(rows)} candidate(s) submit-grade RIGHT NOW "
               f"(sharpe>={g.sharpe} fitness>={g.fitness} "
