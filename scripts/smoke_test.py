@@ -1584,6 +1584,22 @@ _fH = _AU32.check_candidate_id_integrity(st32.conn())
 check("a candidate whose id no longer matches its own expr is caught",
       _fires32(_fH, "candidate_id_mismatch", candidate_id=_cidH), f"{_fH}")
 
+# H2. Corrupted (not merely mismatched) settings JSON must not crash the
+# whole audit -- json.loads raises json.JSONDecodeError (a ValueError
+# subclass), which an except TypeError alone does not catch, so this used to
+# propagate out of check_candidate_id_integrity and abort run_all() before
+# any later check ran.
+with st32.conn() as _c32:
+    _c32.execute(
+        "INSERT INTO candidates (id,expr,settings,theme,template,field,"
+        "stage,parent_id,created) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("cH2", "e", "{not valid json", "pv", "level_rank", "f", "scan",
+         None, 0.0))
+_fH2 = _AU32.check_candidate_id_integrity(st32.conn())
+check("corrupted (non-JSON) settings is reported, not raised",
+      _fires32(_fH2, "candidate_settings_corrupted", candidate_id="cH2"),
+      f"{_fH2}")
+
 # I. stage/parent shape -- a root with a variant's stage, and vice versa.
 with st32.conn() as _c32:
     _c32.execute(

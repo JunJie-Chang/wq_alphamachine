@@ -207,6 +207,17 @@ def check_candidate_id_integrity(conn: sqlite3.Connection) -> list[Finding]:
     for r in conn.execute("SELECT id, expr, settings FROM candidates"):
         try:
             payload = json.loads(r["settings"] or "{}")
+        except ValueError as e:
+            # json.loads raises json.JSONDecodeError (a ValueError subclass)
+            # on malformed JSON -- distinct from, and worse than, the
+            # TypeError case below: this is actual column corruption, not a
+            # config.py field rename.
+            out.append(Finding(
+                "candidate_settings_corrupted", "critical", "candidates",
+                f"settings column is not valid JSON: {e}",
+                {"candidate_id": r["id"]}))
+            continue
+        try:
             key = SimSettings(**payload).key()
         except TypeError as e:
             out.append(Finding(
