@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field as dc_field
 from typing import Any
 
-from .config import Gates, PLATFORM_CHECKS, fitness
+from .config import Gates, PLATFORM_CHECKS, fitness, subuniverse_floor
 
 
 @dataclass
@@ -57,6 +57,20 @@ def check_value(checks: list[dict], name: str) -> float | None:
     return None
 
 
+def check_limit(checks: list[dict], name: str) -> float | None:
+    """The threshold BRAIN itself applied, straight from the checks payload.
+
+    Worth preferring over any local formula wherever it exists: it is the
+    authoritative number, it is already per-alpha (LOW_SUB_UNIVERSE_SHARPE
+    scales with the alpha's own Sharpe), and every simulation record we hold
+    carries it.
+    """
+    for c in checks or []:
+        if c.get("name") == name:
+            return _f(c.get("limit"))
+    return None
+
+
 def check_result(checks: list[dict], name: str) -> str | None:
     for c in checks or []:
         if c.get("name") == name:
@@ -92,8 +106,18 @@ def platform_verdict(rec: dict) -> Verdict:
     return Verdict(not reasons, reasons)
 
 
-def quality_verdict(rec: dict, g: Gates) -> Verdict:
-    """Our gate. Deliberately stricter than the platform's on every axis."""
+def quality_verdict(rec: dict, g: Gates, universe: str = "TOP3000",
+                    region: str = "USA") -> Verdict:
+    """Our gate: would BRAIN accept this, and is it worth our slot?
+
+    Stricter than the platform where we have a documented reason (Sharpe,
+    Fitness, drawdown, margin) -- but NOT stricter on the submission ceilings
+    themselves. Being stricter there does not raise quality, it just hides
+    alphas BRAIN would have taken; see the Gates docstring for what that cost.
+
+    `universe`/`region` are only consulted for the sub-universe fallback, when
+    a record has no BRAIN-reported limit to read.
+    """
     r: list[str] = []
     sh = abs(rec.get("sharpe") or 0.0)
     fit = abs(rec.get("fitness") or 0.0)
@@ -112,11 +136,20 @@ def quality_verdict(rec: dict, g: Gates) -> Verdict:
     if dd > g.max_drawdown:
         r.append(f"drawdown {dd:.3f} > {g.max_drawdown}")
 
+    # A signal that only works on the full universe is usually a small-cap /
+    # illiquidity artefact. But the bar is BRAIN's, not a flat ratio of our
+    # own: LOW_SUB_UNIVERSE_SHARPE is 0.75*sqrt(sub_size/size)*sharpe
+    # (BRAIN_RULES.md:27), roughly 0.433x on USA/TOP3000 -- so the old
+    # `sub/sharpe < 0.70` test rejected alphas BRAIN passes, by a wide margin.
+    # Prefer the limit BRAIN reported; fall back to the formula only for a
+    # record that predates the check.
     sub = rec.get("subuniverse_sharpe")
-    if sub is not None and sh > 0 and (sub / sh) < g.subuniverse_ratio:
-        # A signal that only works on the full universe is usually a
-        # small-cap/illiquidity artefact, and it will not survive live costs.
-        r.append(f"sub-universe sharpe ratio {sub / sh:.2f} < {g.subuniverse_ratio}")
+    if sub is not None:
+        floor = check_limit(rec.get("checks"), "LOW_SUB_UNIVERSE_SHARPE")
+        if floor is None:
+            floor = subuniverse_floor(sh, universe, region)
+        if sub < floor:
+            r.append(f"sub-universe sharpe {sub:.2f} < {floor:.2f}")
 
     if mg is not None:
         bps = mg * 10000.0 if abs(mg) < 1.0 else mg
@@ -202,8 +235,13 @@ def headroom(rec: dict, g: Gates) -> float:
     sh = abs(rec.get("sharpe") or 0.0)
     fit = abs(rec.get("fitness") or 0.0)
     to = rec.get("turnover") or 1.0
+    # Scored against the PREFERRED turnover, not the submission ceiling. The
+    # ceiling decides what is allowed; this decides what the refinement ladder
+    # climbs toward, and Value Factor rewards staying near 30% (BRAIN_RULES.md
+    # :77) plus a PASS-threshold discount below it (line 44). Scoring against
+    # 0.70 here would flatten that gradient and let the ladder drift up.
     slacks = [sh / max(g.sharpe, 1e-9), fit / max(g.fitness, 1e-9),
-              g.turnover_max / max(to, 1e-9)]
+              g.turnover_ideal_max / max(to, 1e-9)]
     # Turnover has a FLOOR as well as a ceiling. Scoring only the ceiling makes
     # a 0.4% -turnover alpha look outstanding when it is actually unsubmittable
     # (LOW_TURNOVER), and the refinement ladder will happily climb toward it --

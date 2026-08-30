@@ -1367,6 +1367,75 @@ os.remove(_pc30)
 for _f30 in (db30, db31, db32):
     os.remove(_f30)
 
+print("\n[31] gates BLOCK what BRAIN rejects, PREFER what pays well")
+from alphamachine.config import AutoGates as _AG31
+from alphamachine.metrics import check_limit as _cl31
+g31 = Gates()
+
+# The regression this section exists for: omqZOwpb, verbatim from the database.
+# Our old gate rejected it on a flat sub/sharpe ratio of 0.61 < 0.70, so it
+# never reached a deep check. BRAIN's own /check passed every line except
+# PROD_CORRELATION (0.767) -- including LOW_SUB_UNIVERSE_SHARPE, limit 1.14.
+real31 = {"sharpe": 2.64, "fitness": 1.63, "turnover": 0.2883,
+          "drawdown": 0.0329, "margin": 0.000764, "longCount": 1224,
+          "shortCount": 1882, "subuniverse_sharpe": 1.6,
+          "checks": [{"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "PASS",
+                      "limit": 1.14, "value": 1.6},
+                     {"name": "HIGH_TURNOVER", "result": "PASS",
+                      "limit": 0.7, "value": 0.2883}]}
+_v31 = quality_verdict(real31, g31)
+check("the best real candidate is no longer hidden by our own gate",
+      _v31.ok, f"-> {_v31.reasons}")
+check("its sub/sharpe ratio really is under the OLD flat bar",
+      real31["subuniverse_sharpe"] / real31["sharpe"] < 0.70,
+      f"{real31['subuniverse_sharpe'] / real31['sharpe']:.2f}")
+
+# Sub-universe: BRAIN's per-alpha limit is the bar, not a ratio of our own.
+check("sub-universe judged against BRAIN's reported limit, and passes",
+      quality_verdict(dict(real31, subuniverse_sharpe=1.20), g31).ok)
+check("sub-universe below BRAIN's reported limit still fails",
+      not quality_verdict(dict(real31, subuniverse_sharpe=1.00), g31).ok)
+check("check_limit reads the limit, check_value reads the value",
+      _cl31(real31["checks"], "LOW_SUB_UNIVERSE_SHARPE") == 1.14
+      and _cl31(real31["checks"], "NOPE") is None)
+# Fallback for a record with no check to read: the BRAIN_RULES.md formula,
+# never the flat ratio.
+_nc31 = {k: v for k, v in real31.items() if k != "checks"}
+_nc31["checks"] = []
+check("with no reported limit it falls back to the documented formula",
+      quality_verdict(_nc31, g31).ok
+      and not quality_verdict(dict(_nc31, subuniverse_sharpe=0.9), g31).ok,
+      f"floor={subuniverse_floor(2.64, 'TOP3000'):.2f}")
+
+# Turnover: block at BRAIN's 0.70 ceiling, prefer 0.30.
+mid31 = dict(real31, turnover=0.45)
+check("turnover between the ideal and the ceiling is ACCEPTED now",
+      quality_verdict(mid31, g31).ok, f"-> {quality_verdict(mid31, g31).reasons}")
+check("turnover above BRAIN's 0.70 ceiling is still rejected",
+      not quality_verdict(dict(real31, turnover=0.75), g31).ok)
+check("but headroom still prefers the low-turnover version",
+      headroom(dict(real31, turnover=0.25), g31) > headroom(mid31, g31),
+      f"{headroom(dict(real31, turnover=0.25), g31):.2f} vs "
+      f"{headroom(mid31, g31):.2f}")
+check("headroom still punishes turnover under the FLOOR",
+      headroom(dict(real31, turnover=0.005), g31) < headroom(mid31, g31))
+
+# Correlation ceilings match the platform rather than padding below it.
+check("self/prod correlation gates sit at the documented 0.70 ceiling",
+      g31.max_self_corr == 0.70 and g31.max_prod_corr == 0.70)
+check("a 0.65 prod-corr alpha is no longer pre-rejected below BRAIN's bar",
+      quality_verdict(dict(real31, prod_correlation=0.65), g31).ok)
+check("a 0.75 prod-corr alpha is still rejected",
+      not quality_verdict(dict(real31, prod_correlation=0.75), g31).ok)
+
+# AutoGates is the one place staying deliberately stricter: nothing reviews an
+# unattended submission, so the asymmetry there is the point.
+check("unattended gates stay tighter than the manual ones",
+      not quality_verdict(mid31, _AG31()).ok
+      and _AG31().turnover_max < g31.turnover_max)
+check("AutoGates keeps its score and block aligned",
+      _AG31().turnover_ideal_max <= _AG31().turnover_max)
+
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")
 sys.exit(1 if fail else 0)

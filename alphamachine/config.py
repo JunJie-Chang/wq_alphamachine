@@ -127,8 +127,32 @@ class Gates:
     inflated number on top of 1.58. Pushing the gate to e.g. 1.80 "for margin"
     mostly just throws away real candidates (1.7x-Sharpe alphas that are
     already above the true floor) without a documented reason to justify it.
-    Where a number below IS backed by official guidance (turnover_max,
-    subuniverse_ratio, min_margin_bps) that guidance is kept as-is.
+
+    BLOCK vs PREFER -- the distinction this class got wrong for a long time
+    ------------------------------------------------------------------------
+    BRAIN_RULES.md carries two different kinds of number and they were being
+    applied as if they were one:
+
+      * SUBMISSION requirements (line 17-20) -- what BRAIN actually rejects.
+        Turnover 1%-70%, self/prod correlation < 0.7.
+      * VALUE FACTOR guidance (line 76-77) -- "官方提高建議", advice on what
+        EARNS well once submitted: turnover < 30%, retain 70% of Sharpe in the
+        sub/super universe, margin > 4bps.
+
+    The second set was wired in as a hard rejection, so a preference about
+    payout was silently deciding what was allowed to exist. Measured cost, on
+    the database as it stood: of 100 distinct ideas clearing Sharpe 1.58 and
+    Fitness 1.0, only 19 survived -- turnover alone hid 39 and the sub-universe
+    rule hid another 34. Among the hidden was the best candidate the pipeline
+    has ever produced (Sharpe 2.64 / Fitness 1.63), whose real server check
+    came back PASS on every line except PROD_CORRELATION at 0.767.
+
+    So: the `*_max` / `*_min` fields below are BLOCKS and mirror what BRAIN
+    rejects. The `*_ideal_*` fields are PREFERENCES -- they steer `headroom()`,
+    and through it the refinement ladder, toward the Value-Factor sweet spot
+    without discarding anything BRAIN would have accepted. Widening the block
+    costs no extra API budget: deep checks are capped per run and spent in
+    score order, so a bigger eligible pool only improves what the cap buys.
     """
     # Survival bar for the coarse scan. Kept below where you might set it by
     # instinct: in the first real run the ONLY candidate that went on to clear
@@ -139,15 +163,23 @@ class Gates:
     sharpe: float = 1.58                 # CONSULTANT D1 floor (BRAIN_RULES.md)
     fitness: float = 1.00                # consultant D1 floor (BRAIN_RULES.md)
     turnover_min: float = 0.01
-    # Official guidance for Value Factor (the quarterly-payment driver) is
-    # turnover under 30%, which is stricter than the 70% submission ceiling.
-    turnover_max: float = 0.30
-    # Official guidance: retain 70% of Sharpe in sub/super universe.
+    turnover_max: float = 0.70           # BRAIN_RULES.md:17 submission ceiling
+    # PREFERENCE, not a block: Value Factor guidance (BRAIN_RULES.md:77) is
+    # turnover < 30%, and low turnover also earns a discount on the PASS
+    # threshold (line 44). headroom() scores against this, so the refinement
+    # ladder still climbs toward it -- it just no longer deletes the rest.
+    turnover_ideal_max: float = 0.30
+    # PREFERENCE. The BLOCK for sub-universe Sharpe is BRAIN's own per-alpha
+    # limit, which every simulation record carries verbatim in its checks
+    # payload (`LOW_SUB_UNIVERSE_SHARPE`, e.g. limit 1.14 against Sharpe 2.64
+    # -- that is 0.433x, the BRAIN_RULES.md:27 formula, NOT a flat 0.70). See
+    # metrics.quality_verdict; subuniverse_floor() below is the fallback when
+    # a record predates the check.
     subuniverse_ratio: float = 0.70
     max_drawdown: float = 0.12
     min_margin_bps: float = 4.0          # official guidance: margin > 4 bps
-    max_self_corr: float = 0.55          # platform ceiling 0.70
-    max_prod_corr: float = 0.60          # platform ceiling 0.70
+    max_self_corr: float = 0.70          # BRAIN_RULES.md:19 platform ceiling
+    max_prod_corr: float = 0.70          # BRAIN_RULES.md:20 platform ceiling
     min_years_positive: float = 0.70     # fraction of IS years with +PnL
     max_year_pnl_share: float = 0.50     # no single year carries the alpha
 
@@ -258,9 +290,14 @@ class AutoGates(Gates):
     """
     sharpe: float = 2.10              # manual 1.58, consultant floor 1.58
     fitness: float = 1.50             # manual 1.00, consultant floor 1.00
-    turnover_max: float = 0.22        # manual 0.30, submission ceiling 0.70
-    max_self_corr: float = 0.40       # manual 0.55, platform 0.70
-    max_prod_corr: float = 0.45       # manual 0.60, platform 0.70
+    # These stay well inside the submission ceilings ON PURPOSE. Unlike the
+    # manual gates -- where being stricter than BRAIN silently destroyed
+    # candidates -- here the asymmetry is the point, because nothing downstream
+    # reviews the decision.
+    turnover_max: float = 0.22        # manual 0.70 (ceiling), ideal 0.30
+    turnover_ideal_max: float = 0.22  # keep score and block aligned here
+    max_self_corr: float = 0.40       # manual 0.70, platform 0.70
+    max_prod_corr: float = 0.45       # manual 0.70, platform 0.70
     subuniverse_ratio: float = 0.80   # manual 0.70 (official guidance)
     max_drawdown: float = 0.10        # manual 0.12
     min_years_positive: float = 0.80  # manual 0.70
