@@ -104,8 +104,19 @@ class BrainClient:
     # locks the account out with BIOMETRICS_THROTTLED. The budget is therefore
     # enforced client-side, below the platform cap, and it is a hard stop
     # rather than a warning.
+    #
+    # Was 10. Once autoloop.py started running the pipeline unattended, a
+    # session expiring every ~4h (SESSION_TTL_HOURS) started hitting this
+    # SELF-imposed number rather than the platform's, halting the loop and
+    # paging a human to raise a fresh inquiry by hand purely to work around our
+    # own margin -- 2026-08-30 alone needed several manual overrides. Same
+    # mistake as the Gates rewrite the same day: a conservative guess, applied
+    # as a hard stop, ends up doing more harm than the real limit it was
+    # guarding against. 20 keeps a real 5-request buffer below the platform's
+    # 25 -- enough to survive one manual re-auth misfire -- while no longer
+    # being the day's dominant cause of downtime.
     BIOMETRIC_DAILY_CAP = 25
-    BIOMETRIC_SAFE_BUDGET = 10
+    BIOMETRIC_SAFE_BUDGET = 20
 
     def _bio_log_path(self) -> str:
         return os.path.join(os.path.dirname(self.cookie_path) or ".",

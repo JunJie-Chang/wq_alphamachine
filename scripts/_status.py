@@ -8,9 +8,12 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
 
-os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
 
 # --- catalog -----------------------------------------------------------
 try:
@@ -71,6 +74,8 @@ if os.path.exists("data/machine.db"):
 try:
     n = len([t for t in json.load(open("data/biometric_attempts.json"))
              if t > time.time() - 86400])
-    print(f"  人臉額度: 24h 內用了 {n}/10  (平台上限 25)")
+    from alphamachine.client import BrainClient
+    print(f"  人臉額度: 24h 內用了 {n}/{BrainClient.BIOMETRIC_SAFE_BUDGET}"
+          f"  (平台上限 {BrainClient.BIOMETRIC_DAILY_CAP})")
 except (OSError, ValueError):
     pass

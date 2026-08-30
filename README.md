@@ -362,8 +362,8 @@ that shapes the whole auth design. Two things make it easy to blow:
 So `scripts/auth_wait.py` spends **exactly 2 units per attempt**: one to raise
 the inquiry, one to finalise it. Waiting happens on a local sentinel file
 (`touch data/persona_done`), never on the network. `BrainClient` additionally
-enforces a client-side budget of **10 per rolling 24h** and raises rather than
-requesting an 11th — a hard stop, not a warning.
+enforces a client-side budget of **20 per rolling 24h** and raises rather than
+requesting a 21st — a hard stop, not a warning.
 
 A verified session's cookie jar is persisted to `data/cookies.json` (mode 600,
 gitignored) and reused, so in normal operation you do the face check once and
@@ -495,9 +495,11 @@ wastes a slot, a bad submission occupies book space and cannot be withdrawn.
 server-side queue and costs you the ability to react to results as they land.
 
 **Biometric quota is the real operational constraint**, not simulation budget.
-The client hard-stops at 10 requests per rolling 24h against a platform cap of
+The client hard-stops at 20 requests per rolling 24h against a platform cap of
 25. In steady state you complete one face check and the persisted session
-carries you; the quota only becomes visible when a session lapses mid-run.
+carries you; the quota only becomes visible when a session lapses mid-run --
+which happens roughly every 4h under unattended operation (`autoloop.py`),
+since each expiry needs its own re-authentication.
 
 ### Sources
 
