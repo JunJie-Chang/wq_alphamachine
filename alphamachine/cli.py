@@ -17,7 +17,9 @@ import logging
 import os
 import sys
 import time
+from collections import Counter
 
+from . import audit
 from .bandit import Bandit, arm_name
 from .catalog import Catalog
 from .client import BrainClient
@@ -588,6 +590,39 @@ def cmd_gatelog(args):
     print()
 
 
+def cmd_audit(args):
+    """Read-only consistency audit of the live database.
+
+    Bypasses Store deliberately: Store() runs migrations and takes a
+    write-capable connection, and this must be safe to run at any time,
+    including while autoloop.py is mid-write (see alphamachine.audit.open_ro).
+
+    Born from two real bugs found only because a human happened to ask about
+    one specific candidate -- a poisoned deep_checks cache entry and a
+    stale-pass bug in gate_passing_now(). This exists to catch the next one
+    proactively instead of by luck.
+    """
+    conn = audit.open_ro(args.db)
+    try:
+        findings = audit.run_all(conn)
+    finally:
+        conn.close()
+
+    order = {"critical": 0, "warning": 1, "info": 2}
+    findings.sort(key=lambda f: (order.get(f.severity, 9), f.check))
+    counts = Counter(f.severity for f in findings)
+    print(f"\naudit: {len(findings)} finding(s) -- "
+          f"{counts.get('critical', 0)} critical, "
+          f"{counts.get('warning', 0)} warning, "
+          f"{counts.get('info', 0)} info  ({len(audit.CHECKS)} checks run)\n")
+    for f in findings:
+        detail = " ".join(f"{k}={v}" for k, v in f.detail.items())
+        print(f"  [{f.severity.upper():8}] {f.check}: {f.summary}"
+              + (f"\n             {detail}" if detail else ""))
+    print()
+    return 1 if counts.get("critical") else 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser("alphamachine")
     p.add_argument("--db", default="data/machine.db")
@@ -657,6 +692,14 @@ def main(argv=None):
                         "needing one are reported as unverified, not passing")
     s.add_argument("--limit", type=int, default=40)
     s.set_defaults(fn=cmd_gatelog)
+
+    s = sub.add_parser("audit",
+                       help="read-only consistency audit of the live db -- "
+                            "catches the class of bug behind gate_passing_now's "
+                            "stale-pass regression and the poisoned deep_checks "
+                            "cache, without needing to already suspect a "
+                            "specific candidate")
+    s.set_defaults(fn=cmd_audit)
 
     s = sub.add_parser("run")
     s.add_argument("--budget", type=int, default=200)

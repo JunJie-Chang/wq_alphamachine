@@ -1470,6 +1470,224 @@ check("unattended gates stay tighter than the manual ones",
 check("AutoGates keeps its score and block aligned",
       _AG31().turnover_ideal_max <= _AG31().turnover_max)
 
+print("\n[32] audit: consistency checks against the live-shaped database")
+from alphamachine import audit as _AU32
+import sqlite3 as _sq32, time as _t32
+
+db32 = tempfile.mktemp(suffix=".db"); st32 = Store(db32)
+
+# A. Clean baseline FIRST -- one legitimate row through every table, built
+# entirely through the public Store API. Every "fires on broken data"
+# assertion below is only meaningful if this passes: an audit tool that
+# false-positives on ordinary correct data trains people to ignore it.
+_cid32 = st32.add_candidate(expr="group_rank(fa, sector)",
+                            settings=SimSettings().payload(), theme="pv",
+                            template="level_rank", field="fa",
+                            settings_key=SimSettings().key())
+st32.record_sim(_cid32, {"alpha_id": "CLEAN1", "status": "OK", "sharpe": 1.8,
+                        "fitness": 1.2, "turnover": 0.15, "checks": []})
+st32.conn().execute("UPDATE candidates SET stage='gated' WHERE id=?", (_cid32,))
+st32.record_gate_check(_cid32, "CLEAN1", "group_rank(fa, sector)",
+                       {"sharpe": 1.8, "fitness": 1.2, "turnover": 0.15},
+                       _V27(True, []), Gates(), deep=_V27(True, []))
+st32.bump_arm("pv::level_rank", trial=1, scan_trials=1, scan_pass=1)
+_clean32 = _AU32.run_all(st32.conn())
+check("a clean, legitimately-built database has zero findings",
+      _clean32 == [], f"{_clean32}")
+
+def _fires32(findings, check_name, **want):
+    return any(f.check == check_name
+              and all(f.detail.get(k) == v for k, v in want.items())
+              for f in findings)
+
+# B. gate_history: deep computed after a metric-gate FAIL. The store method
+# itself has no guard against this shape -- only caller discipline in
+# cli.py's three call sites does.
+st32.record_gate_check("cB", "AB", "expr_b", _rec27,
+                       _V27(False, ["sharpe too low"]), Gates(),
+                       deep=_V27(True, []))
+_fB = _AU32.check_gate_history_ok0_with_deep(st32.conn())
+check("deep-after-metric-fail is caught",
+      _fires32(_fB, "gate_history_deep_computed_after_metric_fail",
+               candidate_id="cB"), f"{_fB}")
+
+# C. deep_checks poisoning -- the exact shape from section [26]'s fixture,
+# now checked by the audit tool instead of by deep_verdict() itself.
+st32.save_deep("AC", yearly={"records": [[1]]}, checks=[], ok=True, reasons=[])
+_fC = _AU32.check_deep_checks_poisoned(st32.conn())
+check("a poisoned (ok=1, empty checks) cache row is caught",
+      _fires32(_fC, "deep_checks_poisoned", alpha_id="AC"), f"{_fC}")
+
+# D. gate_passing_now, against the LIVE-shaped table -- a later fail must
+# leave BOTH the live query's own answer and audit's independent
+# recomputation agreeing "not passing", since the query is already fixed
+# (this is the same scenario section [25]'s st27 fixture already proves
+# directly against gate_passing_now() itself). Zero findings here is the
+# correct outcome, not a gap: the real disagreement this checker exists to
+# catch is the ts-TIE case right below, which the SQL's arbitrary join CAN
+# still get wrong even with the fix in place.
+st32.record_gate_check("cD1", "AD1", "expr_d", _rec27,
+                       _V27(True, []), Gates(), deep=_V27(True, []))
+_tD = _t32.time() + 10.0     # force strict ordering after the row above
+with st32.conn() as _c32:
+    _c32.execute(
+        "INSERT INTO gate_history (ts,candidate_id,alpha_id,expr,ok,"
+        "deep_ok,deep_reasons) VALUES (?,?,?,?,?,?,?)",
+        (_tD, "cD2", "AD2", "expr_d", 1, 0, "[\"PROD_CORRELATION\"]"))
+_fD = _AU32.check_gate_passing_now_consistency(st32.conn())
+check("a later fail is agreed on by both the live query and audit's own "
+      "recomputation -- no false alarm on data the fixed code already "
+      "handles correctly",
+      not any(f.detail.get("expr") == "expr_d" for f in _fD), f"{_fD}")
+
+_tTie = _t32.time() + 20.0
+with st32.conn() as _c32:
+    _c32.execute(
+        "INSERT INTO gate_history (ts,candidate_id,alpha_id,expr,ok,"
+        "deep_ok,deep_reasons) VALUES (?,?,?,?,?,?,?)",
+        (_tTie, "cE1", "AE1", "expr_e", 1, 1, "[]"))
+    _c32.execute(
+        "INSERT INTO gate_history (ts,candidate_id,alpha_id,expr,ok,"
+        "deep_ok,deep_reasons) VALUES (?,?,?,?,?,?,?)",
+        (_tTie, "cE2", "AE2", "expr_e", 1, 0, "[\"lucky year\"]"))
+_fE = _AU32.check_gate_passing_now_consistency(st32.conn())
+check("a ts-tie is resolved by id, not left to the SQL join's discretion",
+      any(f.detail.get("expr") == "expr_e" for f in _fE), f"{_fE}")
+
+# F. arms bounds -- bump_arm is additive, so a direct raw UPDATE is the only
+# way to construct pass > trials (no legitimate caller ever would).
+st32.bump_arm("bad::arm", trial=1, scan_trials=1, scan_pass=1)
+with st32.conn() as _c32:
+    _c32.execute("UPDATE arms SET scan_pass=10 WHERE arm='bad::arm'")
+_fF = _AU32.check_arms_bounds(st32.conn())
+check("scan_pass exceeding scan_trials is caught",
+      _fires32(_fF, "arms_bounds_violation", arm="bad::arm"), f"{_fF}")
+
+# G. bandit_taught vs arms.deep_trials -- deliberately exact, unlike
+# scan/refine (which _backfill_arm_stages documents as an approximation).
+st32.bump_arm("untaught::arm", trial=1, deep_trials=3, deep_pass=1)
+_fG = _AU32.check_bandit_taught_vs_deep_trials(st32.conn())
+check("deep_trials with zero matching bandit_taught claims is caught",
+      _fires32(_fG, "deep_trials_bandit_taught_mismatch", arm="untaught::arm",
+              bandit_taught_deep_n=0, arms_deep_trials=3), f"{_fG}")
+
+# H. candidate id integrity -- mutate expr after insertion so the stored id
+# (hashed from the ORIGINAL expr) no longer matches the row it sits on.
+_cidH = st32.add_candidate(expr="group_rank(e1, sector)",
+                           settings=SimSettings().payload(), theme="pv",
+                           template="level_rank", field="e1",
+                           settings_key=SimSettings().key())
+with st32.conn() as _c32:
+    _c32.execute("UPDATE candidates SET expr='group_rank(e2, sector)' "
+                "WHERE id=?", (_cidH,))
+_fH = _AU32.check_candidate_id_integrity(st32.conn())
+check("a candidate whose id no longer matches its own expr is caught",
+      _fires32(_fH, "candidate_id_mismatch", candidate_id=_cidH), f"{_fH}")
+
+# I. stage/parent shape -- a root with a variant's stage, and vice versa.
+with st32.conn() as _c32:
+    _c32.execute(
+        "INSERT INTO candidates (id,expr,settings,theme,template,field,"
+        "stage,parent_id,created) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("cI1", "e", "{}", "pv", "level_rank", "f", "refine", None, 0.0))
+    _c32.execute(
+        "INSERT INTO candidates (id,expr,settings,theme,template,field,"
+        "stage,parent_id,created) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("cI2", "e", "{}", "pv", "level_rank", "f", "scan", "cI1", 0.0))
+_fI = _AU32.check_candidate_stage_shape(st32.conn())
+check("a root candidate with a variant's stage is caught",
+      _fires32(_fI, "root_candidate_bad_stage", candidate_id="cI1"), f"{_fI}")
+check("a variant candidate with a root's stage is caught",
+      _fires32(_fI, "variant_candidate_bad_stage", candidate_id="cI2"), f"{_fI}")
+
+# J. gated without an OK sim -- cmd_select's silent join assumption.
+_cidJ = st32.add_candidate(expr="group_rank(fj, sector)",
+                           settings=SimSettings().payload(), theme="pv",
+                           template="level_rank", field="fj",
+                           settings_key=SimSettings().key())
+with st32.conn() as _c32:
+    _c32.execute("UPDATE candidates SET stage='gated' WHERE id=?", (_cidJ,))
+_fJ = _AU32.check_gated_has_ok_sim(st32.conn())
+check("a gated candidate with no OK simulation is caught",
+      _fires32(_fJ, "gated_without_ok_sim", candidate_id=_cidJ), f"{_fJ}")
+
+# K. field2 shape -- three violations in one pass: set where not needed,
+# missing where required, and equal to field where set.
+_cidK1 = st32.add_candidate(expr="group_rank(fk1, sector)",
+                            settings=SimSettings().payload(), theme="pv",
+                            template="level_rank", field="fk1", field2="fk2",
+                            settings_key=SimSettings().key() + "k1")
+_cidK2 = st32.add_candidate(expr="group_rank(divide(fk3, fk4), sector)",
+                            settings=SimSettings().payload(), theme="pv",
+                            template="ratio_fields", field="fk3",
+                            settings_key=SimSettings().key() + "k2")
+_cidK3 = st32.add_candidate(expr="group_rank(divide(fk5, fk5), sector)",
+                            settings=SimSettings().payload(), theme="pv",
+                            template="ratio_fields", field="fk5",
+                            field2="fk5",
+                            settings_key=SimSettings().key() + "k3")
+_fK = _AU32.check_field2_shape(st32.conn())
+check("field2 set on a single-field template is caught",
+      _fires32(_fK, "field2_set_for_single_field_template",
+              candidate_id=_cidK1), f"{_fK}")
+check("field2 missing on a two-field template is caught",
+      _fires32(_fK, "field2_missing_for_two_field_template",
+              candidate_id=_cidK2), f"{_fK}")
+check("field2 equal to field is caught",
+      _fires32(_fK, "field2_equals_field", candidate_id=_cidK3), f"{_fK}")
+
+# L. orphan references -- one per table, since FKs are off and nothing else
+# enforces these.
+with st32.conn() as _c32:
+    _c32.execute("INSERT INTO sims (candidate_id, status) VALUES (?,?)",
+                ("ghost-sim", "OK"))
+    _c32.execute(
+        "INSERT INTO gate_history (ts,candidate_id,alpha_id,expr,ok) "
+        "VALUES (?,?,?,?,?)", (_t32.time(), "ghost-gh", "A", "e", 1))
+    _c32.execute("INSERT INTO inflight VALUES (?,?,?,?)",
+                ("ghost-if", "http://x", 0, _t32.time()))
+    _c32.execute(
+        "INSERT INTO candidates (id,expr,settings,theme,template,field,"
+        "stage,parent_id,created) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("cL", "e", "{}", "pv", "level_rank", "f", "refine", "ghost-parent",
+         0.0))
+_fL = _AU32.check_orphan_references(st32.conn())
+check("an orphan sims reference is caught",
+      _fires32(_fL, "orphan_sims_reference", candidate_id="ghost-sim"), f"{_fL}")
+check("an orphan gate_history reference is caught",
+      _fires32(_fL, "orphan_gate_history_reference", candidate_id="ghost-gh"),
+      f"{_fL}")
+check("an orphan inflight reference is caught",
+      _fires32(_fL, "orphan_inflight_reference", candidate_id="ghost-if"),
+      f"{_fL}")
+check("an orphan parent_id reference is caught",
+      _fires32(_fL, "orphan_candidates_parent_reference", candidate_id="cL"),
+      f"{_fL}")
+
+# M. stuck inflight -- back-date a dispatch well past the cutoff.
+st32.mark_dispatched("cM", "http://x/progress", 0)
+with st32.conn() as _c32:
+    _c32.execute("UPDATE inflight SET dispatched=? WHERE candidate_id='cM'",
+                (_t32.time() - 999999,))
+_fM = _AU32.check_stuck_inflight(st32.conn())
+check("an old in-flight simulation is flagged as stuck",
+      _fires32(_fM, "stuck_inflight", candidate_id="cM"), f"{_fM}")
+
+# N. run_all() aggregates every check without cross-contamination -- assert
+# a handful of the specific findings above all survive being run together.
+_fAll32 = _AU32.run_all(st32.conn())
+check("run_all() reports every distinct violation constructed in this section",
+      {f.check for f in _fAll32} >= {
+          "gate_history_deep_computed_after_metric_fail",
+          "deep_checks_poisoned", "gate_passing_now_stale_pass",
+          "arms_bounds_violation", "deep_trials_bandit_taught_mismatch",
+          "candidate_id_mismatch", "root_candidate_bad_stage",
+          "gated_without_ok_sim", "field2_equals_field",
+          "orphan_sims_reference", "stuck_inflight"},
+      f"{sorted({f.check for f in _fAll32})}")
+
+os.remove(db32)
+
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")
 sys.exit(1 if fail else 0)

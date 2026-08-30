@@ -59,4 +59,16 @@ for r in rows:
           f"{r['field']} x {r['field2']}")
 PY
   echo '```'
+
+  # Read-only consistency audit -- catches the class of bug behind the
+  # gate_passing_now stale-pass regression and the poisoned deep_checks
+  # cache without needing to already suspect a specific candidate. Never
+  # exits nonzero here: this script appends a status line, it does not fail
+  # the cron job.
+  audit_out=$(python3 -m alphamachine audit 2>&1)
+  echo "$audit_out"
+  if echo "$audit_out" | grep -q '\[CRITICAL\]'; then
+    echo "**AUDIT: critical finding(s), see above**"
+  fi
 } >> "$OUT" 2>&1
+true   # this script's own exit code is not a cron-failure signal (see header)
