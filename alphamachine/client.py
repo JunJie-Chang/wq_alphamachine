@@ -574,7 +574,8 @@ class BrainClient:
     def alpha_yearly(self, alpha_id: str) -> dict:
         return self._recordset(f"/alphas/{alpha_id}/recordsets/yearly-stats")
 
-    def _recordset(self, path: str, tries: int = 3, delay: float = 2.0) -> dict:
+    def _recordset(self, path: str, tries: int = 3, delay: float = 2.0,
+                   present=lambda out: bool(out.get("records"))) -> dict:
         """Fetch a recordset, tolerating BRAIN computing it lazily.
 
         These endpoints behave like /check: the first read after an alpha is
@@ -584,13 +585,16 @@ class BrainClient:
         absence and silently drops the candidate.
 
         _await_record already handles 204/Retry-After. The extra retry here is
-        for the 200-with-no-records case it cannot see, bounded tightly so a
-        genuinely empty recordset costs a few seconds, not the full timeout.
+        for the 200-with-nothing-yet case it cannot see, bounded tightly so a
+        genuinely empty result costs a few seconds, not the full timeout.
+        `present` lets a caller whose payload is NOT shaped like
+        `{"records": [...]}` (alpha_check's `{"is": {"checks": [...]}}`) supply
+        its own "did this actually arrive" test.
         """
         out: dict = {}
         for i in range(tries):
             out = self._await_record(path) or {}
-            if out.get("records"):
+            if present(out):
                 return out
             if i + 1 < tries:
                 time.sleep(delay)
@@ -598,8 +602,19 @@ class BrainClient:
 
     def alpha_check(self, alpha_id: str) -> dict:
         """Server-side submission check -- the authoritative gate, including
-        PROD_CORRELATION which you cannot compute locally."""
-        return self._await_record(f"/alphas/{alpha_id}/check")
+        PROD_CORRELATION which you cannot compute locally.
+
+        Same lazy-computation race as alpha_pnl/alpha_yearly, missed the first
+        time this class was hardened against it: a 200 with an empty `checks`
+        list reads exactly like "nothing failed" to a naive caller, when it
+        really means BRAIN has not finished computing yet. Confirmed live --
+        one alpha returned `checks: []` immediately, then 20 real entries
+        (including a PROD_CORRELATION FAIL) two minutes later on retry.
+        """
+        def _has_checks(out: dict) -> bool:
+            return bool((out.get("is") or {}).get("checks") or out.get("checks"))
+        return self._recordset(f"/alphas/{alpha_id}/check", tries=5, delay=3.0,
+                               present=_has_checks)
 
     def self_correlation(self, alpha_id: str) -> dict:
         return self._await_record(f"/alphas/{alpha_id}/correlations/self")

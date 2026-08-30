@@ -577,10 +577,23 @@ class Store:
         reported as submittable -- that was exactly the failure mode where
         three candidates looked ready and submit blocked all three.
         """
+        # The subquery finds each expr's single latest row FIRST, filtering
+        # for pass only in the outer WHERE -- so a later FAIL correctly
+        # displaces an earlier PASS. Restricting the subquery itself to
+        # `WHERE ok=1 AND deep_ok=1` (the bug this replaced) instead finds the
+        # latest row THAT HAPPENED TO PASS, ignoring anything more recent: an
+        # expr that passed once and was superseded by a real failure kept
+        # reporting the stale pass forever, exactly contradicting the
+        # docstring's "submit-grade AT THE TIME of their most recent check."
+        # Caught live: a lazy-computation race (client.alpha_check returning
+        # 200 with an empty checks list) produced a false deep_ok=1 snapshot;
+        # the corrective re-check that followed recorded deep_ok=0 as a NEW
+        # row, per gate_history's own append-only design -- but the old query
+        # kept surfacing the stale pass because it never looked past deep_ok=1
+        # rows to notice a fail had been recorded since.
         return self.conn().execute(
             "SELECT g.* FROM gate_history g JOIN "
-            "(SELECT expr, MAX(ts) mts FROM gate_history "
-            " WHERE ok=1 AND deep_ok=1 GROUP BY expr) m "
+            "(SELECT expr, MAX(ts) mts FROM gate_history GROUP BY expr) m "
             "ON m.expr=g.expr AND m.mts=g.ts "
             "WHERE g.ok=1 AND g.deep_ok=1 "
             "ORDER BY g.sharpe DESC LIMIT ?", (limit,)).fetchall()

@@ -759,6 +759,20 @@ st27.record_gate_check("c3", "A3", "expr_good", _rec27,
 _pass27 = {r["expr"] for r in st27.gate_passing_now()}
 check("only the deep-verified candidate counts as submittable",
       _pass27 == {"expr_good"}, f"{sorted(_pass27)}")
+
+# A later FAIL must displace an earlier PASS for the same expression. Caught
+# live: a lazy-computation race made client.alpha_check() return a false
+# empty-checks "pass" that got cached and reported submittable for hours; the
+# corrective re-check appended a new deep_ok=0 row (gate_history is
+# append-only, so the bad row is never deleted) but gate_passing_now() kept
+# surfacing the stale pass anyway -- its subquery restricted itself to
+# `WHERE ok=1 AND deep_ok=1` before taking MAX(ts), so it found the latest
+# PASS ever recorded rather than the latest CHECK overall.
+st27.record_gate_check("c3", "A3b", "expr_good", _rec27,
+                       _V27(True, []), _g27, deep=_V27(False, ["PROD_CORRELATION"]))
+_pass27b = {r["expr"] for r in st27.gate_passing_now()}
+check("a later fail displaces an earlier pass for the same expression",
+      "expr_good" not in _pass27b, f"{sorted(_pass27b)}")
 os.remove(db27)
 
 print("\n[26] deep verdict: unknown is neither pass nor fail")
@@ -802,7 +816,8 @@ _v28 = _sub28(_good_yr, checks=[{"name": "LOW_SHARPE", "result": "PASS"}]
               ).deep_verdict("X4")
 check("a clean alpha passes the deep gate", _v28 is not None and _v28.ok,
       f"{_v28}")
-_v28b = _sub28(_lucky_yr, checks=[]).deep_verdict("X5")
+_v28b = _sub28(_lucky_yr, checks=[{"name": "LOW_SHARPE", "result": "PASS"}]
+              ).deep_verdict("X5")
 check("a one-lucky-year alpha fails the deep gate",
       _v28b is not None and not _v28b.ok, f"{_v28b and _v28b.reasons}")
 _v28c = _sub28(_good_yr, checks=[{"name": "PROD_CORRELATION", "result": "FAIL"}]
@@ -816,6 +831,25 @@ check("a crowded alpha fails on PROD_CORRELATION",
 check("an advisory reason from a PASSING sub-verdict is not a failure",
       "no yearly stats available" not in json.dumps(
           [r for r in (_v28.reasons if _v28 else [])]))
+
+# A second bug this section now also exists for: BRAIN's lazy-computation race
+# hits /check too, not just the recordset endpoints. A 200 with an empty
+# `checks` list looks exactly like "nothing failed" to a naive reader, when it
+# means "not finished yet." Caught live: one alpha returned checks:[]
+# immediately, then 20 real entries (incl. PROD_CORRELATION FAIL) on retry --
+# the empty read got cached as a clean pass and stayed "submittable" for
+# hours. client.alpha_check() now retries this exact race (see its own
+# docstring); this is the belt-and-braces layer for whatever still gets
+# through empty.
+check("an empty server-check response is INCONCLUSIVE, not a clean pass",
+      _sub28(_good_yr, checks=[]).deep_verdict("X7") is None)
+# A cached empty-checks entry (this same race, saved before the fix existed)
+# must not be trusted just because it is within TTL -- it would otherwise
+# report a false pass for the entry's whole deep_check_ttl_hours.
+st28.save_deep("X8", yearly=_good_yr, checks=[], ok=True, reasons=[])
+check("a POISONED cache entry (ok=True, checks=[]) is not trusted on replay",
+      _sub28(_good_yr, checks=[{"name": "LOW_SHARPE", "result": "PASS"}]
+            ).deep_verdict("X8") is not None)
 os.remove(db28)
 
 print("\n[27] interleaved ladders: fill the slots, keep the rung order")

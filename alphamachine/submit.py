@@ -133,13 +133,27 @@ class Submitter:
                      alpha_id)
             return None
 
-        checks = (cached or {}).get("checks")
+        # An empty list is never trusted, cached or fresh: `or None` collapses
+        # `[]` to the same "need a real look" state as never having cached it.
+        # A poisoned cache entry (the empty-checks race below, saved before
+        # this was in place) would otherwise read as fresh for a full
+        # deep_check_ttl_hours and keep reporting a false PASS the whole time.
+        checks = (cached or {}).get("checks") or None
         if with_server_check and checks is None:
             try:
                 checks = self.server_check(alpha_id)["checks"]
             except Exception as e:
                 log.info("deep verdict inconclusive for %s: server check "
                          "unavailable (%s)", alpha_id, e)
+                return None
+            if not checks:
+                # client.alpha_check() already retries this exact race
+                # (5 tries over 15s); if it is STILL empty here, an authentic
+                # response is never this: a real PASS carries dozens of
+                # entries (LOW_SHARPE, LOW_FITNESS, ...). Report inconclusive
+                # rather than reading "nothing failed" out of nothing checked.
+                log.info("deep verdict inconclusive for %s: server check "
+                         "came back empty", alpha_id)
                 return None
         reasons += [f"server check FAIL: {n}" for n in failed_checks(checks or [])]
 
