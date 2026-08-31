@@ -10,6 +10,7 @@ coin flip out of sample, and a book full of coin flips scores badly.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field as dc_field
 from typing import Any
 
@@ -224,6 +225,56 @@ def pnl_series(pnl_recordset: dict) -> tuple[list[str], list[float]]:
         dates.append(str(d))
         vals.append(float(v))
     return dates, vals
+
+
+# Expected maximum of N iid standard-normal draws. PROD_CORRELATION scores an
+# alpha on the MAXIMUM correlation against every alpha in BRAIN's production
+# pool, so with a pool this large the max is dominated by extreme-value
+# statistics rather than by how novel the idea is: at the ~2.48M pool observed
+# in 2026-08, z is about 4.95, so a profile centred at 0.11 with sd 0.16
+# "expects" a max near 0.92 no matter what the alpha does. mean and sd are
+# therefore the only two levers, which is why they are worth recording.
+def expected_max_z(n: int) -> float:
+    if n < 2:
+        return 0.0
+    ln = math.log(n)
+    a = math.sqrt(2.0 * ln)
+    return a - (math.log(ln) + math.log(4.0 * math.pi)) / (2.0 * a)
+
+
+def corr_profile(payload: dict) -> dict | None:
+    """mean/sd/max/min/n from a /correlations/prod histogram.
+
+    The payload is a recordset of [lo, hi, count] bins spanning the whole
+    production pool. Mean and sd come from bin midpoints -- coarse, but the
+    bins are 0.1 wide against an sd near 0.16, and it is the SHAPE that
+    matters here, not the third decimal.
+
+    Returns None when there are no records, matching deep_verdict's
+    inconclusive-is-not-a-verdict discipline: these endpoints are lazily
+    computed and _await_record (unlike _recordset) does not retry a 200 with
+    an empty body, so "no records" means "we did not get an answer", never
+    "this alpha has no correlations".
+    """
+    rows = _records(payload or {})
+    bins = []
+    for r in rows:
+        lo, hi, cnt = _f(r.get("min")), _f(r.get("max")), r.get("alphas")
+        if lo is None or hi is None or cnt is None:
+            continue
+        bins.append(((lo + hi) / 2.0, int(cnt)))
+    n = sum(c for _, c in bins)
+    if not bins or n <= 0:
+        return None
+    mean = sum(m * c for m, c in bins) / n
+    var = sum(((m - mean) ** 2) * c for m, c in bins) / n
+    sd = math.sqrt(max(var, 0.0))
+    return {"n_alphas": n, "mean": mean, "sd": sd,
+            # BRAIN reports the true max/min alongside the histogram; prefer
+            # those over a bin-edge estimate when present.
+            "max_corr": _f((payload or {}).get("max")),
+            "min_corr": _f((payload or {}).get("min")),
+            "expected_max": mean + sd * expected_max_z(n)}
 
 
 def headroom(rec: dict, g: Gates) -> float:

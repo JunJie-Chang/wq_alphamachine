@@ -67,6 +67,30 @@ CREATE TABLE IF NOT EXISTS pnl (
     fetched       REAL
 );
 
+-- The SHAPE of an alpha's correlation against BRAIN's production pool, from
+-- /correlations/prod. Separate from deep_checks on purpose: save_deep() binds
+-- a positional VALUES (?,?,?,?,?,?) that a column count change breaks
+-- silently, and audit.check_deep_checks_poisoned reads that table with
+-- assumptions about its shape.
+--
+-- Why the shape and not just the max: PROD_CORRELATION scores the MAXIMUM
+-- against ~2.5M production alphas, and the expected maximum of that many
+-- draws is mean + sd*z(N) with z fixed near 4.95. So mean and sd are the only
+-- two things an alpha can actually change. Recording just the max (which the
+-- /check payload already gives) tells us we failed; recording the profile
+-- tells us whether anything we changed moved the distribution.
+CREATE TABLE IF NOT EXISTS prod_corr_hist (
+    alpha_id      TEXT PRIMARY KEY,
+    hist          TEXT,                  -- json recordset, verbatim
+    max_corr      REAL,
+    min_corr      REAL,
+    mean          REAL,
+    sd            REAL,
+    expected_max  REAL,                  -- mean + sd*z(n_alphas)
+    n_alphas      INTEGER,
+    fetched       REAL
+);
+
 CREATE TABLE IF NOT EXISTS submissions (
     alpha_id      TEXT PRIMARY KEY,
     submitted_at  REAL,
@@ -439,6 +463,25 @@ class Store:
         if not row:
             return None
         return json.loads(row["dates"]), json.loads(row["vals"])
+
+    # ------------------------------------------------- prod correlation shape
+    def save_corr_profile(self, alpha_id: str, hist: Any, profile: dict) -> None:
+        """Named columns, not positional: deep_checks' positional INSERT is
+        exactly the fragility this table was split out to avoid."""
+        with self.conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO prod_corr_hist"
+                "(alpha_id,hist,max_corr,min_corr,mean,sd,expected_max,"
+                "n_alphas,fetched) VALUES (?,?,?,?,?,?,?,?,?)",
+                (alpha_id, json.dumps(hist or {}), profile.get("max_corr"),
+                 profile.get("min_corr"), profile.get("mean"),
+                 profile.get("sd"), profile.get("expected_max"),
+                 profile.get("n_alphas"), time.time()))
+
+    def load_corr_profile(self, alpha_id: str) -> sqlite3.Row | None:
+        return self.conn().execute(
+            "SELECT * FROM prod_corr_hist WHERE alpha_id=?",
+            (alpha_id,)).fetchone()
 
     def all_pnl(self) -> dict[str, tuple[list[str], list[float]]]:
         out = {}

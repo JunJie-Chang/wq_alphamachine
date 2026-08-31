@@ -29,7 +29,8 @@ from .correlate import CorrelationBook, fetch_book, greedy_select
 from .executor import Executor
 from .generator import generate
 from . import priors as P
-from .metrics import Verdict, headroom, pnl_series, quality_verdict
+from .metrics import (Verdict, corr_profile, headroom, pnl_series,
+                      quality_verdict)
 from .refine import Refiner
 from .store import Store
 from .submit import Submitter
@@ -118,6 +119,46 @@ def cmd_scan(args):
         (g.scan_abs_sharpe,))
     print(f"\nscan done: {stats}  survivors(|sharpe|>={g.scan_abs_sharpe}): "
           f"{len(survivors)}")
+
+
+def _capture_corr_profile(store, client, alpha_id: str) -> None:
+    """Record the SHAPE of this alpha's correlation against the production
+    pool, not just the max that /check already reports.
+
+    PROD_CORRELATION scores the maximum against ~2.5M production alphas, and
+    the expected maximum of that many draws is mean + sd*z(N) with z fixed
+    near 4.95 -- so mean and sd are the only two quantities an alpha can move.
+    Without this, every attempt at the correlation wall is judged on a single
+    noisy max value, which is how two earlier rounds of work reached the wrong
+    conclusion.
+
+    Deliberately NOT inside Submitter.deep_verdict(): cmd_select calls that
+    uncapped over up to 200 rows. Here it rides the caller's existing
+    max_deep_checks_per_refine budget, so it is bounded to ~10 extra calls per
+    refine run, on champions that already cleared the metric gate.
+
+    Never raises: this is instrumentation. A failure to measure must not take
+    down a refine run that is otherwise fine.
+    """
+    if not alpha_id or store.load_corr_profile(alpha_id) is not None:
+        return
+    try:
+        hist = client.prod_correlation(alpha_id)
+    except Exception as e:
+        print(f"       corr profile: unavailable ({e})")
+        return
+    prof = corr_profile(hist)
+    if prof is None:
+        # Same lazy-computation hazard as /check: _await_record does not retry
+        # a 200 with an empty body, so this is "no answer", not "no
+        # correlations". Recording it would poison the table the same way an
+        # empty checks list once poisoned deep_checks.
+        print("       corr profile: INCONCLUSIVE (empty recordset)")
+        return
+    store.save_corr_profile(alpha_id, hist, prof)
+    print(f"       corr profile: mean={prof['mean']:+.4f} "
+          f"sd={prof['sd']:.4f} max={prof['max_corr'] or 0.0:.4f} "
+          f"expected_max={prof['expected_max']:.4f}")
 
 
 def _teach_deep(store, bandit, candidate_id, arm, dv) -> None:
@@ -259,6 +300,7 @@ def cmd_refine(args):
                 print(f"       deep: "
                       f"{'PASS' if dv.ok else '; '.join(dv.reasons[:2])}")
                 _teach_deep(store, bandit, best_id, arm, dv)
+            _capture_corr_profile(store, client, aid)
         store.record_gate_check(best_id, aid, r.get("expr", ""), best, qv, g,
                                 deep=dv)
 
@@ -486,7 +528,50 @@ def _prod_corr_table(store) -> None:
         ok = sum(1 for x in s if x < 0.70)
         print(f"  {name:<12}{len(s):>4}{s[0]:>8.3f}{med:>8.3f}{s[-1]:>8.3f}"
               f"{ok:>7}/{len(s):<4}")
+    _corr_profile_table(store)
     print()
+
+
+def _corr_profile_table(store) -> None:
+    """The SHAPE of the correlation distribution, grouped by neutralization.
+
+    The observed max above says whether an alpha failed. This says WHY, and
+    whether anything we changed is moving the underlying distribution:
+    PROD_CORRELATION scores the maximum against ~2.5M production alphas, and
+    the expected max of that many draws is mean + sd*z(N) with z fixed near
+    4.95. So `mean` and `sd` are the only two levers, and `expected_max` is
+    what they imply -- a number that has to come down before any observed max
+    can reliably clear 0.70.
+
+    Grouped by neutralization because that is the setting the ladder searches
+    over, and a positive mean is a factor-exposure signature -- exactly what
+    neutralization exists to strip.
+    """
+    rows = store.conn().execute(
+        "SELECT p.mean, p.sd, p.expected_max, p.max_corr, c.settings"
+        " FROM prod_corr_hist p"
+        " JOIN sims s ON s.alpha_id = p.alpha_id"
+        " JOIN candidates c ON c.id = s.candidate_id").fetchall()
+    if not rows:
+        return
+    groups: dict[str, list] = {}
+    for r in rows:
+        try:
+            neut = json.loads(r["settings"] or "{}").get("neutralization", "?")
+        except ValueError:
+            neut = "?"
+        groups.setdefault(neut, []).append(r)
+    print("\ncorrelation PROFILE (mean + sd*4.95 = expected max; "
+          "needs to fall below 0.70)")
+    print(f"  {'neutralization':<16}{'n':>4}{'mean':>9}{'sd':>8}"
+          f"{'exp.max':>9}{'obs.max':>9}")
+    def _avg(rs, k):
+        vals = [r[k] for r in rs if r[k] is not None]
+        return sum(vals) / len(vals) if vals else 0.0
+    for neut, rs in sorted(groups.items(), key=lambda kv: _avg(kv[1], "expected_max")):
+        print(f"  {neut:<16}{len(rs):>4}{_avg(rs,'mean'):>+9.4f}"
+              f"{_avg(rs,'sd'):>8.4f}{_avg(rs,'expected_max'):>9.4f}"
+              f"{_avg(rs,'max_corr'):>9.4f}")
 
 
 def cmd_report(args):

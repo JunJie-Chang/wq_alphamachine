@@ -1704,6 +1704,111 @@ check("run_all() reports every distinct violation constructed in this section",
 
 os.remove(db32)
 
+print("\n[33] correlation profile: the two levers behind PROD_CORRELATION")
+from alphamachine.metrics import corr_profile as _cp33, expected_max_z as _z33
+from alphamachine.config import (NEUTRALIZATIONS as _NA33,
+                                 REFINE_NEUTRALIZATION as _RN33)
+
+# The real omqZOwpb histogram, pulled live from /correlations/prod this
+# session. Kept verbatim as the regression anchor: the arithmetic below was
+# hand-computed off exactly these numbers when the extreme-value analysis was
+# done, so a drift in corr_profile() shows up against reality, not against a
+# fixture someone invented to match the code.
+_hist33 = {"schema": {"name": "prodCorrelation",
+                      "properties": [{"name": "min"}, {"name": "max"},
+                                     {"name": "alphas"}]},
+           "records": [[-1.0,-0.9,0],[-0.9,-0.8,0],[-0.8,-0.7,0],[-0.7,-0.6,15],
+                       [-0.6,-0.5,166],[-0.5,-0.4,2595],[-0.4,-0.3,17884],
+                       [-0.3,-0.2,55601],[-0.2,-0.1,150644],[-0.1,0.0,366655],
+                       [0.0,0.1,605372],[0.1,0.2,584353],[0.2,0.3,407298],
+                       [0.3,0.4,195585],[0.4,0.5,71954],[0.5,0.6,17693],
+                       [0.6,0.7,2285],[0.7,0.8,70],[0.8,0.9,0],[0.9,1.0,0]],
+           "max": 0.7667, "min": -0.6878}
+_p33 = _cp33(_hist33)
+check("corr_profile reproduces the real histogram's pool size",
+      _p33["n_alphas"] == 2478170, f"{_p33['n_alphas']}")
+check("corr_profile reproduces the hand-computed mean and sd",
+      abs(_p33["mean"] - 0.1087) < 0.001 and abs(_p33["sd"] - 0.1635) < 0.001,
+      f"mean={_p33['mean']:.4f} sd={_p33['sd']:.4f}")
+check("corr_profile prefers BRAIN's reported max over a bin-edge estimate",
+      _p33["max_corr"] == 0.7667 and _p33["min_corr"] == -0.6878)
+# The whole reason this instrumentation exists: the observed max (0.7667) is
+# FAR below what the profile implies (0.9174). Recording only the max hides
+# that the distribution itself is what has to move.
+check("expected_max exceeds the observed max on the real data",
+      abs(_p33["expected_max"] - 0.9174) < 0.001
+      and _p33["expected_max"] > _p33["max_corr"],
+      f"expected={_p33['expected_max']:.4f} observed={_p33['max_corr']}")
+
+# z is fixed by pool size alone -- that is why mean and sd are the only levers.
+check("expected_max_z grows with the pool and is ~4.95 at 2.48M",
+      abs(_z33(2478170) - 4.945) < 0.01 and _z33(10_000) < _z33(1_000_000),
+      f"z(2.48M)={_z33(2478170):.3f}")
+check("expected_max_z is defined for degenerate pool sizes",
+      _z33(0) == 0.0 and _z33(1) == 0.0)
+
+# Inconclusive, not zero: /correlations/prod is lazily computed and
+# _await_record does not retry an empty 200, so "no records" means "no answer".
+check("an empty or missing histogram is INCONCLUSIVE, not a profile",
+      _cp33({"records": []}) is None and _cp33(None) is None
+      and _cp33({}) is None)
+check("a histogram whose bins are all empty is INCONCLUSIVE",
+      _cp33({"schema": {"properties": [{"name":"min"},{"name":"max"},
+                                       {"name":"alphas"}]},
+             "records": [[-0.1,0.0,0],[0.0,0.1,0]]}) is None)
+
+# Storage round-trip, on its own table (deliberately not deep_checks, whose
+# positional INSERT breaks silently on a column-count change).
+db33 = tempfile.mktemp(suffix=".db"); st33 = Store(db33)
+check("load_corr_profile returns None before anything is stored",
+      st33.load_corr_profile("A33") is None)
+st33.save_corr_profile("A33", _hist33, _p33)
+_r33 = st33.load_corr_profile("A33")
+check("corr profile round-trips through its own table",
+      _r33 is not None and _r33["n_alphas"] == 2478170
+      and abs(_r33["mean"] - _p33["mean"]) < 1e-9
+      and abs(_r33["expected_max"] - _p33["expected_max"]) < 1e-9)
+check("the raw histogram is kept verbatim alongside the derived numbers",
+      json.loads(_r33["hist"])["max"] == 0.7667)
+check("prod_corr_hist is separate from deep_checks",
+      st33.load_deep("A33") is None)
+os.remove(db33)
+
+# The widened ladder. A typo here would not fail loudly -- it would just make
+# every simulation for that value come back ERROR, so assert membership.
+check("every ladder neutralization is a value BRAIN's own list carries",
+      set(_RN33) <= set(_NA33), f"{sorted(set(_RN33) - set(_NA33))}")
+check("the ladder searches the four never-tried values probed this session",
+      {"STATISTICAL", "CROWDING", "FAST", "SLOW"} <= set(_RN33))
+# Probed live 2026-08-31: BRAIN rejects these for EQUITY/USA. COUNTRY is "not
+# available for instrument type EQUITY and region USA"; RAM is "not a valid
+# choice" at all despite appearing in docs/ for Power Pools.
+check("values BRAIN rejects for EQUITY/USA stay out of the ladder",
+      "COUNTRY" not in _RN33 and "RAM" not in _RN33)
+check("NONE stays out -- it strips no factor exposure at all",
+      "NONE" not in _RN33)
+check("no duplicates in the ladder (each costs a simulation per candidate)",
+      len(_RN33) == len(set(_RN33)), f"{len(_RN33)} values")
+
+# Rung 1 yields exactly one variant per non-incumbent value.
+db34 = tempfile.mktemp(suffix=".db"); st34 = Store(db34)
+_s34 = SimSettings(neutralization="INDUSTRY")
+_c34 = st34.add_candidate(expr="group_rank(f34, sector)",
+                          settings=_s34.payload(), theme="pv",
+                          template="level_rank", field="f34",
+                          settings_key=_s34.key())
+class _Ex34:
+    pass
+_v34 = Refiner(st34, _Ex34(), Gates()).plan(
+    _c34, {"sharpe": 1.8, "fitness": 1.2, "turnover": 0.15, "checks": []}, 1)
+check("rung 1 plans one variant per non-incumbent neutralization",
+      len(_v34) == len(_RN33) - 1, f"{len(_v34)} variants for {len(_RN33)} values")
+check("rung 1 never re-plans the incumbent's own neutralization",
+      all(v.settings.neutralization != "INDUSTRY" for v in _v34))
+check("rung 1 leaves the expression untouched (settings-only rung)",
+      all(v.expr == "group_rank(f34, sector)" for v in _v34))
+os.remove(db34)
+
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")
 sys.exit(1 if fail else 0)

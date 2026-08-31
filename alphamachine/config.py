@@ -244,8 +244,33 @@ class SimSettings:
 SCAN_SETTINGS = SimSettings()
 
 # Stage-3 refinement ladder. Ordered by (expected Sharpe gain) / (sims spent).
-# Neutralization first: it is the biggest single lever and costs ~5 sims.
-REFINE_NEUTRALIZATION = ("INDUSTRY", "SUBINDUSTRY", "SECTOR", "MARKET", "SLOW_AND_FAST")
+# Neutralization first: it is the biggest single lever and costs ~9 sims.
+#
+# Widened from 5 to 9 after probing what BRAIN actually accepts for
+# EQUITY/USA/TOP3000/d1 (scratch probe, 2026-08-31). NEUTRALIZATIONS above has
+# listed 11 values since day one and is read by nothing -- the ladder only ever
+# tried these 5, so STATISTICAL, CROWDING, FAST and SLOW had never been
+# simulated once. On the probe expression they were three of the four best:
+#
+#   STATISTICAL  3.48    SLOW  3.11    CROWDING 3.04 (fitness 1.22, the best)
+#   SLOW_AND_FAST 2.98  <- the best the old tuple could reach
+#   SUBINDUSTRY  2.60    FAST  2.57    MARKET 2.56   SECTOR 2.47  INDUSTRY 2.44
+#
+# Rejected by BRAIN for this region/instrument, so deliberately NOT here:
+#   COUNTRY -- "not available for instrument type EQUITY and region USA"
+#   RAM     -- '"RAM" is not a valid choice' (it appears in docs/ for Power
+#              Pools, but is not a value this API accepts)
+# NONE is accepted but excluded: it removes no factor exposure at all, which is
+# the opposite of the mechanism being targeted here (a positive mean
+# correlation against the production pool is a factor-exposure signature), and
+# it scored 0.88 against 2.44-3.48 for every other option on the same
+# expression. Add it back only with a reason.
+#
+# Cost: rung 1 goes from 4 variants per ladder to 8, so ~100 extra simulations
+# per `refine --top 25` run -- roughly 10 minutes at observed throughput.
+REFINE_NEUTRALIZATION = ("INDUSTRY", "SUBINDUSTRY", "SECTOR", "MARKET",
+                         "SLOW_AND_FAST", "STATISTICAL", "CROWDING",
+                         "FAST", "SLOW")
 REFINE_DECAY = (0, 4, 8, 16, 32, 64)
 REFINE_TRUNCATION = (0.01, 0.04, 0.08, 0.15)
 
