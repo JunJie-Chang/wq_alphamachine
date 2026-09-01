@@ -51,6 +51,30 @@ from alphamachine.client import BrainClient
 POLL_SECONDS = 30
 NEEDS_AUTH_MARKERS = ("BiometricRequired", "HALTED")
 
+# A third outcome the original two-way split had no room for: the network went
+# away. Seen live -- DNS stopped resolving api.worldquantbrain.com mid-`select`
+# ("Temporary failure in name resolution"), the stage exited non-zero with no
+# auth marker, and the loop classified a transient blip as a code bug and shut
+# itself down for good. Nothing was broken and nothing needed a human; it just
+# needed to wait.
+#
+# These are matched against the child's combined output, so they must be
+# specific enough not to swallow a genuine bug. Every one names a transport
+# failure that cannot be produced by this codebase's own logic.
+TRANSIENT_MARKERS = (
+    "Temporary failure in name resolution",
+    "NameResolutionError",
+    "Failed to resolve",
+    "Connection aborted",
+    "ConnectionResetError",
+    "Max retries exceeded",
+    "Read timed out",
+    "ReadTimeoutError",
+    "Network is unreachable",
+)
+TRANSIENT_BACKOFF = 60.0     # one minute, then just try the stage again
+TRANSIENT_MAX_RETRIES = 20   # ~20 min of outage before giving up for real
+
 # The currently-running stage subprocess, if any -- so a signal handler can
 # kill it. `subprocess.run()` blocks the parent until the child exits, so a
 # plain `kill` on the parent leaves that child orphaned and still hitting the
@@ -116,6 +140,7 @@ def run_stage(concurrency: int, name: str, args: list[str]) -> None:
     script needs to tell apart by channel.
     """
     global _current_proc
+    transient_tries = 0
     while True:
         cmd = ["python3", "-m", "alphamachine",
                "--concurrency", str(concurrency), name, *args]
@@ -137,12 +162,29 @@ def run_stage(concurrency: int, name: str, args: list[str]) -> None:
         if not needs_auth:
             return
         if proc.returncode != 0 and not any(m in out for m in NEEDS_AUTH_MARKERS):
+            # Order matters: check for a transient transport failure BEFORE
+            # declaring a bug. The network dropping out looks identical to a
+            # crash from the outside -- non-zero exit, a traceback, no auth
+            # marker -- and treating one as the other killed a healthy loop
+            # for 5 minutes of DNS trouble.
+            if any(m in out for m in TRANSIENT_MARKERS):
+                transient_tries += 1
+                if transient_tries > TRANSIENT_MAX_RETRIES:
+                    log(f"FATAL: [{name}] still failing on a network error "
+                        f"after {transient_tries} retries -- stopping")
+                    raise SystemExit(1)
+                log(f"TRANSIENT: [{name}] network error "
+                    f"({transient_tries}/{TRANSIENT_MAX_RETRIES}), retrying "
+                    f"in {TRANSIENT_BACKOFF:.0f}s")
+                time.sleep(TRANSIENT_BACKOFF)
+                continue
             # A real bug, not an auth block -- surface it loudly and stop the
             # whole loop rather than spin forever on something a fresh
             # session cannot fix.
             log(f"FATAL: [{name}] exited {proc.returncode} for a reason "
                 f"other than biometric auth -- stopping")
             raise SystemExit(1)
+        transient_tries = 0          # a real auth block is not a network fault
         wait_for_session()
         # Loop back and retry the SAME stage rather than advancing --
         # partial work from the halted attempt is already saved.

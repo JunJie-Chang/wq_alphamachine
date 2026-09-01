@@ -1237,6 +1237,40 @@ calls, _al.subprocess.Popen = _stub29([
 check("a non-auth crash raises SystemExit instead of retrying forever",
       _raises(lambda: _al.run_stage(3, "scan", ["--budget", "10"]), SystemExit))
 
+# The THIRD outcome, which the original two-way split had no room for: the
+# network went away. Seen live -- DNS stopped resolving mid-`select`, the stage
+# exited non-zero with a traceback and no auth marker, and the loop classified
+# a five-minute blip as a code bug and shut itself down permanently.
+_dns29 = ["Traceback...",
+          "urllib3.exceptions.NameResolutionError: Failed to resolve "
+          "'api.worldquantbrain.com' ([Errno -3] Temporary failure in name "
+          "resolution)"]
+calls, _al.subprocess.Popen = _stub29([_P29(1, _dns29), _P29(0, ["3 candidate(s)"])])
+_al.run_stage(3, "select", ["--n", "10"])
+check("a DNS failure is retried, not treated as a fatal bug", len(calls) == 2)
+
+# It must not retry forever either -- a network that never comes back is a
+# real stop, just a slower one. Needs a FRESH _P29 per call: .stdout is a
+# one-shot iterator, so reusing one object reads as empty output on the second
+# attempt and takes the fatal branch for the wrong reason.
+_calls29b = []
+def _always_dns29(cmd, **kw):
+    _calls29b.append(cmd)
+    return _P29(1, _dns29)
+_al.subprocess.Popen = _always_dns29
+check("a network error that never clears eventually stops the loop",
+      _raises(lambda: _al.run_stage(3, "select", ["--n", "10"]), SystemExit))
+check("it retried up to the cap before giving up",
+      len(_calls29b) == _al.TRANSIENT_MAX_RETRIES + 1,
+      f"{len(_calls29b)} attempts, cap {_al.TRANSIENT_MAX_RETRIES}")
+
+# The transient counter must not let a genuine bug slip through, and must not
+# accumulate across unrelated auth blocks.
+calls, _al.subprocess.Popen = _stub29([
+    _P29(1, ["Traceback...", "KeyError: 'expr'"])])
+check("a real bug is still fatal even with transient handling in place",
+      _raises(lambda: _al.run_stage(3, "scan", ["--budget", "10"]), SystemExit))
+
 _al.time.sleep, _al.wait_for_session = _real_sleep29, _real_wait29
 
 # The orphan-child bug this session actually hit: killing autoloop.py while a
