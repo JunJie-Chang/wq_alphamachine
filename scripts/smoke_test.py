@@ -1809,6 +1809,121 @@ check("rung 1 leaves the expression untouched (settings-only rung)",
       all(v.expr == "group_rank(f34, sector)" for v in _v34))
 os.remove(db34)
 
+print("\n[34] recency: the 2-year Sharpe we were already being told")
+import dataclasses as _dc34
+from alphamachine.metrics import extract as _ex34, failed_checks as _fc34
+
+# The real shape that slipped through: at SIMULATION time BRAIN reports
+# LOW_2Y_SHARPE as a WARNING, not a FAIL -- failed_checks() ignores WARNING,
+# so a 0.48 read as a clean pass all the way to the deep gate. The value is
+# identical to what /check later returns as FAIL; only the string differs.
+_pay34 = {"id": "A34",
+          "is": {"sharpe": 2.39, "fitness": 1.48, "turnover": 0.121,
+                 "drawdown": 0.03, "margin": 0.0008,
+                 "longCount": 900, "shortCount": 900,
+                 "checks": [{"name": "LOW_SHARPE", "result": "PASS",
+                             "limit": 1.58, "value": 2.39},
+                            {"name": "LOW_2Y_SHARPE", "result": "WARNING",
+                             "limit": 1.58, "value": 0.48},
+                            {"name": "LOW_SUB_UNIVERSE_SHARPE",
+                             "result": "PASS", "limit": 1.03, "value": 1.61}]},
+          "test": {"sharpe": 0.30}}
+_e34 = _ex34(_pay34)
+check("extract pulls the 2Y sharpe even when reported as WARNING",
+      _e34["two_year_sharpe"] == 0.48, f"{_e34['two_year_sharpe']}")
+check("extract pulls the trailing-testPeriod sharpe from the payload",
+      _e34["test_sharpe"] == 0.30, f"{_e34['test_sharpe']}")
+check("the WARNING really is invisible to failed_checks -- the original hole",
+      "LOW_2Y_SHARPE" not in _fc34(_pay34["is"]["checks"]))
+_e34b = _ex34({"id": "B34", "is": {"sharpe": 1.8, "checks": []}})
+check("both recency fields are None when the payload carries neither",
+      _e34b["two_year_sharpe"] is None and _e34b["test_sharpe"] is None)
+
+g34 = Gates()
+_base34 = {"sharpe": 2.39, "fitness": 1.48, "turnover": 0.121,
+           "drawdown": 0.03, "margin": 0.0008, "longCount": 900,
+           "shortCount": 900, "subuniverse_sharpe": 1.61,
+           "checks": [{"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "PASS",
+                       "limit": 1.03, "value": 1.61}]}
+check("a decayed alpha is blocked on the real failing value (0.48)",
+      not quality_verdict(dict(_base34, two_year_sharpe=0.48), g34).ok)
+check("a recent-healthy alpha with the same full-period sharpe passes (1.63)",
+      quality_verdict(dict(_base34, two_year_sharpe=1.63), g34).ok)
+# Absence means BRAIN sent IS_LADDER_SHARPE instead -- unknown, not fine. This
+# is the 92-of-98 majority; blocking them would be the over-strict-gate
+# mistake made earlier in this same codebase.
+check("absence of the 2Y value does NOT block",
+      quality_verdict(dict(_base34), g34).ok)
+check("the proxy alone never blocks, however bad it looks",
+      quality_verdict(dict(_base34, test_sharpe=0.05), g34).ok)
+# Read from checks when the column has not been populated (older row).
+check("the 2Y value is also honoured straight from the checks payload",
+      not quality_verdict(
+          dict(_base34, checks=_base34["checks"] +
+               [{"name": "LOW_2Y_SHARPE", "result": "WARNING",
+                 "limit": 1.58, "value": 0.48}]), g34).ok)
+
+# The inversion the ladder made before this existed: refine._score is
+# headroom - 0.25*fails, so whatever headroom prefers, the ladder climbs to.
+# The decayed alpha here is given a healthy sub-universe retention (1.80 of
+# 2.39) precisely so that EVERY whole-period slack favours it -- which is the
+# situation that matters, and the one the old headroom had no way to see past.
+_decayed34 = dict(_base34, two_year_sharpe=0.48, subuniverse_sharpe=1.80)
+_steady34 = {"sharpe": 1.75, "fitness": 1.05, "turnover": 0.12,
+             "drawdown": 0.03, "margin": 0.0008, "longCount": 900,
+             "shortCount": 900, "subuniverse_sharpe": 1.20,
+             "two_year_sharpe": 1.80, "checks": []}
+check("headroom now ranks the steady alpha ABOVE the decayed one",
+      headroom(_steady34, g34) > headroom(_decayed34, g34),
+      f"steady={headroom(_steady34, g34):.2f} decayed={headroom(_decayed34, g34):.2f}")
+_off34 = _dc34.replace(Gates(), min_two_year_sharpe=1e-9)
+check("and that ordering is INVERTED without the recency term",
+      headroom(_steady34, _off34) < headroom(_decayed34, _off34),
+      f"steady={headroom(_steady34, _off34):.2f} "
+      f"decayed={headroom(_decayed34, _off34):.2f}")
+check("headroom falls back to the proxy when the exact value is absent",
+      headroom(dict(_base34, test_sharpe=0.30), g34)
+      < headroom(dict(_base34, test_sharpe=2.50), g34))
+check("headroom is unchanged when neither recency field is present",
+      headroom(_base34, g34) == headroom(_base34, _off34))
+
+# Migration + backfill from payloads already on disk.
+db35 = tempfile.mktemp(suffix=".db")
+_o35 = _sq30.connect(db35)
+_o35.executescript("""
+CREATE TABLE sims (candidate_id TEXT PRIMARY KEY, alpha_id TEXT, status TEXT,
+  error TEXT, sharpe REAL, fitness REAL, turnover REAL, returns REAL,
+  drawdown REAL, margin REAL, longCount INTEGER, shortCount INTEGER,
+  subuniverse_sharpe REAL, checks TEXT, raw TEXT, finished REAL);
+""")
+_o35.execute("INSERT INTO sims (candidate_id,alpha_id,status,sharpe,checks,raw)"
+             " VALUES (?,?,?,?,?,?)",
+             ("c35", "A35", "OK", 2.39,
+              json.dumps([{"name": "LOW_2Y_SHARPE", "result": "WARNING",
+                           "limit": 1.58, "value": 0.48}]),
+              json.dumps({"test": {"sharpe": 0.30}})))
+_o35.execute("INSERT INTO sims (candidate_id,alpha_id,status,sharpe,checks,raw)"
+             " VALUES (?,?,?,?,?,?)",
+             ("c35b", "A35b", "OK", 1.9, json.dumps([]), json.dumps({})))
+_o35.commit(); _o35.close()
+st35 = Store(db35)                              # migration + backfill on open
+_cols35 = {r[1] for r in st35.conn().execute("PRAGMA table_info(sims)")}
+check("migration adds both recency columns to an older database",
+      {"two_year_sharpe", "test_sharpe"} <= _cols35)
+_r35 = st35.conn().execute(
+    "SELECT two_year_sharpe, test_sharpe FROM sims WHERE candidate_id='c35'"
+).fetchone()
+check("backfill recovers both values from payloads already stored",
+      _r35["two_year_sharpe"] == 0.48 and _r35["test_sharpe"] == 0.30,
+      f"{dict(_r35)}")
+_r35b = st35.conn().execute(
+    "SELECT two_year_sharpe, test_sharpe FROM sims WHERE candidate_id='c35b'"
+).fetchone()
+check("a payload carrying neither is left NULL, never guessed",
+      _r35b["two_year_sharpe"] is None and _r35b["test_sharpe"] is None)
+check("backfill is idempotent", Store(db35) is not None)
+os.remove(db35)
+
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")
 sys.exit(1 if fail else 0)

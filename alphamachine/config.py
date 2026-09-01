@@ -182,6 +182,15 @@ class Gates:
     max_prod_corr: float = 0.70          # BRAIN_RULES.md:20 platform ceiling
     min_years_positive: float = 0.70     # fraction of IS years with +PnL
     max_year_pnl_share: float = 0.50     # no single year carries the alpha
+    # BLOCK, and BRAIN's own number: LOW_2Y_SHARPE carries limit 1.58 in every
+    # simulation payload that reports it. Every other threshold here is a
+    # whole-period aggregate, which is how three candidates that had cleared
+    # PROD_CORRELATION for the first time ever still turned out to be dead --
+    # Sharpe 2.39 over 2014-2023, but 0.48 over the trailing two years,
+    # essentially all of it earned in 2015-2016. Absence of the value means
+    # BRAIN sent IS_LADDER_SHARPE instead, NOT that the alpha is fine, so
+    # quality_verdict only applies this when the number is actually present.
+    min_two_year_sharpe: float = 1.58
 
 
 # --------------------------------------------------------------------------
@@ -222,7 +231,14 @@ class SimSettings:
     unitHandling: str = "VERIFY"
     nanHandling: str = "ON"
     maxTrade: str = "OFF"
-    testPeriod: str = "P1Y6M"   # holdout window kept out of the IS metrics
+    # NOT a holdout: measured over 2,992 stored payloads, is.pnl == train.pnl +
+    # test.pnl to within 0.5%, while is.pnl differs from train.pnl by 16%. The
+    # IS metrics every gate reads INCLUDE this window. What testPeriod actually
+    # buys is a separate `test` block in the response covering the trailing
+    # period -- which is where metrics.extract() gets test_sharpe, the recency
+    # proxy. (SimSettings.key() omits testPeriod, so changing it would collide
+    # candidate ids with existing rows rather than producing new ones.)
+    testPeriod: str = "P1Y6M"
     language: str = "FASTEXPR"
     visualization: bool = False
 

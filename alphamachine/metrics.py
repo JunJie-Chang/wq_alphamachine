@@ -48,6 +48,22 @@ def extract(alpha: dict) -> dict:
     out["subuniverse_sharpe"] = check_value(checks, "LOW_SUB_UNIVERSE_SHARPE")
     out["self_correlation"] = check_value(checks, "SELF_CORRELATION")
     out["prod_correlation"] = check_value(checks, "PROD_CORRELATION")
+    # Recency. Nothing else in the pipeline knew an alpha could be dead for
+    # five years and still look good: every other field here is a whole-period
+    # aggregate, so a signal that earned Sharpe 9 in 2016 and nothing since
+    # scores like a working one.
+    #
+    # two_year_sharpe is BRAIN's OWN number, present on ~44% of simulations
+    # (it sends IS_LADDER_SHARPE to the rest) and identical to the value
+    # /check later reports -- only the `result` string flips WARNING -> FAIL,
+    # which is exactly how a 0.48 slipped through unnoticed. Because it is
+    # BRAIN's, it can block.
+    out["two_year_sharpe"] = check_value(checks, "LOW_2Y_SHARPE")
+    # test_sharpe is the trailing-testPeriod (P1Y6M) Sharpe BRAIN reports
+    # alongside the full period. Nearly universal coverage, but a shorter
+    # window than the 2Y check and only ~88% agreement with it at the 1.58
+    # threshold -- good enough to RANK on, not to reject on.
+    out["test_sharpe"] = _f((alpha.get("test") or {}).get("sharpe"))
     return out
 
 
@@ -151,6 +167,18 @@ def quality_verdict(rec: dict, g: Gates, universe: str = "TOP3000",
             floor = subuniverse_floor(sh, universe, region)
         if sub < floor:
             r.append(f"sub-universe sharpe {sub:.2f} < {floor:.2f}")
+
+    # Recency, on BRAIN's own number. Judged on the VALUE, never on the
+    # `result` string: at simulation time these come back WARNING, and it is
+    # the value that predicts the FAIL /check will return later -- a 0.48
+    # reported as WARNING is exactly how a dead alpha reached the deep gate
+    # looking submittable. Absent means BRAIN sent IS_LADDER_SHARPE for this
+    # alpha instead, which is unknown, not fine, so absence never blocks.
+    two_y = rec.get("two_year_sharpe")
+    if two_y is None:
+        two_y = check_value(rec.get("checks"), "LOW_2Y_SHARPE")
+    if two_y is not None and abs(two_y) < g.min_two_year_sharpe:
+        r.append(f"2y sharpe {two_y:.2f} < {g.min_two_year_sharpe}")
 
     if mg is not None:
         bps = mg * 10000.0 if abs(mg) < 1.0 else mg
@@ -301,6 +329,24 @@ def headroom(rec: dict, g: Gates) -> float:
     sub = rec.get("subuniverse_sharpe")
     if sub is not None and sh > 0:
         slacks.append((sub / sh) / max(g.subuniverse_ratio, 1e-9))
+    # Recency. Without this the ladder actively PREFERS decayed signals: every
+    # other term above is a whole-period aggregate, so an alpha whose
+    # 2015-2016 block inflates its full-period Sharpe by ~40% outscores a
+    # steady one, and refine._score (= headroom - 0.25*fails) is the only
+    # objective the ladder has. Measured before this line existed: a
+    # Sharpe-2.39 alpha with a 0.48 two-year Sharpe scored 0.96 and beat a
+    # steady Sharpe-1.75/2Y-1.8 alpha at 1.05's expense.
+    #
+    # Prefer BRAIN's exact 2Y number; fall back to the trailing-testPeriod
+    # Sharpe, which is present on nearly every simulation but covers a shorter
+    # window and agrees with the 2Y check only ~88% of the time at the
+    # threshold. That is why it ranks here and does NOT gate in
+    # quality_verdict: good enough to steer, not to veto.
+    recent = rec.get("two_year_sharpe")
+    if recent is None:
+        recent = rec.get("test_sharpe")
+    if recent is not None:
+        slacks.append(abs(recent) / max(g.min_two_year_sharpe, 1e-9))
     return min(slacks)
 
 

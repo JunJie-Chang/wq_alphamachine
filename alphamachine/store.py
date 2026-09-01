@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS sims (
     drawdown      REAL, margin REAL,
     longCount     INTEGER, shortCount INTEGER,
     subuniverse_sharpe REAL,
+    -- Recency, pulled out of the payload we already store. Every other metric
+    -- here is a whole-period aggregate, so without these a signal that died in
+    -- 2018 still scores on its 2015 performance.
+    two_year_sharpe REAL,                -- BRAIN's LOW_2Y_SHARPE value (~44%)
+    test_sharpe     REAL,                -- trailing testPeriod Sharpe (~100%)
     checks        TEXT,                  -- json list
     raw           TEXT,                  -- json
     finished      REAL
@@ -255,6 +260,7 @@ class Store:
         "gate_history": [("deep_ok", "INTEGER"),
                          ("deep_reasons", "TEXT")],
         "candidates": [("field2", "TEXT")],
+        "sims": [("two_year_sharpe", "REAL"), ("test_sharpe", "REAL")],
     }
 
     def _migrate(self, pre_existing: set[str] | None = None) -> None:
@@ -271,11 +277,56 @@ class Store:
         c.commit()
         if "arms.scan_trials" in added:
             self._backfill_arm_stages()
+        if "sims.two_year_sharpe" in added:
+            self._backfill_recency()
         # A database that already had gate_history but not the ledger has deep
         # verdicts on file that were never counted -- rebuild them once.
         pre = pre_existing or set()
         if "gate_history" in pre and "bandit_taught" not in pre:
             self._rebuild_deep_trials()
+
+    def _backfill_recency(self) -> None:
+        """Populate the two recency columns from payloads already on disk.
+
+        Both numbers have been arriving with every simulation since day one --
+        LOW_2Y_SHARPE inside `checks`, and the trailing-testPeriod Sharpe
+        inside `raw.test` -- and both were dropped on the floor because
+        extract() never read them. So the whole accumulated history is usable
+        immediately rather than only simulations from here on, which matters:
+        the alphas this was built to catch are already in the table.
+
+        Exact, not inferred: every value is copied out of BRAIN's own stored
+        response. Rows whose payload carries neither are left NULL, which
+        downstream treats as "unknown" and never as "fine".
+        """
+        c = self.conn()
+        rows = c.execute(
+            "SELECT candidate_id, checks, raw FROM sims "
+            "WHERE two_year_sharpe IS NULL AND test_sharpe IS NULL").fetchall()
+        n2 = nt = 0
+        for r in rows:
+            two = test = None
+            try:
+                for ch in json.loads(r["checks"] or "[]"):
+                    if ch.get("name") == "LOW_2Y_SHARPE":
+                        two = ch.get("value")
+                        break
+            except (ValueError, TypeError, AttributeError):
+                pass
+            try:
+                test = ((json.loads(r["raw"] or "{}") or {}).get("test")
+                        or {}).get("sharpe")
+            except (ValueError, TypeError, AttributeError):
+                pass
+            if two is None and test is None:
+                continue
+            n2 += two is not None
+            nt += test is not None
+            c.execute("UPDATE sims SET two_year_sharpe=?, test_sharpe=? "
+                      "WHERE candidate_id=?", (two, test, r["candidate_id"]))
+        c.commit()
+        log.info("recency backfill: %d rows scanned, %d two_year_sharpe, "
+                 "%d test_sharpe", len(rows), n2, nt)
 
     def _rebuild_deep_trials(self) -> None:
         """Recount the deep stage from gate_history, one trial per lineage.
@@ -436,7 +487,8 @@ class Store:
     # --------------------------------------------------------------- sims
     def record_sim(self, candidate_id: str, rec: dict) -> None:
         cols = ("alpha_id status error sharpe fitness turnover returns drawdown "
-                "margin longCount shortCount subuniverse_sharpe").split()
+                "margin longCount shortCount subuniverse_sharpe "
+                "two_year_sharpe test_sharpe").split()
         vals = [rec.get(k) for k in cols]
         with self.conn() as c:
             c.execute(
