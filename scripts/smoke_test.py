@@ -1574,6 +1574,10 @@ check("a later fail is agreed on by both the live query and audit's own "
       "handles correctly",
       not any(f.detail.get("expr") == "expr_d" for f in _fD), f"{_fD}")
 
+# The tie must be between two rows for the SAME candidate -- that is the only
+# case the SQL's MAX(ts) join genuinely cannot resolve. (Two different
+# candidates sharing a ts are separately evaluated and are not a tie at all,
+# which is exactly what grouping by candidate_id fixed.)
 _tTie = _t32.time() + 20.0
 with st32.conn() as _c32:
     _c32.execute(
@@ -1583,10 +1587,10 @@ with st32.conn() as _c32:
     _c32.execute(
         "INSERT INTO gate_history (ts,candidate_id,alpha_id,expr,ok,"
         "deep_ok,deep_reasons) VALUES (?,?,?,?,?,?,?)",
-        (_tTie, "cE2", "AE2", "expr_e", 1, 0, "[\"lucky year\"]"))
+        (_tTie, "cE1", "AE1b", "expr_e", 1, 0, "[\"lucky year\"]"))
 _fE = _AU32.check_gate_passing_now_consistency(st32.conn())
-check("a ts-tie is resolved by id, not left to the SQL join's discretion",
-      any(f.detail.get("expr") == "expr_e" for f in _fE), f"{_fE}")
+check("a ts-tie on one candidate is resolved by id, not by the SQL join",
+      any(f.detail.get("candidate_id") == "cE1" for f in _fE), f"{_fE}")
 
 # F. arms bounds -- bump_arm is additive, so a direct raw UPDATE is the only
 # way to construct pass > trials (no legitimate caller ever would).

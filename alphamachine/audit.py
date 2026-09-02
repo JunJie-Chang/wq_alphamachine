@@ -107,42 +107,49 @@ def check_deep_checks_poisoned(conn: sqlite3.Connection) -> list[Finding]:
 
 def check_gate_passing_now_consistency(conn: sqlite3.Connection
                                        ) -> list[Finding]:
-    """Independently recomputes 'the true latest gate_history row per expr,
-    then judge pass/fail' in plain Python, tie-broken by id (SQLite's
-    insertion-order proxy) when two rows share a timestamp -- a case the live
-    query's MAX(ts) join cannot distinguish -- then diffs that ground truth
-    against what GATE_PASSING_NOW_SQL actually reports. This is deliberately
-    NOT just re-running that same SQL and trusting it: if the query is ever
-    reverted to its pre-fix form (or a differently-buggy variant is added
-    elsewhere), the diff against this independent recomputation still fires."""
+    """Independently recomputes 'the true latest gate_history row per
+    candidate, then judge pass/fail' in plain Python, tie-broken by id
+    (SQLite's insertion-order proxy) when two rows share a timestamp -- a case
+    the live query's MAX(ts) join cannot distinguish -- then diffs that ground
+    truth against what GATE_PASSING_NOW_SQL actually reports. This is
+    deliberately NOT just re-running that same SQL and trusting it: if the
+    query is ever reverted to a buggy form (or a differently-buggy variant is
+    added elsewhere), the diff against this independent recomputation fires.
+
+    Keyed on candidate_id, matching the query. It was keyed on expr until the
+    ladder began searching nine neutralizations, at which point the same
+    expression under different settings became several genuinely different,
+    separately submittable alphas -- and grouping them let a failing sibling
+    at an identical timestamp mask a candidate that passed everything.
+    """
     rows = conn.execute(
-        "SELECT id, ts, expr, ok, deep_ok FROM gate_history").fetchall()
+        "SELECT id, ts, candidate_id, ok, deep_ok FROM gate_history").fetchall()
     latest: dict[str, sqlite3.Row] = {}
     for r in rows:
-        cur = latest.get(r["expr"])
+        cur = latest.get(r["candidate_id"])
         if cur is None or (r["ts"], r["id"]) > (cur["ts"], cur["id"]):
-            latest[r["expr"]] = r
+            latest[r["candidate_id"]] = r
     truth_passing = {e for e, r in latest.items()
                      if r["ok"] == 1 and r["deep_ok"] == 1}
-    reported = {r["expr"] for r in
+    reported = {r["candidate_id"] for r in
                 conn.execute(GATE_PASSING_NOW_SQL, (10**9,))}
 
     out = []
     for e in sorted(reported - truth_passing):
         out.append(Finding(
             "gate_passing_now_stale_pass", "critical", "gate_history",
-            "gate_passing_now() reports this expression submittable, but "
+            "gate_passing_now() reports this candidate submittable, but "
             "its true latest row (by ts, tie-broken by id) is not a clean "
             "ok=1/deep_ok=1 pass -- the exact shape of a real regression "
             "found and fixed once already",
-            {"expr": e[:80]}))
+            {"candidate_id": e}))
     for e in sorted(truth_passing - reported):
         out.append(Finding(
             "gate_passing_now_missing_true_pass", "warning", "gate_history",
-            "this expression's true latest row is a clean pass but "
+            "this candidate's true latest row is a clean pass but "
             "gate_passing_now() did not report it -- check for a ts "
-            "collision with another row for the same expr",
-            {"expr": e[:80]}))
+            "collision with another row for the same candidate",
+            {"candidate_id": e}))
     return out
 
 

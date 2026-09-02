@@ -177,8 +177,18 @@ def quality_verdict(rec: dict, g: Gates, universe: str = "TOP3000",
     two_y = rec.get("two_year_sharpe")
     if two_y is None:
         two_y = check_value(rec.get("checks"), "LOW_2Y_SHARPE")
-    if two_y is not None and abs(two_y) < g.min_two_year_sharpe:
-        r.append(f"2y sharpe {two_y:.2f} < {g.min_two_year_sharpe}")
+    if two_y is not None:
+        # The limit is NOT always 1.58. Observed live: /check returned
+        # limit 2.02 for five alphas while every simulation-time payload said
+        # 1.58, so a 1.88 that our gate waved through was rejected by BRAIN.
+        # Same lesson as LOW_SUB_UNIVERSE_SHARPE above -- prefer the limit
+        # BRAIN reported for THIS alpha, and keep the Gates value only as the
+        # fallback for a record that carries no limit.
+        floor2y = check_limit(rec.get("checks"), "LOW_2Y_SHARPE")
+        if floor2y is None:
+            floor2y = g.min_two_year_sharpe
+        if abs(two_y) < floor2y:
+            r.append(f"2y sharpe {two_y:.2f} < {floor2y}")
 
     if mg is not None:
         bps = mg * 10000.0 if abs(mg) < 1.0 else mg

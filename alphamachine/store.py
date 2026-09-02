@@ -224,10 +224,26 @@ def cid(expr: str, settings_key: str) -> str:
 # because it never looked past deep_ok=1 rows to notice a fail had been
 # recorded since. DO NOT move the ok=1/deep_ok=1 filter into the subquery --
 # that is precisely this bug.
+#
+# Grouped by candidate_id, NOT by expr. Expression-grouping was right while
+# the ladder varied one neutralization; it became wrong the moment the search
+# widened to nine, because the SAME expression under a different
+# neutralization is a genuinely different alpha -- different settings,
+# different candidate_id, different alpha_id, different PnL, separately
+# submittable. Up to 26 distinct candidates now share a single expr.
+#
+# Caught live: WjPj1R0x (FAST neutralization) passed every gate and every
+# BRAIN check -- ok=1, deep_ok=1, PROD_CORRELATION 0.557, 2Y Sharpe 1.93 --
+# and was invisible here, because six OTHER neutralizations of the same
+# expression were recorded failing at the identical timestamp and the
+# MAX(ts) join picked one of those instead. candidate_id is the true identity
+# of a submittable alpha; deduping to it still collapses the same candidate
+# re-checked over time, which is all the expr grouping was ever meant to do.
 GATE_PASSING_NOW_SQL = (
     "SELECT g.* FROM gate_history g JOIN "
-    "(SELECT expr, MAX(ts) mts FROM gate_history GROUP BY expr) m "
-    "ON m.expr=g.expr AND m.mts=g.ts "
+    "(SELECT candidate_id, MAX(ts) mts FROM gate_history "
+    " GROUP BY candidate_id) m "
+    "ON m.candidate_id=g.candidate_id AND m.mts=g.ts "
     "WHERE g.ok=1 AND g.deep_ok=1 "
     "ORDER BY g.sharpe DESC LIMIT ?"
 )
