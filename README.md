@@ -37,6 +37,7 @@ for a fitness credit that does not exist. The machine explicitly targets the
 | `MAX_STOCK_WEIGHT` | < 0.10 | < 0.10 |
 | `SELF_CORRELATION` | < 0.70 | < 0.70 |
 | `PROD_CORRELATION` | < 0.70 | < 0.70 |
+| `LOW_2Y_SHARPE` | ≥ **1.58** (per-alpha) | ≥ 1.58 |
 
 **The most expensive myth on the internet is `LOW_SHARPE ≥ 1.25`.** That is the
 **user-level Challenge** bar. A consultant D1 alpha needs **1.58**, so a gate
@@ -50,6 +51,31 @@ universe it is `0.75 × √(sub_size / universe_size) × alpha_sharpe`
 ladder, and `CONCENTRATED_WEIGHT` / `LOW_DURATION` / `MATCHES_COMPETITION` are
 pass/fail. Reported failure distribution: **`LOW_SHARPE` ~90% of rejections.**
 Pass rates by data type: fundamental ~40% ≫ mixed ~13% ≫ pure technical ~5%.
+
+**Prefer the limit BRAIN reports over any local formula.** Every simulation
+payload carries each check's own `limit` alongside its value, already scaled to
+that alpha. Two of the numbers above are per-alpha in practice:
+`LOW_SUB_UNIVERSE_SHARPE` scales with the alpha's Sharpe, and `LOW_2Y_SHARPE`
+has been observed live at **2.02** on `/check` while every simulation-time
+payload for the same alphas said 1.58. So `metrics.check_limit()` reads the
+reported number and the `Gates` constant is only the fallback for a record
+that predates the check.
+
+**`LOW_2Y_SHARPE` is the one check that is not a whole-period aggregate**, and
+that makes it the one worth singling out. Every other metric here is computed
+over the full history, so a signal that earned Sharpe 9 in 2015–2016 and
+nothing since still scores like a working one. A real example from this
+database — full-period Sharpe **2.39**, trailing-two-year Sharpe **0.48**:
+
+```
+year   2014  2015  2016  2017  2018  2019  2020  2021  2022  2023
+sharpe 2.81  7.43  9.52  4.24 -0.60 -0.18 -0.03  0.59  1.06  0.47
+```
+
+BRAIN sends this value on ~44% of simulations (it sends `IS_LADDER_SHARPE` for
+the rest) with the same value `/check` will later report — only the `result`
+string flips `WARNING` → `FAIL`. Judge the **value**, never the string.
+Absence means BRAIN sent the other check, which is unknown, not fine.
 
 ### How consultant score is computed
 
@@ -137,6 +163,12 @@ out of sample. A book of coin flips scores badly and cannot be un-submitted.
 > hypothesis*, not the identity of the data. `templates.py` encodes ten distinct
 > transform families — LEVEL, CHANGE, SURPRISE, ACCELERATION, STABILITY,
 > RELATIVE, YIELD, RESIDUAL, CONSISTENCY, EVENT — each a different economic claim.
+> A second axis was added once the first one hit its measured ceiling: **how
+> many data sources**. `needs_field2` templates pair two fields drawn from
+> *different themes*, weighted by `Catalog.field_value` (which carries the
+> platform's own `alphaCount`, i.e. a direct crowding measure). Four of the five
+> are minimal generalisations of shapes already in the list, and every one
+> reuses an existing family so `priors.py` scores them with no extra LLM call.
 
 > **② Diagnose, don't sweep.** A survivor's failing metric tells you which knob
 > to turn. Reading the failure and turning that one knob costs ~20 sims; a full
@@ -169,9 +201,9 @@ out of sample. A book of coin flips scores badly and cannot be un-submitted.
    │  kept deliberately low: today's best alpha scanned at 0.94  │
    └────────────────────────────┬────────────────────────────────┘
                                 ▼
-   ┌─ refine ── greedy coordinate ascent, ~20 sims per survivor ─┐
+   ┌─ refine ── greedy coordinate ascent, ~25 sims per survivor ─┐
    │  0 SIGN         1 sim   −1.6 Sharpe is a 1.6 alpha backwards│
-   │  1 NEUTRALIZE   5 sims  biggest single Sharpe lever         │
+   │  1 NEUTRALIZE   8 sims  biggest single lever, 9 values tried│
    │  2 ROBUSTNESS   3 sims  backfill/winsorize → CONCENTR_WEIGHT│
    │  3 TURNOVER     6 sims  decay aimed AT THE KNEE, hump,      │
    │                         trade_when                          │
@@ -180,13 +212,15 @@ out of sample. A book of coin flips scores badly and cannot be un-submitted.
    └────────────────────────────┬────────────────────────────────┘
                                 ▼
    ┌─ metric gate ──── free: everything the sim record knows ────┐
-   │  sharpe · fitness · turnover · sub-universe ratio           │
+   │  sharpe · fitness · turnover · sub-universe (BRAIN's limit) │
    │  · drawdown · margin (bps) · long/short balance · positions │
+   │  · RECENCY: LOW_2Y_SHARPE, which the payload always carried │
    └────────────────────────────┬────────────────────────────────┘
                                 ▼
    ┌─ deep gate ── costs API calls, so only for metric-passers ──┐
    │  yearly consistency   one-lucky-year filter                 │
    │  /check               PROD_CORRELATION et al                │
+   │  /correlations/prod   the whole HISTOGRAM, not just the max │
    │  The sim record CANNOT answer either. Unknown != pass.      │
    └────────────────────────────┬────────────────────────────────┘
                                 ▼
@@ -239,21 +273,72 @@ degrade the allocation into noise.
 **Selection value = quality × (1 − corr).** Because score aggregates over a
 *basket*, the marginal alpha is worth its quality discounted by its redundancy.
 
-**The metric gate is not the bar — measured, not assumed.** From one full day of
-running: **1,385 simulations → 334 scan survivors → 14 cleared every local
-metric → 0 submittable.** Every one of the 14 died at the deep gate, in two
-clean clusters:
+**The metric gate is not the bar — measured, not assumed.** The funnel over the
+whole accumulated database, recomputed live rather than read off a stored flag:
 
-| Cluster | Blocked by |
-|---|---|
-| analyst / earnings-revision family | `PROD_CORRELATION` — the theme is already crowded in BRAIN's production pool |
-| `inst20_ra_sv` family | one lucky year (18% of years positive, single year 71% of \|PnL\|), plus `CONCENTRATED_WEIGHT`, `IS_LADDER_SHARPE`, `LOW_DURATION` |
+```
+28,535   simulations dispatched
+22,691   completed OK
+ 2,414   |Sharpe| >= 1.58
+   524   clear every local gate
+           top blockers: sub-universe 254, 2Y sharpe 132, then margin, fitness
+   529   paid to measure PROD_CORRELATION      (across every gate version to date)
+    19   came in under the 0.70 limit          <- the wall
+     1   submitted, status ACTIVE
+```
 
-Two lessons. First, **a simulation record cannot tell you whether an alpha is
-submittable** — it reports both correlation checks as `PENDING` with no value
-and says nothing about the shape of the equity curve. Second, the
-`PROD_CORRELATION` cluster is *structural*: no amount of refinement fixes "this
-hypothesis is crowded". That is a signal to rotate region or theme, not to tune.
+**A simulation record cannot tell you whether an alpha is submittable** — it
+reports both correlation checks as `PENDING` with no value. That is why the
+deep gate exists, and why "unknown" is recorded as NULL rather than as a pass.
+
+### `PROD_CORRELATION` is the binding constraint, and it is extreme-value statistics
+
+Of 529 alphas we have paid to measure, **510 failed** — median 0.87, and for a
+long stretch not one of 99 consecutive ideas came in under the 0.70 limit. That
+is not bad luck. `PROD_CORRELATION` scores an alpha on its **maximum**
+correlation against every alpha in BRAIN's production pool, and that pool is
+**~2.48 million**. The maximum of N draws is governed by
+
+```
+expected_max ≈ mean + sd × z(N),        z(2,478,170) = 4.945
+```
+
+N is fixed, so **mean and sd of the correlation profile are the only two levers
+an alpha has**. A profile centred at 0.11 with sd 0.16 "expects" a maximum near
+0.92 no matter how novel the idea feels. This is why `/correlations/prod` is
+stored as a whole histogram in the `prod_corr_hist` table rather than as a
+single number: the max tells you that you failed, the profile tells you whether
+anything you changed actually moved the distribution. Two real rows:
+
+| alpha | mean | sd | expected max | actual |
+|---|---|---|---|---|
+| `58lKRxQJ` | **−0.016** | **0.051** | 0.237 | 0.538 |
+| `pwj9oMKg` | 0.138 | 0.154 | 0.899 | 0.865 |
+
+**What moved it: neutralization, and only neutralization.** A positive mean
+correlation against the production pool is a *factor-exposure signature*, and
+neutralization is the lever that removes factor exposure. `NEUTRALIZATIONS` had
+listed eleven values since day one and was read by nothing — the ladder only
+ever tried five, so `STATISTICAL`, `CROWDING`, `FAST` and `SLOW` had **never
+been simulated once**. On a probe expression three of them beat everything the
+old tuple could reach (`STATISTICAL` 3.48, `SLOW` 3.11, `CROWDING` 3.04 against
+a previous best of 2.98). The result on the real database is unambiguous — all
+19 sub-0.70 alphas came from the neutralizations the ladder had never tried:
+
+```
+STATISTICAL 11    SLOW 6    FAST 1    SLOW_AND_FAST 1
+INDUSTRY 0   SUBINDUSTRY 0   SECTOR 0   MARKET 0
+```
+
+The other lever tested against the same wall, **two-field templates**, was
+pre-registered with a decision rule and then honestly scored as a null result:
+median 0.837 across 135 measured two-field alphas versus 0.873 across 394
+one-field ones. Real, small, and nowhere near the size of the neutralization
+effect. It stays in the library; it is not the answer.
+
+**Some crowding is still structural.** No amount of refinement fixes "this
+hypothesis is already in production" — that is a signal to rotate region or
+theme, not to tune.
 
 **Portability (rung 5) is falsification, not optimisation.** An alpha that dies
 on TOP1000 is a liquidity artefact. Better to kill it than to have it pass in
@@ -263,21 +348,46 @@ sample and lose money live.
 independent alphas show 0.9+ correlation on cumulative series. This one mistake
 is the most common cause of a locally-vetted basket failing `SELF_CORRELATION`.
 
-**Our gates vs the platform's** — set to the actual consultant floor from
-`docs/BRAIN_RULES.md` (the user's own official documents; see Part 5), not an
-arbitrary margin on top of it. Where a stricter number IS backed by official
-guidance (turnover, sub-universe ratio, margin) that guidance is kept:
+**BLOCK vs PREFER — the distinction this project got wrong for a long time.**
+`docs/BRAIN_RULES.md` carries two different kinds of number, and they were
+being applied as if they were one:
 
-| | platform (consultant D1) | machine |
-|---|---|---|
-| Sharpe | > 1.58 | **1.58** |
-| Fitness | > 1.00 | **1.00** |
-| Turnover | ≤ 0.70 | **≤ 0.30** (official Value Factor guidance) |
-| Self-corr | < 0.70 | **< 0.55** |
-| Prod-corr | < 0.70 | **< 0.60** |
-| Sub-universe ratio | — | **≥ 0.70** (official guidance) |
-| Drawdown | — | **≤ 0.12** |
-| Years positive | — | **≥ 70%, no year > 50% of PnL** |
+* **Submission requirements** (line 17–20) — what BRAIN actually *rejects*:
+  turnover 1%–70%, self/prod correlation < 0.70.
+* **Value Factor guidance** (line 76–77) — advice on what *earns well once
+  submitted*: turnover < 30%, retain 70% of Sharpe in the sub-universe,
+  margin > 4 bps.
+
+The second set was wired in as a hard rejection, so a preference about payout
+was silently deciding what was allowed to exist. **Measured cost:** of 100
+distinct ideas clearing Sharpe 1.58 and Fitness 1.0, only **19** survived —
+turnover alone hid 39 and the sub-universe rule hid another 34. Among the
+hidden was the best candidate the pipeline had ever produced (Sharpe 2.64 /
+Fitness 1.63), whose real server check came back PASS on every line except
+`PROD_CORRELATION`.
+
+So the two are now separate. **BLOCKS mirror what BRAIN rejects. PREFERENCES
+steer `headroom()`, and through it the refinement ladder**, toward the payout
+sweet spot without discarding anything BRAIN would have accepted. Widening a
+block costs no extra API budget: deep checks are capped per run and spent in
+score order, so a bigger eligible pool only improves what the cap buys.
+
+| | platform (consultant D1) | machine BLOCK | machine PREFER |
+|---|---|---|---|
+| Sharpe | > 1.58 | **1.58** | — |
+| Fitness | > 1.00 | **1.00** | — |
+| Turnover | 0.01 – 0.70 | **0.01 – 0.70** | **≤ 0.30** |
+| Self-corr | < 0.70 | **< 0.70** | — |
+| Prod-corr | < 0.70 | **< 0.70** | — |
+| Sub-universe | per-alpha formula | **BRAIN's own reported limit** | ratio ≥ 0.70 |
+| 2-year Sharpe | ≥ 1.58 (per-alpha) | **BRAIN's own reported limit** | — |
+| Drawdown | — | **≤ 0.12** | — |
+| Margin | — | — | **≥ 4 bps** |
+| Years positive | — | **≥ 70%, no year > 50% of PnL** | — |
+
+`AutoGates` — the bar for submitting *without a human looking* — is a whole
+tier stricter (Sharpe 2.10, prod-corr 0.45, turnover 0.22) and there the
+asymmetry is deliberate, because nothing downstream reviews the decision.
 
 ---
 
@@ -286,7 +396,7 @@ guidance (turnover, sub-universe ratio, margin) that guidance is kept:
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 141 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 279 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 3 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -296,8 +406,56 @@ python3 -m alphamachine gatelog --passing                     # what can I submi
 python3 -m alphamachine --concurrency 3 select --n 10
 python3 -m alphamachine --concurrency 3 submit --n 3          # dry run
 python3 -m alphamachine --concurrency 3 submit --n 3 --live   # for real
-python3 -m alphamachine report
+python3 -m alphamachine report --corr                         # observed prod-corr
+python3 -m alphamachine audit                                 # live-db consistency
 ```
+
+**Two test surfaces, and they answer different questions.**
+`scripts/smoke_test.py` proves the **write path** is correct against a fresh
+temp database, driven the way the test drives it — offline, no quota, no
+network. It says nothing about whether the *actual accumulated* database,
+written by real runs, crashes, migrations and interrupted processes over its
+whole lifetime, still satisfies the invariants that write path assumes.
+`alphamachine audit` is the compensating control: eleven checks that open the
+live db **read-only** and recompute each cross-table invariant from first
+principles. SQLite foreign keys are off and the schema has no `CHECK`
+constraints, so every one of those invariants is enforced purely by caller
+discipline — exactly the kind of thing that erodes silently. It exists because
+two real bugs were found only because a human happened to ask about one
+specific candidate; checks 2 and 3 are those two bugs' exact shapes.
+
+### Running it unattended
+
+```bash
+nohup python3 scripts/autoloop.py --scan-budget 300 --refine-top 25 \
+      --select-n 10 --submit-n 4 >> data/logs/autoloop.log 2>&1 &
+```
+
+`autoloop.py` sequences `scan → refine → gatelog → select → submit` forever, each
+stage as a fresh `python3 -m alphamachine <stage>` subprocess. It reimplements
+none of their logic, so a stage behaves identically whether launched from the
+loop or from a terminal.
+
+**Invariant, enforced in that one file: `submit` is invoked WITHOUT `--live`.**
+No code path in it constructs that flag under any condition. Automating the loop
+is not a reason to relax the one boundary worth keeping — submission stays a
+dry-run report, never an action.
+
+The loop's real job is handling the two failure signatures neither `cli.py` nor
+`executor.py` turns into a clean stop: a dead session raises `BiometricRequired`
+out of `_setup()` (uncaught, non-zero exit with a traceback), and `Executor.run`
+catches it *per bundle*, sets its own halt flag, and returns having quietly done
+less work than asked. Both mean the same thing — only a human can revive the
+session. The loop logs one `NEEDS_AUTH` marker, polls a **free** endpoint
+(`GET /users/self`, no biometric quota) until the session is valid again, then
+retries the same stage. Retrying costs nothing: `scan` dedupes via
+`already_simulated`, and `refine` replays a part-finished ladder from stored
+results.
+
+`scripts/night_check.sh` is a read-only overnight snapshot appended to
+`data/logs/overnight.md`, with one exception — it restarts `autoloop.py` if the
+process has died outright. It never touches submission, and never tries to solve
+a biometric block; it just records the wait.
 
 `--concurrency` **must equal your real slot count** — confirmed **3** for this
 account, which is already the default. `submit` is a dry run unless you pass
@@ -417,6 +575,7 @@ same command resumes:
 | Field catalog | `data/cache/fields_*.json` | reused unless `--refresh` |
 | Alpha PnL | `pnl` table | fetched once per alpha |
 | Deep checks | `deep_checks` table | yearly kept forever; `/check` expires on TTL |
+| Prod-corr profile | `prod_corr_hist` table | histogram kept verbatim, one row per alpha |
 | Gate verdicts | `gate_history` table | append-only trail, with the thresholds in force at the time |
 | Bandit evidence | `arms` table, per funnel stage | schema migrates in place on open |
 | Session | `data/cookies.json` | reused; no repeat face check |
@@ -440,14 +599,29 @@ anything new.
 
 ### Where the quality actually comes from
 
-1. **Rung 1 (neutralization)** — biggest Sharpe lever, 5 sims. Always run it.
+1. **Rung 1 (neutralization)** — biggest lever by a wide margin, 8 sims, and
+   the *only* thing measured to move `PROD_CORRELATION`. Always run it, and run
+   it over all nine values, not the obvious five.
 2. **Rung 3 aimed at 12.5%** — most people decay past the knee and lose returns
    for nothing.
-3. **The lucky-year filter** — cheapest overfitting filter that exists, and
-   measured above as roughly half of all deep-gate rejections.
-4. **Breadth across datasets** — the thing that keeps `SELF_CORRELATION` off you.
-5. **Not submitting at the floor** — the 1.58-Sharpe alphas you *don't* submit
+3. **The lucky-year filter** — cheapest overfitting filter that exists.
+4. **The recency check** — nearly as cheap, and it was free all along. Without
+   it the ladder actively *prefers* decayed signals, because every other term in
+   `headroom()` is a whole-period aggregate: a Sharpe-2.39 / 2Y-0.48 alpha
+   scored 0.96 and beat a steady Sharpe-1.75 / 2Y-1.8 one. After the fix it
+   scores ~0.30 and loses, which is correct.
+5. **Breadth across datasets** — the thing that keeps `SELF_CORRELATION` off you.
+6. **Not submitting at the floor** — the 1.58-Sharpe alphas you *don't* submit
    are worth more than the ones you do.
+
+**Read what the payload already contains before adding an API call.** Both the
+recency fix and the sub-universe fix were the same bug twice: BRAIN sends every
+check's value *and* its per-alpha limit in `is.checks` on every simulation, and
+the pipeline stored the whole list and read three fields out of it. Fixing that
+cost zero extra requests and recovered 6,989 two-year Sharpes and 15,707
+trailing Sharpes from simulations already on disk. `MATCHES_PYRAMID`, which
+carries the payout multiplier, is arriving free in that same list today and is
+still unread — the same shape, still open.
 
 A worked example, straight from the database — the whole thesis in four lines:
 
@@ -463,6 +637,25 @@ gated   sharpe 1.73   fitness 1.57   turnover 0.040
 than by sweeping. Then the deep gate rejected it anyway on `PROD_CORRELATION`:
 the hypothesis is sound and already crowded. Both halves of that are the system
 working.
+
+And the one that made it all the way through — the first alpha this pipeline
+ever submitted:
+
+```
+group_neutralize(rank(ts_delta(ts_backfill(eur_director_value_2, 120), 66)), industry)
+
+neutralization  FAST          <- one of the four the ladder had never tried
+sharpe 1.76   fitness 1.04   turnover 0.148   sub-universe 0.85 (limit 0.76)
+PROD_CORRELATION 0.557        SELF_CORRELATION 0.098
+2Y sharpe 1.93                pyramid USA/D1/OTHER ×1.4
+status ACTIVE
+```
+
+Note the shape of it: a **1.76** Sharpe, well under the 2.6s that kept failing.
+Nothing about it is spectacular in sample, and its `test` segment (2.09) beats
+its `train` segment (1.68) — it is *getting better*, which is exactly what the
+recency gate was built to find. The metric that had blocked all 99 predecessors
+is the one it passes comfortably.
 
 ---
 
@@ -490,6 +683,26 @@ basket. `submit --auto` exists but applies `AutoGates`, a whole tier stricter
 than the manual gates (Sharpe 2.10 vs 1.58), and queues anything borderline for
 review instead of sending it. The asymmetry is the point: a bad simulation
 wastes a slot, a bad submission occupies book space and cannot be withdrawn.
+`autoloop.py` runs the entire pipeline unattended and still never constructs
+`--live`; the one alpha submitted so far was sent by hand.
+
+**A `200` is not evidence.** Several endpoints compute lazily and return `200`
+with an empty body while they do. This caused a real bug worth guarding against
+by name: `alpha_check()` accepted a `200` carrying an empty `checks` list and
+cached it as a clean pass, so a candidate read as submittable for a full
+`deep_check_ttl_hours`. Re-fetching the same alpha 123 seconds later returned 20
+real checks including `PROD_CORRELATION FAIL 0.857`. Both halves needed fixing —
+`client._recordset()` now retries on a `present` predicate rather than on the
+status code, and `deep_verdict()` treats an empty checks list as *inconclusive*
+whether it came fresh or from cache. `audit` checks the live table for the
+poisoned shape.
+
+**Bundling is all-or-nothing on the request, per-child on the error.** BRAIN
+`400`s the *whole* multi-sim bundle if any single member is malformed, and the
+error body is a per-child array in which valid members appear as `{}`. Reading
+that as "everything was rejected" produces exactly the wrong conclusion — a
+neutralization probe once reported all 7 variants invalid when 5 were fine.
+Re-probe separately before believing a bundle-level rejection.
 
 **`--concurrency` above your slot count does nothing good.** It builds a
 server-side queue and costs you the ability to react to results as they land.
@@ -499,7 +712,15 @@ The client hard-stops at 20 requests per rolling 24h against a platform cap of
 25. In steady state you complete one face check and the persisted session
 carries you; the quota only becomes visible when a session lapses mid-run --
 which happens roughly every 4h under unattended operation (`autoloop.py`),
-since each expiry needs its own re-authentication.
+since each expiry needs its own re-authentication. The interval is a function of
+**consultant tier** (~4h at Gold, up to 24h at Grand Master), so tier is an
+operational variable and not only a payout one.
+
+**Kill the parent, never the child.** `autoloop.py` classifies a stage
+subprocess dying as FATAL and stops the whole pipeline. Sending a signal to the
+`python3 -m alphamachine <stage>` process directly therefore halts everything;
+`SIGTERM` to the `autoloop.py` parent is the designed path, and its handler
+terminates the child cleanly.
 
 ### Sources
 
