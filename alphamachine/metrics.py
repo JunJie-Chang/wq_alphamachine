@@ -64,6 +64,15 @@ def extract(alpha: dict) -> dict:
     # window than the 2Y check and only ~88% agreement with it at the 1.58
     # threshold -- good enough to RANK on, not to reject on.
     out["test_sharpe"] = _f((alpha.get("test") or {}).get("sharpe"))
+    # Payout. MATCHES_PYRAMID carries the Dynamic Pyramid Multiplier that
+    # scales the base payment's Quality Factor, and it is present on 100% of
+    # simulations -- same shape as the recency gap above: BRAIN has been
+    # sending it since day one and nothing read it.
+    pyr = check_dict(checks, "MATCHES_PYRAMID")
+    out["pyramid_multiplier"] = _f((pyr or {}).get("multiplier"))
+    out["pyramid_names"] = [p.get("name") for p in (pyr or {}).get("pyramids") or []
+                            if p.get("name")] or None
+    out["pyramid_effective"] = (pyr or {}).get("effective")
     return out
 
 
@@ -71,6 +80,19 @@ def check_value(checks: list[dict], name: str) -> float | None:
     for c in checks or []:
         if c.get("name") == name:
             return _f(c.get("value"))
+    return None
+
+
+def check_dict(checks: list[dict], name: str) -> dict | None:
+    """The whole check entry, for checks that carry more than value/limit.
+
+    MATCHES_PYRAMID is the reason this exists: it reports `multiplier`,
+    `effective` and a `pyramids` list rather than a bare `value`, so
+    check_value() reads None off it and silently loses the payout number.
+    """
+    for c in checks or []:
+        if c.get("name") == name:
+            return c
     return None
 
 

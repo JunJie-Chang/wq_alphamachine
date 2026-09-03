@@ -1962,6 +1962,130 @@ check("a payload carrying neither is left NULL, never guessed",
 check("backfill is idempotent", Store(db35) is not None)
 os.remove(db35)
 
+print("\n[35] pyramid: the payout multiplier BRAIN sends on every simulation")
+from alphamachine.metrics import extract as _ex36
+from alphamachine.refine import _score as _sc36
+from alphamachine.config import pyramid_tilt as _tilt36, PYRAMID_SCORE_WEIGHT as _W36
+
+# Verbatim shape from a real submitted alpha (WjPj1R0x): the check reports
+# `multiplier`, `effective` and a `pyramids` list -- not a bare `value`, which
+# is exactly why check_value() read None off it for the whole project's life.
+_one36 = {"result": "PASS", "name": "MATCHES_PYRAMID", "effective": 1,
+          "multiplier": 1.4,
+          "pyramids": [{"name": "USA/D1/OTHER", "multiplier": 1.4}]}
+# And the multi-pyramid shape, from the database: PV 1.1 + MODEL 1.3 reports
+# 1.1. The MINIMUM, on 9,414 of 9,414 alphas where the members differed.
+_two36 = {"result": "PASS", "name": "MATCHES_PYRAMID", "effective": 2,
+          "multiplier": 1.1,
+          "pyramids": [{"name": "USA/D1/PV", "multiplier": 1.1},
+                       {"name": "USA/D1/MODEL", "multiplier": 1.3}]}
+
+_e36 = _ex36({"id": "A36", "is": {"sharpe": 1.76, "checks": [_one36]}})
+check("extract pulls the pyramid multiplier, names and effective count",
+      _e36["pyramid_multiplier"] == 1.4
+      and _e36["pyramid_names"] == ["USA/D1/OTHER"]
+      and _e36["pyramid_effective"] == 1, f"{_e36['pyramid_multiplier']}")
+_e36m = _ex36({"id": "B36", "is": {"sharpe": 1.76, "checks": [_two36]}})
+check("the reported multiplier is the MINIMUM over matched pyramids, not max",
+      _e36m["pyramid_multiplier"] == 1.1
+      and _e36m["pyramid_names"] == ["USA/D1/PV", "USA/D1/MODEL"],
+      f"{_e36m['pyramid_multiplier']} from 1.1/1.3")
+_e36n = _ex36({"id": "C36", "is": {"sharpe": 1.76, "checks": []}})
+check("all three are None when the check is absent",
+      _e36n["pyramid_multiplier"] is None and _e36n["pyramid_names"] is None
+      and _e36n["pyramid_effective"] is None)
+check("an unknown multiplier tilts by exactly zero -- never a penalty",
+      _tilt36(None) == 0.0 and _tilt36(1.0) == 0.0)
+
+# The scoring property that makes this a PREFER and not a BLOCK.
+g36 = Gates()
+_r36 = {"status": "OK", "sharpe": 2.0, "fitness": 1.4, "turnover": 0.15,
+        "subuniverse_sharpe": 1.2, "two_year_sharpe": 1.9, "checks": []}
+_hi36 = dict(_r36, pyramid_multiplier=1.4)
+_lo36 = dict(_r36, pyramid_multiplier=1.1)
+_none36 = dict(_r36)
+check("_score prefers the higher-paying of two identical variants",
+      _sc36(_hi36, g36) > _sc36(_lo36, g36),
+      f"{_sc36(_hi36, g36):.4f} > {_sc36(_lo36, g36):.4f}")
+check("the whole 1.0-2.0 payout range is worth less than ONE failed check",
+      _W36 * 1.0 < 0.25, f"{_W36:.2f} vs 0.25")
+_broken36 = dict(_r36, pyramid_multiplier=2.0,
+                 checks=[{"name": "LOW_SHARPE", "result": "FAIL"}])
+check("payout can never buy a variant that fails a check",
+      _sc36(_broken36, g36) < _sc36(_lo36, g36),
+      f"{_sc36(_broken36, g36):.4f} < {_sc36(_lo36, g36):.4f}")
+check("a candidate with no pyramid data scores exactly as it did before",
+      _sc36(_none36, g36) == headroom(_none36, g36))
+check("headroom itself is untouched by the multiplier",
+      headroom(_hi36, g36) == headroom(_lo36, g36) == headroom(_none36, g36))
+
+# Rung 3: substitute the gate CONDITION, never add a second variant.
+check("an expression with a PV token is detected",
+      T.touches_pv("group_rank(ts_corr(fld, returns, 126), industry)")
+      and not T.touches_pv("group_rank(ts_delta(fld, 66), industry)"))
+check("'capex' does not count as 'cap' -- identifier boundaries hold",
+      not T.touches_pv("group_rank(ts_delta(fnd6_capex, 66), industry)"))
+_pv36 = "group_rank(ts_corr(fld, returns, 126), industry)"
+_no36 = "group_rank(ts_delta(fld, 66), industry)"
+check("already in the PV pyramid -> the volume gate is free, so keep it",
+      "volume > adv20" in T.turnover_gate(_pv36, "fld"))
+check("not in it -> gate on the field's own dispersion instead",
+      "ts_zscore(fld, 66)" in T.turnover_gate(_no36, "fld")
+      and "volume" not in T.turnover_gate(_no36, "fld"),
+      T.turnover_gate(_no36, "fld")[:52])
+check("with no field to gate on, fall back rather than emit nothing",
+      "volume > adv20" in T.turnover_gate(_no36, ""))
+check("either way it is exactly one trade_when, not two",
+      T.turnover_gate(_no36, "fld").count("trade_when") == 1)
+check("the gated expression still lints clean", not T.lint(T.turnover_gate(_no36, "fld")))
+
+# Migration + backfill over a database written before the columns existed.
+db36 = os.path.join(tempfile.gettempdir(), "am_pyr_test.db")
+if os.path.exists(db36): os.remove(db36)
+import sqlite3 as _sq36
+_o36 = _sq36.connect(db36)
+_o36.execute("CREATE TABLE sims (candidate_id TEXT PRIMARY KEY, alpha_id TEXT,"
+             " status TEXT, sharpe REAL, checks TEXT, raw TEXT)")
+_o36.execute("INSERT INTO sims (candidate_id,alpha_id,status,sharpe,checks,raw)"
+             " VALUES (?,?,?,?,?,?)",
+             ("c36", "A36", "OK", 1.76, json.dumps([_two36]), json.dumps({})))
+_o36.execute("INSERT INTO sims (candidate_id,alpha_id,status,sharpe,checks,raw)"
+             " VALUES (?,?,?,?,?,?)",
+             ("c36b", "A36b", "OK", 1.9, json.dumps([]), json.dumps({})))
+_o36.commit(); _o36.close()
+st36 = Store(db36)                              # migration + backfill on open
+_cols36 = {r[1] for r in st36.conn().execute("PRAGMA table_info(sims)")}
+check("migration adds all three pyramid columns to an older database",
+      {"pyramid_multiplier", "pyramid_names", "pyramid_effective"} <= _cols36)
+_r36b = st36.conn().execute(
+    "SELECT pyramid_multiplier m, pyramid_names ns, pyramid_effective e "
+    "FROM sims WHERE candidate_id='c36'").fetchone()
+check("backfill recovers the effective multiplier from stored checks",
+      _r36b["m"] == 1.1 and _r36b["e"] == 2, f"{dict(_r36b)}")
+check("and the pyramid names, as json, for genius coverage",
+      json.loads(_r36b["ns"]) == ["USA/D1/PV", "USA/D1/MODEL"])
+_r36c = st36.conn().execute(
+    "SELECT pyramid_multiplier m FROM sims WHERE candidate_id='c36b'").fetchone()
+check("a payload with no MATCHES_PYRAMID is left NULL, never defaulted to 1.0",
+      _r36c["m"] is None)
+check("pyramid backfill is idempotent", Store(db36) is not None)
+
+# record_sim must persist what extract() produced -- the list column included.
+db36w = os.path.join(tempfile.gettempdir(), "am_pyr_write.db")
+if os.path.exists(db36w): os.remove(db36w)
+st36w = Store(db36w)
+_cid36 = st36w.add_candidate(expr="rank(fld)", settings=SimSettings().payload(),
+                             theme="model", template="level_rank", field="fld")
+st36w.record_sim(_cid36, _ex36({"id": "W36", "is": {"sharpe": 1.7,
+                                                    "checks": [_one36]}}))
+_w36 = st36w.conn().execute(
+    "SELECT pyramid_multiplier m, pyramid_names ns FROM sims "
+    "WHERE candidate_id=?", (_cid36,)).fetchone()
+check("record_sim round-trips the multiplier and json-encodes the name list",
+      _w36["m"] == 1.4 and json.loads(_w36["ns"]) == ["USA/D1/OTHER"],
+      f"{dict(_w36)}")
+os.remove(db36); os.remove(db36w)
+
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")
 sys.exit(1 if fail else 0)

@@ -30,7 +30,7 @@ from typing import Any
 from . import templates as T
 from .config import (FITNESS_TURNOVER_KNEE, Gates, REFINE_DECAY,
                      REFINE_NEUTRALIZATION, REFINE_TRUNCATION, SimSettings,
-                     UNIVERSES)
+                     UNIVERSES, pyramid_tilt)
 from .metrics import check_result, failed_checks, headroom
 
 log = logging.getLogger("alphamachine.refine")
@@ -246,7 +246,14 @@ class Refiner:
                 v.append(Variant(T.wrap_hump(expr, 0.005), s, "hump=0.005"))
                 v.append(Variant(T.wrap_hump(expr, 0.01), s, "hump=0.01"))
             if to > 0.25 and "trade_when" not in expr:
-                v.append(Variant(T.wrap_trade_when(expr), s, "trade_when volume>adv20"))
+                # The gate's CONDITION is chosen to avoid dragging the alpha
+                # into the price-volume pyramid when it is not there already;
+                # see templates.turnover_gate. Substitution, not addition --
+                # this rung still emits exactly one trade_when variant.
+                gated = T.turnover_gate(expr, field)
+                v.append(Variant(gated, s, "trade_when "
+                                 + ("volume>adv20" if T.touches_pv(expr)
+                                    or not field else "own-zscore")))
             if to < 0.02:
                 # Guard the LOW_TURNOVER floor; below the knee there is no
                 # fitness credit anyway, so trading a little more is free.
@@ -331,4 +338,10 @@ def _score(rec: dict, g: Gates) -> float:
         return -1e9
     h = headroom(rec, g)
     fails = len(failed_checks(rec.get("checks") or []))
-    return h - 0.25 * fails
+    # Payout tilt, and it belongs HERE rather than in headroom(): headroom is a
+    # weakest-link feasibility score, and a 1.1x multiplier is a smaller prize,
+    # not a near-failure. Folding it into that min() would let a low-paying but
+    # perfectly submittable alpha look broken. As an additive term bounded by
+    # 0.15 it cannot outweigh a single failed check (0.25), which is the
+    # property that keeps this a preference.
+    return h - 0.25 * fails + pyramid_tilt(rec.get("pyramid_multiplier"))

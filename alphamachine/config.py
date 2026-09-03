@@ -290,6 +290,52 @@ REFINE_NEUTRALIZATION = ("INDUSTRY", "SUBINDUSTRY", "SECTOR", "MARKET",
 REFINE_DECAY = (0, 4, 8, 16, 32, 64)
 REFINE_TRUNCATION = (0.01, 0.04, 0.08, 0.15)
 
+# --------------------------------------------------------------------------
+# Payout: the Dynamic Pyramid Multiplier
+# --------------------------------------------------------------------------
+# A pyramid is region x delay x dataset category (e.g. USA/D1/ANALYST). BRAIN
+# publishes a per-pyramid multiplier in the range 1.0-2.0, driven by how little
+# that pyramid's data is used platform-wide, and applies it to the base
+# payment's Quality Factor. Every simulation carries the alpha's own value in
+# the MATCHES_PYRAMID check -- on 100% of OK sims -- so this costs no API call.
+#
+# Two measured facts shape how it is used:
+#
+#   * The reported multiplier is the MINIMUM over every pyramid the expression
+#     matches (9,414 of 9,414 multi-pyramid alphas; never the max or mean). So
+#     writing `returns`/`cap`/`volume`/`adv20` into an expression pulls in
+#     USA/D1/PV at 1.1 and holds the whole alpha there. The budget-weighted
+#     average across 24,277 simulations is 1.186 against 1.4 available.
+#   * It is NOT keyed by our `theme` tag, which agrees with BRAIN's actual
+#     pyramid category on only 25% of simulations. It is a property of the
+#     expression's datasets, which is why it is read per candidate rather than
+#     folded into a bandit arm.
+#
+# This is a PREFER, never a BLOCK: it is payout, not a submission requirement.
+# The weight is deliberately smaller than refine._score's 0.25-per-failed-check
+# penalty, so payout can break a tie between two feasible variants and can
+# never buy a broken one.
+PYRAMID_SCORE_WEIGHT = 0.15
+# A pyramid counts as "formulated" toward Genius tier at this many submitted
+# alphas; Expert needs 10 formulated pyramids, Master 30, Grand Master 60.
+# Tier sets the biometric re-auth interval (Gold 4h -> GM 24h), which is an
+# operational cost, not only a payout one.
+PYRAMID_MIN_ALPHAS = 3
+GENIUS_PYRAMIDS = {"EXPERT": 10, "MASTER": 30, "GRAND_MASTER": 60}
+
+
+def pyramid_tilt(multiplier: float | None, weight: float = PYRAMID_SCORE_WEIGHT
+                 ) -> float:
+    """Payout preference as a signed offset, 0.0 when unknown.
+
+    Unknown is neutral here, unlike a gate: a missing multiplier must not
+    penalise a candidate whose payload predates the column.
+    """
+    if multiplier is None:
+        return 0.0
+    return weight * (float(multiplier) - 1.0)
+
+
 # Coverage below this makes a field sparse enough that the raw series is
 # mostly gaps: ts_delta reads NaN, ranks concentrate on the few names that
 # have values, and the signal looks like noise until it is backfilled. 38% of

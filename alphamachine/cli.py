@@ -23,7 +23,9 @@ from . import audit
 from .bandit import Bandit, arm_name
 from .catalog import Catalog
 from .client import BrainClient
-from .config import AutoGates, RunConfig, SimSettings, Gates
+from .config import (AutoGates, RunConfig, SimSettings, Gates,
+                     GENIUS_PYRAMIDS, PYRAMID_MIN_ALPHAS, PYRAMID_SCORE_WEIGHT,
+                     pyramid_tilt)
 from .priors import MODEL as MODEL_NAME
 from .correlate import CorrelationBook, fetch_book, greedy_select
 from .executor import Executor
@@ -351,7 +353,14 @@ def cmd_select(args):
             store.save_pnl(aid, d, v)
         else:
             d, v = cached
-        cands.append({"alpha_id": aid, "quality": headroom(rec, g),
+        # Payout tilt on the selection value, which greedy_select uses as
+        # quality * (1 - corr). Multiplicative because quality is already a
+        # multiplicative term; at weight 0.15 a 1.4x alpha gains 6%, enough to
+        # break a tie between two submittable alphas and nowhere near enough to
+        # outrank diversity, which is still the binding constraint.
+        cands.append({"alpha_id": aid,
+                      "quality": headroom(rec, g)
+                      * (1.0 + pyramid_tilt(rec.get("pyramid_multiplier"))),
                       "dates": d, "pnl": v, "expr": r["expr"],
                       "sharpe": r["sharpe"], "fitness": r["fitness"],
                       "turnover": r["turnover"]})
@@ -574,11 +583,88 @@ def _corr_profile_table(store) -> None:
               f"{_avg(rs,'max_corr'):>9.4f}")
 
 
+def _pyramid_table(store) -> None:
+    """Payout and Genius-coverage view, entirely from disk.
+
+    Two questions this answers that nothing else did: how much of the available
+    Dynamic Pyramid Multiplier the budget is actually earning, and how far the
+    book is from the pyramid coverage Genius tier requires.
+
+    Each pyramid's OWN multiplier is read from the stored checks payload rather
+    than from the sims column, because that column holds the alpha's effective
+    value -- the MINIMUM across everything it matched -- which is not any single
+    pyramid's rate.
+    """
+    c = store.conn()
+    rows = c.execute("SELECT pyramid_multiplier m, checks FROM sims "
+                     "WHERE status='OK' AND pyramid_multiplier IS NOT NULL"
+                     ).fetchall()
+    if not rows:
+        print("\nno pyramid data yet -- run a simulation, or reopen the db to "
+              "trigger the backfill over payloads already stored")
+        return
+    sims_per: Counter = Counter()
+    rate: dict[str, float] = {}
+    total = 0.0
+    for r in rows:
+        total += float(r["m"])
+        try:
+            pyr = next((ch for ch in json.loads(r["checks"] or "[]")
+                        if ch.get("name") == "MATCHES_PYRAMID"), None)
+        except ValueError:
+            continue
+        for e in (pyr or {}).get("pyramids") or []:
+            nm, mu = e.get("name"), e.get("multiplier")
+            if not nm:
+                continue
+            sims_per[nm] += 1
+            if mu is not None:
+                rate[nm] = float(mu)
+
+    avg = total / len(rows)
+    best = max(rate.values(), default=avg)
+    print(f"\npyramid multiplier: budget-weighted average {avg:.3f} over "
+          f"{len(rows)} simulations")
+    print(f"  best available here: {best:.2f}   headroom if the budget were "
+          f"re-pointed: {(best / avg - 1) * 100:+.0f}%")
+    print("  the reported multiplier is the MINIMUM over every pyramid an "
+          "expression matches,\n  so one PV token holds the whole alpha at "
+          "the PV rate")
+
+    # Genius coverage: submitted alphas per pyramid, >= PYRAMID_MIN_ALPHAS
+    # counts as "formulated". Joined through sims, which is where the names are.
+    sub: Counter = Counter()
+    for r in c.execute("SELECT s.pyramid_names ns FROM submissions b "
+                       "JOIN sims s ON s.alpha_id=b.alpha_id "
+                       "WHERE b.final_status='ACTIVE'"):
+        try:
+            for nm in json.loads(r["ns"] or "[]"):
+                sub[nm] += 1
+        except ValueError:
+            pass
+    formed = sum(1 for v in sub.values() if v >= PYRAMID_MIN_ALPHAS)
+    need = "  ".join(f"{k.replace('_', ' ').title()} {v}"
+                     for k, v in GENIUS_PYRAMIDS.items())
+    print(f"\ngenius coverage: {formed} pyramid(s) formulated "
+          f"(>= {PYRAMID_MIN_ALPHAS} submitted alphas each)\n  needs: {need}")
+
+    print(f"\n{'pyramid':<26}{'x':>6}{'sims':>8}{'submitted':>11}")
+    for nm in sorted(sims_per, key=lambda k: (-rate.get(k, 0.0), -sims_per[k])):
+        got = sub.get(nm, 0)
+        mark = "  <- formulated" if got >= PYRAMID_MIN_ALPHAS else ""
+        mu = rate.get(nm)
+        print(f"  {nm:<24}{(f'{mu:.2f}' if mu else '?'):>6}"
+              f"{sims_per[nm]:>8}{got:>11}{mark}")
+
+
 def cmd_report(args):
     cfg, store, client = _setup(args) if args.online else (
         RunConfig(db_path=args.db), Store(args.db), None)
     if args.corr:
         _prod_corr_table(store)
+        return
+    if getattr(args, "pyramid", False):
+        _pyramid_table(store)
         return
     c = store.conn()
     n_cand = c.execute("SELECT COUNT(*) n FROM candidates").fetchone()["n"]
@@ -765,6 +851,9 @@ def main(argv=None):
     s.add_argument("--corr", action="store_true",
                    help="observed PROD_CORRELATION values, one-field vs "
                         "two-field (free: reads deep_checks already on disk)")
+    s.add_argument("--pyramid", action="store_true",
+                   help="Dynamic Pyramid Multiplier earned vs available, and "
+                        "Genius pyramid coverage (free: reads sims on disk)")
     s.set_defaults(fn=cmd_report)
 
     s = sub.add_parser("gatelog",
@@ -805,7 +894,7 @@ def cmd_run(args):
     cmd_select(args)
     cmd_submit(args)
     cmd_report(argparse.Namespace(**{**vars(args), "online": False,
-                                     "corr": False}))
+                                     "corr": False, "pyramid": False}))
 
 
 if __name__ == "__main__":

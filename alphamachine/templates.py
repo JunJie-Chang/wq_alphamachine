@@ -253,8 +253,42 @@ def wrap_hump(expr: str, threshold: float = 0.01) -> str:
     return f"hump({expr}, hump={threshold})"
 
 
+# Tokens that put an expression in the price-volume pyramid. USA/D1/PV pays
+# 1.1, the lowest multiplier we touch, and because the reported multiplier is
+# the MINIMUM over matched pyramids, one of these anywhere in an expression
+# holds the whole alpha down to it.
+PV_TOKENS = ("returns", "volume", "adv20", "cap", "close", "open", "high",
+             "low", "vwap", "sharesout", "dividend")
+_PV_RE = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(PV_TOKENS) + r")(?![A-Za-z0-9_])")
+
+
+def touches_pv(expr: str) -> bool:
+    """Is this expression already in the price-volume pyramid?"""
+    return bool(_PV_RE.search(expr or ""))
+
+
 def wrap_trade_when(expr: str, condition: str = "volume > adv20") -> str:
     return f"trade_when({condition}, {expr}, -1)"
+
+
+def turnover_gate(expr: str, field: str = "", days: int = 66) -> str:
+    """A trade_when condition that suppresses churn without changing pyramid.
+
+    The default `volume > adv20` is a liquidity gate, and it works -- but it
+    writes two PV tokens into the expression. Measured over 339 rung-3 variants
+    that added it: 82 dropped the alpha's pyramid multiplier and NONE ever
+    raised it, a one-way loss for a rung whose job is turnover, not payout.
+
+    So it is only free when the expression is in the PV pyramid already.
+    Otherwise gate on the signal's own dispersion: trading only when the field
+    is meaningfully away from its own mean cuts turnover the same way and
+    introduces no second dataset. Whether it cuts turnover as WELL is a
+    hypothesis -- refine._score now prices both effects, so the ladder measures
+    the trade-off rather than us asserting it.
+    """
+    if not field or touches_pv(expr):
+        return wrap_trade_when(expr)
+    return wrap_trade_when(expr, f"abs(ts_zscore({field}, {days})) > 0.5")
 
 
 def wrap_group_neutralize(expr: str, group: str = "subindustry") -> str:

@@ -46,6 +46,13 @@ CREATE TABLE IF NOT EXISTS sims (
     -- 2018 still scores on its 2015 performance.
     two_year_sharpe REAL,                -- BRAIN's LOW_2Y_SHARPE value (~44%)
     test_sharpe     REAL,                -- trailing testPeriod Sharpe (~100%)
+    -- Payout, from MATCHES_PYRAMID (present on 100% of OK sims). The
+    -- multiplier is the MINIMUM over every pyramid the expression matches --
+    -- measured on 9,414 multi-pyramid alphas, never the max, never the mean --
+    -- so touching an extra dataset category can only hold the payout down.
+    pyramid_multiplier REAL,
+    pyramid_names      TEXT,             -- json list, e.g. ["USA/D1/PV", ...]
+    pyramid_effective  INTEGER,          -- pyramids this alpha counts toward
     checks        TEXT,                  -- json list
     raw           TEXT,                  -- json
     finished      REAL
@@ -276,7 +283,9 @@ class Store:
         "gate_history": [("deep_ok", "INTEGER"),
                          ("deep_reasons", "TEXT")],
         "candidates": [("field2", "TEXT")],
-        "sims": [("two_year_sharpe", "REAL"), ("test_sharpe", "REAL")],
+        "sims": [("two_year_sharpe", "REAL"), ("test_sharpe", "REAL"),
+                 ("pyramid_multiplier", "REAL"), ("pyramid_names", "TEXT"),
+                 ("pyramid_effective", "INTEGER")],
     }
 
     def _migrate(self, pre_existing: set[str] | None = None) -> None:
@@ -295,6 +304,8 @@ class Store:
             self._backfill_arm_stages()
         if "sims.two_year_sharpe" in added:
             self._backfill_recency()
+        if "sims.pyramid_multiplier" in added:
+            self._backfill_pyramid()
         # A database that already had gate_history but not the ledger has deep
         # verdicts on file that were never counted -- rebuild them once.
         pre = pre_existing or set()
@@ -343,6 +354,44 @@ class Store:
         c.commit()
         log.info("recency backfill: %d rows scanned, %d two_year_sharpe, "
                  "%d test_sharpe", len(rows), n2, nt)
+
+    def _backfill_pyramid(self) -> None:
+        """Populate the three payout columns from payloads already on disk.
+
+        MATCHES_PYRAMID is present on 100% of OK simulations and has been since
+        day one, so the whole accumulated history becomes usable at once --
+        which is the point: the budget-weighted average multiplier over that
+        history is the baseline the scoring tilt is measured against.
+
+        Exact, not inferred. `multiplier` is copied as BRAIN reports it (the
+        MINIMUM over the matched pyramids), and a row whose payload carries no
+        MATCHES_PYRAMID is left NULL rather than defaulted to 1.0 -- a missing
+        multiplier is unknown, not neutral.
+        """
+        c = self.conn()
+        rows = c.execute(
+            "SELECT candidate_id, checks FROM sims "
+            "WHERE pyramid_multiplier IS NULL AND pyramid_names IS NULL "
+            "AND checks IS NOT NULL").fetchall()
+        n = 0
+        for r in rows:
+            try:
+                pyr = next((ch for ch in json.loads(r["checks"] or "[]")
+                            if ch.get("name") == "MATCHES_PYRAMID"), None)
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if not pyr:
+                continue
+            names = [p.get("name") for p in (pyr.get("pyramids") or [])
+                     if p.get("name")]
+            c.execute("UPDATE sims SET pyramid_multiplier=?, pyramid_names=?, "
+                      "pyramid_effective=? WHERE candidate_id=?",
+                      (pyr.get("multiplier"),
+                       json.dumps(names) if names else None,
+                       pyr.get("effective"), r["candidate_id"]))
+            n += 1
+        c.commit()
+        log.info("pyramid backfill: %d rows scanned, %d populated", len(rows), n)
 
     def _rebuild_deep_trials(self) -> None:
         """Recount the deep stage from gate_history, one trial per lineage.
@@ -504,8 +553,12 @@ class Store:
     def record_sim(self, candidate_id: str, rec: dict) -> None:
         cols = ("alpha_id status error sharpe fitness turnover returns drawdown "
                 "margin longCount shortCount subuniverse_sharpe "
-                "two_year_sharpe test_sharpe").split()
-        vals = [rec.get(k) for k in cols]
+                "two_year_sharpe test_sharpe "
+                "pyramid_multiplier pyramid_names pyramid_effective").split()
+        # pyramid_names arrives from extract() as a list; every other column is
+        # a scalar sqlite can bind directly.
+        vals = [json.dumps(rec[k]) if k == "pyramid_names" and rec.get(k) is not None
+                else rec.get(k) for k in cols]
         with self.conn() as c:
             c.execute(
                 "INSERT OR REPLACE INTO sims (candidate_id," + ",".join(cols) +
