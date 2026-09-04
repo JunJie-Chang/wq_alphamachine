@@ -25,7 +25,8 @@ from .catalog import Catalog
 from .client import BrainClient
 from .config import (AutoGates, RunConfig, SimSettings, Gates,
                      GENIUS_PYRAMIDS, PYRAMID_MIN_ALPHAS, PYRAMID_SCORE_WEIGHT,
-                     pyramid_tilt)
+                     pyramid_tilt, neutralization_tilt,
+                     NEUTRALIZATION_SURVIVAL_PRIOR)
 from .priors import MODEL as MODEL_NAME
 from .correlate import CorrelationBook, fetch_book, greedy_select
 from .executor import Executor
@@ -657,6 +658,36 @@ def _pyramid_table(store) -> None:
               f"{sims_per[nm]:>8}{got:>11}{mark}")
 
 
+def _neutralization_table(store) -> None:
+    """Which neutralization actually survives PROD_CORRELATION, and how much
+    of the deep-check budget is still being spent on ones that don't.
+
+    refine.py now uses this same posterior to steer rung-1 champion election
+    (config.neutralization_tilt) -- this table is how to watch whether that is
+    actually working: the "under 0.10 posterior" fraction should fall over
+    time as fewer champions get elected from historically-losing settings.
+    """
+    survival = store.neutralization_survival()
+    if not survival:
+        print("\nno deep-checked alphas yet -- nothing to show")
+        return
+    a, b = NEUTRALIZATION_SURVIVAL_PRIOR
+    rows = []
+    for neut, (wins, trials) in survival.items():
+        post = (a + wins) / (a + b + trials)
+        rows.append((neut, wins, trials, post))
+    rows.sort(key=lambda r: -r[3])
+    tot = sum(r[2] for r in rows)
+    low = sum(r[2] for r in rows if r[3] < 0.10)
+    print(f"\nneutralization survival (PROD_CORRELATION < 0.70), "
+          f"{tot} deep-checked alphas")
+    print(f"  {low} ({low * 100 // tot if tot else 0}%) of deep-check volume "
+          f"spent on a neutralization with posterior survival < 10%")
+    print(f"\n{'neutralization':<16}{'won':>6}{'measured':>10}{'posterior':>11}")
+    for neut, wins, trials, post in rows:
+        print(f"  {neut:<14}{wins:>6}{trials:>10}{post:>11.1%}")
+
+
 def cmd_report(args):
     cfg, store, client = _setup(args) if args.online else (
         RunConfig(db_path=args.db), Store(args.db), None)
@@ -665,6 +696,9 @@ def cmd_report(args):
         return
     if getattr(args, "pyramid", False):
         _pyramid_table(store)
+        return
+    if getattr(args, "neutralization", False):
+        _neutralization_table(store)
         return
     c = store.conn()
     n_cand = c.execute("SELECT COUNT(*) n FROM candidates").fetchone()["n"]
@@ -854,6 +888,10 @@ def main(argv=None):
     s.add_argument("--pyramid", action="store_true",
                    help="Dynamic Pyramid Multiplier earned vs available, and "
                         "Genius pyramid coverage (free: reads sims on disk)")
+    s.add_argument("--neutralization", action="store_true",
+                   help="PROD_CORRELATION survival rate by neutralization, and "
+                        "how much deep-check budget still goes to losers "
+                        "(free: reads deep_checks already on disk)")
     s.set_defaults(fn=cmd_report)
 
     s = sub.add_parser("gatelog",
@@ -894,7 +932,8 @@ def cmd_run(args):
     cmd_select(args)
     cmd_submit(args)
     cmd_report(argparse.Namespace(**{**vars(args), "online": False,
-                                     "corr": False, "pyramid": False}))
+                                     "corr": False, "pyramid": False,
+                                     "neutralization": False}))
 
 
 if __name__ == "__main__":

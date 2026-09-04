@@ -643,6 +643,38 @@ class Store:
     def arms(self) -> list[sqlite3.Row]:
         return self.conn().execute("SELECT * FROM arms").fetchall()
 
+    def neutralization_survival(self) -> dict[str, tuple[int, int]]:
+        """(wins, measured) per neutralization, from checks already on disk.
+
+        A "win" is a stored /check PROD_CORRELATION value under 0.70. Joins
+        deep_checks -> sims (alpha_id) -> candidates (settings) -- the same
+        shape cli._prod_corr_table already reads for reporting, just grouped
+        by neutralization instead of left flat. No new table: deep_checks and
+        candidates.settings have carried everything this needs since day one.
+        """
+        out: dict[str, tuple[int, int]] = {}
+        rows = self.conn().execute(
+            "SELECT cd.settings settings, d.checks checks FROM deep_checks d "
+            "JOIN sims s ON s.alpha_id=d.alpha_id "
+            "JOIN candidates cd ON cd.id=s.candidate_id").fetchall()
+        for r in rows:
+            try:
+                pc = next((c.get("value") for c in json.loads(r["checks"] or "[]")
+                          if c.get("name") == "PROD_CORRELATION"), None)
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if pc is None:
+                continue
+            try:
+                neut = json.loads(r["settings"]).get("neutralization")
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if not neut:
+                continue
+            wins, trials = out.get(neut, (0, 0))
+            out[neut] = (wins + (1 if pc < 0.70 else 0), trials + 1)
+        return out
+
     # ------------------------------------------------------- bandit ledger
     def lineage_root(self, candidate_id: str) -> str:
         """Walk a candidate back to the scan candidate its ladder started from.

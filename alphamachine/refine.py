@@ -30,7 +30,7 @@ from typing import Any
 from . import templates as T
 from .config import (FITNESS_TURNOVER_KNEE, Gates, REFINE_DECAY,
                      REFINE_NEUTRALIZATION, REFINE_TRUNCATION, SimSettings,
-                     UNIVERSES, pyramid_tilt)
+                     UNIVERSES, pyramid_tilt, neutralization_tilt)
 from .metrics import check_result, failed_checks, headroom
 
 log = logging.getLogger("alphamachine.refine")
@@ -99,6 +99,11 @@ class Refiner:
         self.store = store
         self.ex = executor
         self.g = gates
+        # Computed ONCE per refine invocation, not per candidate -- this is an
+        # aggregate read over the whole deep_checks history, not a per-record
+        # lookup, so it belongs beside the Bandit's own once-per-run load in
+        # cli.cmd_refine rather than inside the hot per-variant scoring path.
+        self.neut_survival = store.neutralization_survival()
 
     # ------------------------------------------------------------------ API
     MAX_RUNGS = 6
@@ -145,7 +150,8 @@ class Refiner:
             return
         ids, st.pending = st.pending, []
         cand_id, cand = self._best_of([st.best_id, *ids])
-        gain = _score(cand, self.g) - _score(st.best, self.g)
+        gain = (_score(cand, self.g, self.neut_survival)
+               - _score(st.best, self.g, self.neut_survival))
         log.info("rung %d: %d variants, best score %+.3f (%s)",
                  st.rung, len(ids), gain, cand.get("alpha_id"))
         if cand_id != st.best_id and gain > 0:
@@ -321,13 +327,14 @@ class Refiner:
             rec = self._rec(i)
             if not rec or rec.get("status") != "OK":
                 continue
-            sc = _score(rec, self.g)
+            sc = _score(rec, self.g, self.neut_survival)
             if sc > best_s:
                 best_id, best, best_s = i, rec, sc
         return best_id, best
 
 
-def _score(rec: dict, g: Gates) -> float:
+def _score(rec: dict, g: Gates,
+          neut_survival: dict[str, tuple[int, int]] | None = None) -> float:
     """Rank refinement variants by headroom over our gates, not raw Sharpe.
 
     Raw Sharpe would happily pick a variant with 60% turnover that can never
@@ -344,4 +351,19 @@ def _score(rec: dict, g: Gates) -> float:
     # perfectly submittable alpha look broken. As an additive term bounded by
     # 0.15 it cannot outweigh a single failed check (0.25), which is the
     # property that keeps this a preference.
-    return h - 0.25 * fails + pyramid_tilt(rec.get("pyramid_multiplier"))
+    #
+    # PROD_CORRELATION survival, by neutralization -- see config.py's
+    # NEUTRALIZATION_SURVIVAL_WEIGHT docstring for the measured motivation.
+    # Cancels to exactly zero once a lineage is past rung 1: rungs 2-5 never
+    # change settings.neutralization, so cand and st.best in absorb()'s
+    # difference always share the same value here and the tilt cancels in the
+    # subtraction. It only has a real effect where different neutralizations
+    # are actually being compared, i.e. rung 1 -- no rung-number special-case
+    # needed, the cancellation falls out of the existing structure.
+    try:
+        neut = json.loads(rec.get("settings") or "{}").get("neutralization")
+    except (ValueError, TypeError, AttributeError):
+        neut = None
+    return (h - 0.25 * fails
+           + pyramid_tilt(rec.get("pyramid_multiplier"))
+           + neutralization_tilt(neut, neut_survival))

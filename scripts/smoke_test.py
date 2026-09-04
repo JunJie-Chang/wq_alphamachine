@@ -2086,6 +2086,103 @@ check("record_sim round-trips the multiplier and json-encodes the name list",
       f"{dict(_w36)}")
 os.remove(db36); os.remove(db36w)
 
+print("\n[36] neutralization survival: steer rung 1 toward what actually passes")
+from alphamachine.config import (neutralization_tilt as _ntilt37,
+                                 NEUTRALIZATION_SURVIVAL_WEIGHT as _NW37)
+
+# Real shape from the live database: STATISTICAL/SLOW pass PROD_CORRELATION far
+# more often than the classic four, but a rung-1 champion is elected on Sharpe
+# alone with no visibility into that -- 89% of deep-check budget was going to
+# neutralizations with a measured 0% survival rate before this existed.
+_surv37 = {"STATISTICAL": (12, 18), "SLOW": (6, 6), "MARKET": (0, 258)}
+check("a strong historical winner tilts high but stays under the weight cap",
+      0 < _ntilt37("SLOW", _surv37) < _NW37, f"{_ntilt37('SLOW', _surv37):.4f}")
+check("561 measured losses pull the tilt near zero, never to a penalty",
+      0 <= _ntilt37("MARKET", _surv37) < 0.01, f"{_ntilt37('MARKET', _surv37):.4f}")
+check("an unmeasured neutralization gets the prior mean, not zero -- still "
+      "explorable",
+      abs(_ntilt37("CROWDING", _surv37) - _NW37 * 0.25) < 1e-9,
+      f"{_ntilt37('CROWDING', _surv37):.4f}")
+check("no neutralization or no survival table -> exactly zero, never a penalty",
+      _ntilt37(None, _surv37) == 0.0 and _ntilt37("SLOW", None) == 0.0
+      and _ntilt37("SLOW", {}) == 0.0)
+
+# store.neutralization_survival() against a small fixture spanning wins/losses
+# across two neutralizations.
+db37 = os.path.join(tempfile.gettempdir(), "am_neut_test.db")
+if os.path.exists(db37): os.remove(db37)
+st37 = Store(db37)
+def _mk37(tag, alpha, neut, pc):
+    s37 = SimSettings(neutralization=neut).payload()
+    real_cid = st37.add_candidate(expr=f"rank(fld_{tag})", settings=s37,
+                                  theme="model", template="level_rank",
+                                  field=f"fld_{tag}")
+    st37.record_sim(real_cid, {"alpha_id": alpha, "status": "OK", "sharpe": 1.7,
+                               "checks": []})
+    st37.save_deep(alpha, checks=[{"name": "PROD_CORRELATION", "value": pc}])
+_mk37("a", "N37a", "STATISTICAL", 0.55)   # win
+_mk37("b", "N37b", "STATISTICAL", 0.60)   # win
+_mk37("c", "N37c", "MARKET", 0.90)        # loss
+_mk37("d", "N37d", "MARKET", 0.85)        # loss
+_mk37("e", "N37e", "MARKET", 0.88)        # loss
+_sv37 = st37.neutralization_survival()
+check("neutralization_survival counts wins and trials correctly from a fixture",
+      _sv37.get("STATISTICAL") == (2, 2) and _sv37.get("MARKET") == (0, 3),
+      f"{_sv37}")
+os.remove(db37)
+
+# _score: the tilt breaks a near-tie...
+_r37 = {"status": "OK", "sharpe": 2.0, "fitness": 1.4, "turnover": 0.15,
+       "subuniverse_sharpe": 1.2, "two_year_sharpe": 1.9, "checks": []}
+_hi37 = dict(_r37, settings=json.dumps({"neutralization": "SLOW"}))
+_lo37 = dict(_r37, settings=json.dumps({"neutralization": "MARKET"}))
+check("_score prefers the historically-surviving neutralization on a tie",
+      _sc36(_hi37, g36, _surv37) > _sc36(_lo37, g36, _surv37),
+      f"{_sc36(_hi37, g36, _surv37):.4f} > {_sc36(_lo37, g36, _surv37):.4f}")
+check("...but the whole tilt stays under one failed check's 0.25 penalty",
+      _sc36(_hi37, g36, _surv37) - _sc36(_lo37, g36, _surv37) < 0.25)
+_broken37 = dict(_r37, settings=json.dumps({"neutralization": "SLOW"}),
+                 checks=[{"name": "LOW_SHARPE", "result": "FAIL"}])
+check("...and can never buy a variant that fails a check",
+      _sc36(_broken37, g36, _surv37) < _sc36(_lo37, g36, _surv37),
+      f"{_sc36(_broken37, g36, _surv37):.4f} < {_sc36(_lo37, g36, _surv37):.4f}")
+check("no survival table -> identical score to before this feature existed",
+      _sc36(_hi37, g36, None) == _sc36(_hi37, g36))
+
+# The cancellation property: once two variants SHARE a neutralization (every
+# comparison from rung 2 onward), the tilt must cancel exactly out of the
+# difference that absorb() uses to judge a rung -- otherwise a later rung's
+# decay/truncation/universe choice would be silently nudged by a term that has
+# nothing to do with what that rung is testing.
+_same_a37 = dict(_r37, turnover=0.12, settings=json.dumps({"neutralization": "SLOW"}))
+_same_b37 = dict(_r37, turnover=0.18, settings=json.dumps({"neutralization": "SLOW"}))
+_diff_with = _sc36(_same_a37, g36, _surv37) - _sc36(_same_b37, g36, _surv37)
+_diff_without = _sc36(_same_a37, g36, None) - _sc36(_same_b37, g36, None)
+check("the tilt cancels exactly when both sides share a neutralization "
+      "(rung 2+ never re-litigates rung 1's choice)",
+      abs(_diff_with - _diff_without) < 1e-12,
+      f"{_diff_with:.6f} vs {_diff_without:.6f}")
+
+# Refiner.__init__ loads the survival table ONCE, not per candidate -- it is an
+# aggregate query over the whole deep_checks history, not a per-record lookup.
+class _CountingStore37:
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = 0
+    def neutralization_survival(self):
+        self.calls += 1
+        return {}
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+db37b = os.path.join(tempfile.gettempdir(), "am_neut_count.db")
+if os.path.exists(db37b): os.remove(db37b)
+_inner37 = Store(db37b)
+_counted37 = _CountingStore37(_inner37)
+_ref37 = Refiner(_counted37, None, g36)
+check("Refiner.__init__ reads the survival posterior exactly once",
+      _counted37.calls == 1, f"{_counted37.calls}")
+os.remove(db37b)
+
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")
 sys.exit(1 if fail else 0)

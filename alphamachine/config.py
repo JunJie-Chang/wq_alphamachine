@@ -336,6 +336,53 @@ def pyramid_tilt(multiplier: float | None, weight: float = PYRAMID_SCORE_WEIGHT
     return weight * (float(multiplier) - 1.0)
 
 
+# --------------------------------------------------------------------------
+# Which neutralization actually survives PROD_CORRELATION
+# --------------------------------------------------------------------------
+# REFINE_NEUTRALIZATION above fixed WHICH neutralizations get tried at rung 1
+# (5 -> 9). This fixes a different bug: which one WINS the ladder's champion
+# election. refine._score has no visibility into PROD_CORRELATION at rung-1
+# time -- it is only measured later, on whichever champion survives to
+# `select` -- so the ladder keeps electing classic-neutralization champions on
+# raw Sharpe, and the limited deep-check budget is spent confirming what the
+# accumulated history already says. Measured on 632 deep-checked alphas:
+#
+#   STATISTICAL  12/18 (66.7%)   SLOW  6/6 (100%)
+#   MARKET        0/258 (0%)     INDUSTRY 0/124 (0%)   SECTOR 0/85 (0%)
+#   SUBINDUSTRY   0/94 (0%)
+#
+# 89% of deep-check volume goes to the four neutralizations with a measured 0%
+# survival rate. This matches an independently-derived mechanism already in
+# this file's history (STATISTICAL/SLOW/CROWDING produce near-zero or negative
+# mean correlation with roughly a third the spread of the classic five -- see
+# REFINE_NEUTRALIZATION's comment) -- but the winning theme::template combos
+# so far were only ever MEASURED under STATISTICAL/SLOW, never under a classic
+# neutralization on the same idea, so some of this gap could still be which
+# ideas got explored rather than neutralization alone. Hence a bounded,
+# self-correcting PREFERENCE, not a hard rule.
+NEUTRALIZATION_SURVIVAL_PRIOR = (1.0, 3.0)   # Beta(1,3), mean 0.25
+# Bounded below refine._score's 0.25-per-failed-check penalty, same reasoning
+# as PYRAMID_SCORE_WEIGHT: must be able to break a near-tie between two rung-1
+# variants, must never be mistaken for a passing check.
+NEUTRALIZATION_SURVIVAL_WEIGHT = 0.20
+
+
+def neutralization_tilt(neutralization: str | None,
+                        survival: dict[str, tuple[int, int]] | None,
+                        weight: float = NEUTRALIZATION_SURVIVAL_WEIGHT) -> float:
+    """Posterior mean PROD_CORRELATION survival probability, scaled.
+
+    0.0 when the neutralization or the survival table is unknown -- absence
+    must never read as a penalty, only as "no preference yet".
+    """
+    if not neutralization or not survival:
+        return 0.0
+    wins, trials = survival.get(neutralization, (0, 0))
+    a, b = NEUTRALIZATION_SURVIVAL_PRIOR
+    prob = (a + wins) / (a + b + trials)
+    return weight * prob
+
+
 # Coverage below this makes a field sparse enough that the raw series is
 # mostly gaps: ts_delta reads NaN, ranks concentrate on the few names that
 # have values, and the signal looks like noise until it is backfilled. 38% of
