@@ -59,6 +59,15 @@ def extract(alpha: dict) -> dict:
     # which is exactly how a 0.48 slipped through unnoticed. Because it is
     # BRAIN's, it can block.
     out["two_year_sharpe"] = check_value(checks, "LOW_2Y_SHARPE")
+    # IS_LADDER_SHARPE is the OTHER recency check -- BRAIN sends exactly one of
+    # this or LOW_2Y_SHARPE per alpha, never both (fewer years of history get
+    # the ladder; enough years get the flat 2Y bar). It carries the same
+    # {value, limit} shape, just with a "year" field alongside, and it is the
+    # LARGER of the two buckets in this database. Config.py has filed it in
+    # BOOLEAN_CHECKS since day one, which nothing ever reads -- the number was
+    # sitting there the whole time, same as LOW_2Y_SHARPE was.
+    out["is_ladder_sharpe"] = check_value(checks, "IS_LADDER_SHARPE")
+    out["is_ladder_limit"] = check_limit(checks, "IS_LADDER_SHARPE")
     # test_sharpe is the trailing-testPeriod (P1Y6M) Sharpe BRAIN reports
     # alongside the full period. Nearly universal coverage, but a shorter
     # window than the 2Y check and only ~88% agreement with it at the 1.58
@@ -211,6 +220,32 @@ def quality_verdict(rec: dict, g: Gates, universe: str = "TOP3000",
             floor2y = g.min_two_year_sharpe
         if abs(two_y) < floor2y:
             r.append(f"2y sharpe {two_y:.2f} < {floor2y}")
+
+    # The OTHER recency check -- BRAIN sends this OR two_year_sharpe, never
+    # both, and this is the larger bucket. Same discipline: judge the value,
+    # prefer BRAIN's own per-alpha limit, deep_verdict already treats a FAIL
+    # here as a hard rejection via failed_checks() -- this just moves that
+    # same block to the free local stage instead of paying for a /check first.
+    ladder = rec.get("is_ladder_sharpe")
+    if ladder is None:
+        ladder = check_value(rec.get("checks"), "IS_LADDER_SHARPE")
+    if ladder is not None:
+        floor_ladder = rec.get("is_ladder_limit")
+        if floor_ladder is None:
+            floor_ladder = check_limit(rec.get("checks"), "IS_LADDER_SHARPE")
+        if floor_ladder is not None and abs(ladder) < floor_ladder:
+            r.append(f"ladder sharpe {ladder:.2f} < {floor_ladder}")
+
+    # Real re-simulation on a tighter universe, from rung 5 -- see Gates
+    # docstring for the case that motivated this (a formula-estimated
+    # sub-universe check PASSED at 1.33 while the real number came back 0.68,
+    # then 0.17). Absent means this candidate has no rung-5 children yet
+    # (still mid-ladder, or too few universe tiers for its region) -- unknown,
+    # not fine, so absence never blocks, same as every other check here.
+    port = rec.get("portability_ratio")
+    if port is not None and port < g.min_portability_ratio:
+        r.append(f"portability ratio {port:.2f} < {g.min_portability_ratio} "
+                 f"(collapses on a tighter universe)")
 
     if mg is not None:
         bps = mg * 10000.0 if abs(mg) < 1.0 else mg
@@ -369,16 +404,30 @@ def headroom(rec: dict, g: Gates) -> float:
     # Sharpe-2.39 alpha with a 0.48 two-year Sharpe scored 0.96 and beat a
     # steady Sharpe-1.75/2Y-1.8 alpha at 1.05's expense.
     #
-    # Prefer BRAIN's exact 2Y number; fall back to the trailing-testPeriod
-    # Sharpe, which is present on nearly every simulation but covers a shorter
-    # window and agrees with the 2Y check only ~88% of the time at the
-    # threshold. That is why it ranks here and does NOT gate in
-    # quality_verdict: good enough to steer, not to veto.
-    recent = rec.get("two_year_sharpe")
+    # Prefer BRAIN's exact 2Y number; then IS_LADDER_SHARPE (the other check
+    # BRAIN sends instead, on the larger share of alphas -- a record carries
+    # one or the other, never both); fall back to the trailing-testPeriod
+    # Sharpe, present on nearly every simulation but a shorter window that
+    # agrees with the 2Y check only ~88% of the time at the threshold. That is
+    # why the fallback ranks here and does NOT gate in quality_verdict: good
+    # enough to steer, not to veto -- unlike the first two, which DO gate
+    # there, because both are BRAIN's own numbers.
+    recent, recent_floor = rec.get("two_year_sharpe"), g.min_two_year_sharpe
+    if recent is None:
+        recent = rec.get("is_ladder_sharpe")
+        recent_floor = rec.get("is_ladder_limit") or g.min_two_year_sharpe
     if recent is None:
         recent = rec.get("test_sharpe")
     if recent is not None:
-        slacks.append(abs(recent) / max(g.min_two_year_sharpe, 1e-9))
+        slacks.append(abs(recent) / max(recent_floor, 1e-9))
+    # Real re-simulation on a tighter universe (rung 5), scored against BRAIN's
+    # own sub-universe formula -- see Gates.min_portability_ratio for the case
+    # that motivated this: a formula ESTIMATE passed at 1.33 while the real
+    # number came back 0.68, then 0.17. Already a normalised ratio (1.0 = at
+    # the floor), so no rescaling needed, same as every other slack here.
+    port = rec.get("portability_ratio")
+    if port is not None:
+        slacks.append(port / max(g.min_portability_ratio, 1e-9))
     return min(slacks)
 
 

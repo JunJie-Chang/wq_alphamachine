@@ -191,6 +191,18 @@ class Gates:
     # BRAIN sent IS_LADDER_SHARPE instead, NOT that the alpha is fine, so
     # quality_verdict only applies this when the number is actually present.
     min_two_year_sharpe: float = 1.58
+    # BLOCK, and a real re-simulation rather than a formula estimate. Rung 5
+    # (refine.py) already re-tests every champion on 1-2 tighter universes as
+    # a falsification check; this is the ratio of that REAL Sharpe to
+    # subuniverse_floor()'s prediction for the same universe. 1.0 means the
+    # champion barely clears the same bar BRAIN's own LOW_SUB_UNIVERSE_SHARPE
+    # check approximates -- and that check can pass on a formula estimate
+    # while the true number still collapses: observed live, an alpha reported
+    # 1.33 against a limit of 0.90 (comfortable PASS) while its real TOP1000
+    # resimulation came back 0.68 against the same formula's 0.90 floor
+    # (ratio 0.76) and TOP500 came back 0.17 against a 0.64 floor (ratio
+    # 0.27) -- a liquidity artefact BRAIN's own check would not have caught.
+    min_portability_ratio: float = 1.0
 
 
 # --------------------------------------------------------------------------

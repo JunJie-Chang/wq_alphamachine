@@ -53,6 +53,17 @@ CREATE TABLE IF NOT EXISTS sims (
     pyramid_multiplier REAL,
     pyramid_names      TEXT,             -- json list, e.g. ["USA/D1/PV", ...]
     pyramid_effective  INTEGER,          -- pyramids this alpha counts toward
+    -- The OTHER recency check -- BRAIN sends exactly one of this or
+    -- two_year_sharpe per alpha, and this is the larger bucket. Same
+    -- {value, limit} shape; is_ladder_limit is per-alpha (scales with years
+    -- of history), same reason two_year_sharpe's limit is read, not assumed.
+    is_ladder_sharpe   REAL,
+    is_ladder_limit    REAL,
+    -- Worst (actual / subuniverse_floor) across a champion's own rung-5
+    -- children -- real re-simulation against a tighter universe, not BRAIN's
+    -- formula estimate. NULL until refine.finalize() computes it (only
+    -- meaningful on a 'gated' row that has rung-5 children on disk).
+    portability_ratio  REAL,
     checks        TEXT,                  -- json list
     raw           TEXT,                  -- json
     finished      REAL
@@ -285,7 +296,9 @@ class Store:
         "candidates": [("field2", "TEXT")],
         "sims": [("two_year_sharpe", "REAL"), ("test_sharpe", "REAL"),
                  ("pyramid_multiplier", "REAL"), ("pyramid_names", "TEXT"),
-                 ("pyramid_effective", "INTEGER")],
+                 ("pyramid_effective", "INTEGER"),
+                 ("is_ladder_sharpe", "REAL"), ("is_ladder_limit", "REAL"),
+                 ("portability_ratio", "REAL")],
     }
 
     def _migrate(self, pre_existing: set[str] | None = None) -> None:
@@ -306,6 +319,10 @@ class Store:
             self._backfill_recency()
         if "sims.pyramid_multiplier" in added:
             self._backfill_pyramid()
+        if "sims.is_ladder_sharpe" in added:
+            self._backfill_is_ladder()
+        if "sims.portability_ratio" in added:
+            self._backfill_portability()
         # A database that already had gate_history but not the ledger has deep
         # verdicts on file that were never counted -- rebuild them once.
         pre = pre_existing or set()
@@ -392,6 +409,95 @@ class Store:
             n += 1
         c.commit()
         log.info("pyramid backfill: %d rows scanned, %d populated", len(rows), n)
+
+    def _backfill_is_ladder(self) -> None:
+        """Populate the ladder-recency columns from payloads already on disk.
+
+        Same rationale and shape as _backfill_recency(): IS_LADDER_SHARPE has
+        been arriving in `checks` since day one and nothing read it. A row
+        carries this OR two_year_sharpe, never both, so this is the other half
+        of that same recency picture -- and per the live database, the larger
+        half.
+        """
+        c = self.conn()
+        rows = c.execute(
+            "SELECT candidate_id, checks FROM sims "
+            "WHERE is_ladder_sharpe IS NULL AND is_ladder_limit IS NULL "
+            "AND checks IS NOT NULL").fetchall()
+        n = 0
+        for r in rows:
+            try:
+                ch = next((x for x in json.loads(r["checks"] or "[]")
+                          if x.get("name") == "IS_LADDER_SHARPE"), None)
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if not ch or ch.get("value") is None:
+                continue
+            c.execute("UPDATE sims SET is_ladder_sharpe=?, is_ladder_limit=? "
+                      "WHERE candidate_id=?",
+                      (ch.get("value"), ch.get("limit"), r["candidate_id"]))
+            n += 1
+        c.commit()
+        log.info("IS_LADDER_SHARPE backfill: %d rows scanned, %d populated",
+                 len(rows), n)
+
+    def _backfill_portability(self) -> None:
+        """Score every already-'gated' champion against its own rung-5 result.
+
+        Rung 5 (refine.py) re-simulates a champion on 1-2 tighter universes
+        purely as a falsification test -- and until this existed, nothing ever
+        read the result back onto the champion it was testing. This applies
+        config.subuniverse_floor(), the SAME formula BRAIN's own
+        LOW_SUB_UNIVERSE_SHARPE check approximates, to the REAL re-simulated
+        Sharpe instead of an estimate: a formula estimate can pass (observed
+        live: 1.33 vs a limit of 0.90) while the true tighter-universe Sharpe
+        still collapses (0.68, then 0.17) -- exactly the case that motivated
+        this column. One import from config.py, a deliberate, narrow exception
+        to this module staying formula-free: the alternative was duplicating
+        subuniverse_floor's constants here, which is worse.
+        """
+        from .config import subuniverse_floor
+        c = self.conn()
+        champions = c.execute(
+            "SELECT c.id, c.settings, s.sharpe FROM candidates c "
+            "JOIN sims s ON s.candidate_id=c.id "
+            "WHERE c.stage='gated' AND s.portability_ratio IS NULL "
+            "AND s.status='OK'").fetchall()
+        n = 0
+        for champ in champions:
+            try:
+                csettings = json.loads(champ["settings"])
+            except (ValueError, TypeError):
+                continue
+            cuniv, region = csettings.get("universe"), csettings.get("region", "USA")
+            csharpe = champ["sharpe"]
+            if not cuniv or csharpe is None:
+                continue
+            children = c.execute(
+                "SELECT ch.settings, s.sharpe FROM candidates ch "
+                "JOIN sims s ON s.candidate_id=ch.id "
+                "WHERE ch.parent_id=? AND s.status='OK'", (champ["id"],)).fetchall()
+            worst = None
+            for child in children:
+                try:
+                    universe = json.loads(child["settings"]).get("universe")
+                except (ValueError, TypeError):
+                    continue
+                if not universe or universe == cuniv or child["sharpe"] is None:
+                    continue
+                floor = subuniverse_floor(csharpe, cuniv, region, universe)
+                if floor <= 0:
+                    continue
+                ratio = child["sharpe"] / floor
+                if worst is None or ratio < worst:
+                    worst = ratio
+            if worst is not None:
+                c.execute("UPDATE sims SET portability_ratio=? WHERE candidate_id=?",
+                          (worst, champ["id"]))
+                n += 1
+        c.commit()
+        log.info("portability backfill: %d champion(s) scanned, %d scored",
+                 len(champions), n)
 
     def _rebuild_deep_trials(self) -> None:
         """Recount the deep stage from gate_history, one trial per lineage.
@@ -554,7 +660,8 @@ class Store:
         cols = ("alpha_id status error sharpe fitness turnover returns drawdown "
                 "margin longCount shortCount subuniverse_sharpe "
                 "two_year_sharpe test_sharpe "
-                "pyramid_multiplier pyramid_names pyramid_effective").split()
+                "pyramid_multiplier pyramid_names pyramid_effective "
+                "is_ladder_sharpe is_ladder_limit").split()
         # pyramid_names arrives from extract() as a list; every other column is
         # a scalar sqlite can bind directly.
         vals = [json.dumps(rec[k]) if k == "pyramid_names" and rec.get(k) is not None

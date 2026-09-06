@@ -2183,6 +2183,135 @@ check("Refiner.__init__ reads the survival posterior exactly once",
       _counted37.calls == 1, f"{_counted37.calls}")
 os.remove(db37b)
 
+print("\n[37] IS_LADDER_SHARPE + portability: two real gaps caught by inspection")
+from alphamachine.config import subuniverse_floor as _sf38
+from alphamachine.refine import Refiner as _Ref38
+
+# Real shape from akL6ngm9 (train sharpe 3.12, test sharpe 0.10 -- a textbook
+# decay that IS_LADDER_SHARPE catches and LOW_2Y_SHARPE never saw, because a
+# record carries one or the other, never both).
+_fail38 = {"name": "IS_LADDER_SHARPE", "result": "FAIL", "year": 2,
+           "startDate": "2024-01-02", "endDate": "2022-01-03",
+           "limit": 1.58, "value": 0.31}
+_pass38 = {"name": "IS_LADDER_SHARPE", "result": "PASS", "year": 2,
+           "startDate": "2024-01-02", "endDate": "2022-01-03",
+           "limit": 2.02, "value": 2.26}
+_e38 = _ex36({"id": "D38", "is": {"sharpe": 2.59, "checks": [_fail38]}})
+check("extract pulls is_ladder_sharpe and its per-alpha limit",
+      _e38["is_ladder_sharpe"] == 0.31 and _e38["is_ladder_limit"] == 1.58)
+_e38n = _ex36({"id": "E38", "is": {"sharpe": 2.59, "checks": []}})
+check("both are None when the check is absent",
+      _e38n["is_ladder_sharpe"] is None and _e38n["is_ladder_limit"] is None)
+
+g38 = Gates()
+_base38 = {"status": "OK", "sharpe": 2.59, "fitness": 1.43, "turnover": 0.2436,
+          "drawdown": 0.0386, "margin": 0.00061, "longCount": 1797,
+          "shortCount": 1329, "subuniverse_sharpe": 1.43, "checks": []}
+_decayed38 = dict(_base38, is_ladder_sharpe=0.31, is_ladder_limit=1.58)
+_healthy38 = dict(_base38, is_ladder_sharpe=2.26, is_ladder_limit=2.02)
+check("quality_verdict blocks the real decayed value (0.31 < 1.58)",
+      not quality_verdict(_decayed38, g38).ok)
+check("quality_verdict passes the real healthy value (2.26 >= 2.02)",
+      quality_verdict(_healthy38, g38).ok)
+check("absence of the ladder value does NOT block",
+      quality_verdict(dict(_base38), g38).ok)
+
+check("headroom falls back to is_ladder_sharpe when two_year_sharpe is absent",
+      headroom(_decayed38, g38) < headroom(_healthy38, g38),
+      f"{headroom(_decayed38, g38):.4f} < {headroom(_healthy38, g38):.4f}")
+_both38 = dict(_base38, two_year_sharpe=1.9, is_ladder_sharpe=0.31, is_ladder_limit=1.58)
+check("two_year_sharpe takes priority when (unusually) both are present",
+      abs(headroom(_both38, g38) - headroom(dict(_base38, two_year_sharpe=1.9), g38)) < 1e-9)
+
+# _portability_ratio: the real xAYKJ2bg numbers (TOP3000 2.08 -> TOP1000 0.68,
+# TOP500 0.17). Built through an actual Refiner against a small fixture db so
+# the parent_id/settings/universe plumbing is exercised, not just the formula.
+db38 = os.path.join(tempfile.gettempdir(), "am_ladder_test.db")
+if os.path.exists(db38): os.remove(db38)
+st38 = Store(db38)
+def _settings38(universe):
+    d = SimSettings(universe=universe).payload()
+    return d
+_champ38 = st38.add_candidate(expr="rank(fld38)", settings=_settings38("TOP3000"),
+                              theme="fundamental", template="yield_assets", field="fld38")
+st38.record_sim(_champ38, {"alpha_id": "CH38", "status": "OK", "sharpe": 2.08, "checks": []})
+_c1000 = st38.add_candidate(expr="rank(fld38)", settings=_settings38("TOP1000"),
+                            theme="fundamental", template="yield_assets", field="fld38",
+                            parent_id=_champ38)
+st38.record_sim(_c1000, {"alpha_id": "C1000", "status": "OK", "sharpe": 0.68, "checks": []})
+_c500 = st38.add_candidate(expr="rank(fld38)", settings=_settings38("TOP500"),
+                           theme="fundamental", template="yield_assets", field="fld38",
+                           parent_id=_champ38)
+st38.record_sim(_c500, {"alpha_id": "C500", "status": "OK", "sharpe": 0.17, "checks": []})
+_ref38 = _Ref38(st38, None, g38)
+_champrec38 = {"settings": json.dumps(_settings38("TOP3000")), "sharpe": 2.08}
+_ratio38 = _ref38._portability_ratio(_champ38, _champrec38)
+_expect_ratio38 = 0.17 / _sf38(2.08, "TOP3000", "USA", "TOP500")
+check("portability_ratio picks the WORST of the two rung-5 children (TOP500)",
+      _ratio38 is not None and abs(_ratio38 - _expect_ratio38) < 1e-9,
+      f"{_ratio38:.4f} vs expected {_expect_ratio38:.4f}")
+check("that ratio is well under the 1.0 floor -- this really is a collapse",
+      _ratio38 < 0.30, f"{_ratio38:.4f}")
+
+_lonely38 = st38.add_candidate(expr="rank(fld38b)", settings=_settings38("TOP3000"),
+                               theme="fundamental", template="yield_assets", field="fld38b")
+st38.record_sim(_lonely38, {"alpha_id": "LONELY38", "status": "OK", "sharpe": 1.5, "checks": []})
+check("no rung-5 children -> None, never guessed",
+      _ref38._portability_ratio(_lonely38, {"settings": json.dumps(_settings38("TOP3000")),
+                                            "sharpe": 1.5}) is None)
+
+check("quality_verdict blocks a collapsed portability ratio",
+      not quality_verdict(dict(_base38, portability_ratio=0.27), g38).ok)
+check("quality_verdict passes a portable one (ratio >= 1.0)",
+      quality_verdict(dict(_base38, portability_ratio=1.2), g38).ok)
+check("headroom ranks the collapsing candidate below an otherwise-identical "
+      "portable one",
+      headroom(dict(_base38, portability_ratio=0.27), g38)
+      < headroom(dict(_base38, portability_ratio=1.2), g38))
+
+# Migration + backfill over a database written before all four columns existed.
+_o38 = __import__("sqlite3").connect(db38)
+_cols38 = {r[1] for r in _o38.execute("PRAGMA table_info(sims)")}
+check("migration already added all four new columns via Store(db38) above",
+      {"is_ladder_sharpe", "is_ladder_limit", "portability_ratio"} <= _cols38)
+
+db38b = os.path.join(tempfile.gettempdir(), "am_ladder_backfill.db")
+if os.path.exists(db38b): os.remove(db38b)
+import sqlite3 as _sq38
+_raw38 = _sq38.connect(db38b)
+_raw38.execute("CREATE TABLE candidates (id TEXT PRIMARY KEY, expr TEXT, "
+               "settings TEXT, theme TEXT, template TEXT, field TEXT, "
+               "field2 TEXT, stage TEXT, parent_id TEXT, created REAL)")
+_raw38.execute("CREATE TABLE sims (candidate_id TEXT PRIMARY KEY, alpha_id TEXT,"
+              " status TEXT, sharpe REAL, checks TEXT, raw TEXT)")
+_raw38.execute("INSERT INTO candidates VALUES (?,?,?,?,?,?,?,?,?,?)",
+              ("champ38b", "rank(x)", json.dumps(_settings38("TOP3000")),
+               "fundamental", "yield_assets", "x", "", "gated", None, 0.0))
+_raw38.execute("INSERT INTO sims (candidate_id,alpha_id,status,sharpe,checks,raw)"
+              " VALUES (?,?,?,?,?,?)",
+              ("champ38b", "CH38b", "OK", 2.08, json.dumps([_fail38]), json.dumps({})))
+_raw38.execute("INSERT INTO candidates VALUES (?,?,?,?,?,?,?,?,?,?)",
+              ("child38b", "rank(x)", json.dumps(_settings38("TOP500")),
+               "fundamental", "yield_assets", "x", "", "refine", "champ38b", 0.0))
+_raw38.execute("INSERT INTO sims (candidate_id,alpha_id,status,sharpe,checks,raw)"
+              " VALUES (?,?,?,?,?,?)",
+              ("child38b", "CD38b", "OK", 0.17, json.dumps([]), json.dumps({})))
+_raw38.commit(); _raw38.close()
+_stb38 = Store(db38b)                          # migration + both backfills on open
+_r38b = _stb38.conn().execute(
+    "SELECT is_ladder_sharpe, is_ladder_limit, portability_ratio FROM sims "
+    "WHERE candidate_id='champ38b'").fetchone()
+check("backfill recovers is_ladder_sharpe/limit from stored checks",
+      _r38b["is_ladder_sharpe"] == 0.31 and _r38b["is_ladder_limit"] == 1.58,
+      f"{dict(_r38b)}")
+check("and independently backfills portability_ratio from the rung-5 sibling",
+      _r38b["portability_ratio"] is not None
+      and abs(_r38b["portability_ratio"]
+              - 0.17 / _sf38(2.08, "TOP3000", "USA", "TOP500")) < 1e-9,
+      f"{_r38b['portability_ratio']}")
+check("both backfills are idempotent", Store(db38b) is not None)
+os.remove(db38); os.remove(db38b)
+
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")
 sys.exit(1 if fail else 0)

@@ -30,7 +30,8 @@ from typing import Any
 from . import templates as T
 from .config import (FITNESS_TURNOVER_KNEE, Gates, REFINE_DECAY,
                      REFINE_NEUTRALIZATION, REFINE_TRUNCATION, SimSettings,
-                     UNIVERSES, pyramid_tilt, neutralization_tilt)
+                     UNIVERSES, pyramid_tilt, neutralization_tilt,
+                     subuniverse_floor)
 from .metrics import check_result, failed_checks, headroom
 
 log = logging.getLogger("alphamachine.refine")
@@ -171,10 +172,58 @@ class Refiner:
         if not st.done:
             raise ValueError(f"refusing to finalize an unfinished ladder "
                              f"({st.root_id} stopped at rung {st.rung})")
-        self.store.conn().execute(
-            "UPDATE candidates SET stage='gated' WHERE id=?", (st.best_id,))
-        self.store.conn().commit()
+        c = self.store.conn()
+        c.execute("UPDATE candidates SET stage='gated' WHERE id=?", (st.best_id,))
+        port = self._portability_ratio(st.best_id, st.best)
+        if port is not None:
+            c.execute("UPDATE sims SET portability_ratio=? WHERE candidate_id=?",
+                      (port, st.best_id))
+            st.best["portability_ratio"] = port
+        c.commit()
         return st.best_id, st.best
+
+    def _portability_ratio(self, champion_id: str, champion: dict
+                           ) -> float | None:
+        """Worst (actual / subuniverse_floor) across the champion's own rung-5
+        children -- see config.Gates.min_portability_ratio for why this exists
+        and the real numbers that motivated it.
+
+        Rung 5's variants are queued with parent_id = the rung-4 champion, and
+        a smaller universe essentially never scores higher in absorb(), so
+        st.best_id cannot change during rung 5 -- the finalized champion's own
+        id IS the parent_id its rung-5 children carry. None when there are no
+        rung-5 children (a region with too few universe tiers, or a barren
+        rung that queued nothing): unknown, not a penalty, same discipline as
+        every other field here.
+        """
+        try:
+            csettings = json.loads(champion.get("settings") or "{}")
+        except (ValueError, TypeError):
+            return None
+        cuniv = csettings.get("universe")
+        region = csettings.get("region", "USA")
+        csharpe = champion.get("sharpe")
+        if not cuniv or csharpe is None:
+            return None
+        children = self.store.conn().execute(
+            "SELECT ch.settings, s.sharpe FROM candidates ch "
+            "JOIN sims s ON s.candidate_id=ch.id "
+            "WHERE ch.parent_id=? AND s.status='OK'", (champion_id,)).fetchall()
+        worst = None
+        for child in children:
+            try:
+                universe = json.loads(child["settings"]).get("universe")
+            except (ValueError, TypeError):
+                continue
+            if not universe or universe == cuniv or child["sharpe"] is None:
+                continue
+            floor = subuniverse_floor(csharpe, cuniv, region, universe)
+            if floor <= 0:
+                continue
+            ratio = child["sharpe"] / floor
+            if worst is None or ratio < worst:
+                worst = ratio
+        return worst
 
     def ladder(self, candidate_id: str, max_rungs: int | None = None
                ) -> tuple[str, dict]:
