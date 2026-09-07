@@ -4,6 +4,7 @@
 
 | 檔案 | 用途 |
 |---|---|
+| `新手指南.md` | **從零開始的教學文** — 平台基本概念 + alphamachine 專案怎麼運作，附即時戰績快照。技術細節仍以 `README.md`／本目錄其他檔案為準 |
 | `BRAIN_RULES.md` | **精簡版速查** — 只留機器會用到的數值與公式，加上「已推翻的錯誤」清單 |
 | `WQ_BRAIN_報酬機制完整說明.md` | 完整版（740 行）— base/quarterly payment、Genius、Power Pool、Leaderboard、規則變更時間軸、文件互相牴觸處、未載明清單 |
 | `Osmosis_分配規則.md` | Osmosis 配點規則與組合建構技巧 |
