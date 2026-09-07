@@ -42,6 +42,50 @@ def save(session, expires_at=None) -> None:
     os.chmod(COOKIE_FILE, 0o600)
 
 
+# Every response header from both persona POSTs, appended to a log so the ONE
+# open question about this script's cost can be settled from evidence instead
+# of assumption.
+#
+# The script's docstring has always claimed it spends "exactly two units" --
+# one to raise the inquiry, one to finalise. The first is documented behaviour
+# (a 401-persona POST /authentication mints a fresh inquiry). The second is an
+# assumption nobody ever tested: the finalise POST COMPLETES an existing
+# inquiry rather than creating one, so it may well not touch the daily
+# biometric counter at all. If it does not, BIOMETRIC_SAFE_BUDGET is throttling
+# us at roughly half the real headroom -- which matters, because biometric
+# downtime was measured at 49% of this pipeline's wall-clock time.
+#
+# Costs nothing: no extra request, just recording what the responses already
+# carry. Compare the RateLimit-* values across the two calls to see whether
+# the second one moves any counter.
+HEADER_LOG = "data/logs/biometric_headers.log"
+
+
+# Never write these to disk: an /authentication response carries the session
+# JWT in Set-Cookie, and this log exists to be read and pasted around.
+_REDACT = ("set-cookie", "authorization", "www-authenticate", "cookie")
+
+
+def _dump_headers(label: str, r) -> None:
+    try:
+        os.makedirs(os.path.dirname(HEADER_LOG), exist_ok=True)
+        with open(HEADER_LOG, "a") as fh:
+            fh.write(f"\n=== {label} @ {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                     f"status={r.status_code} ===\n")
+            for k, v in sorted(r.headers.items()):
+                if k.lower() in _REDACT:
+                    fh.write(f"  {k}: <redacted>\n")
+                    continue
+                fh.write(f"  {k}: {v}\n")
+    except OSError:
+        pass                                    # never fail auth over logging
+    interesting = {k: v for k, v in r.headers.items()
+                   if "ratelimit" in k.lower() or "retry" in k.lower()
+                   or "quota" in k.lower() or "biometric" in k.lower()}
+    if interesting:
+        print(f"  [{label}] {interesting}")
+
+
 def main() -> int:
     _load_env()
     email, pw = os.environ.get("WQ_EMAIL"), os.environ.get("WQ_PASSWORD")
@@ -76,6 +120,7 @@ def main() -> int:
     # --- quota unit 1 -------------------------------------------------------
     probe._record_bio_attempt()
     r = s.post(f"{API}/authentication", auth=HTTPBasicAuth(email, pw), timeout=60)
+    _dump_headers("POST /authentication (unit 1: mints the inquiry)", r)
     if r.status_code == 201:
         save(s)
         print("AUTH OK (no persona needed); cookies saved.")
@@ -106,10 +151,16 @@ def main() -> int:
         print("TIMEOUT -- sentinel never appeared. No extra quota was spent.")
         return 1
 
-    # --- quota unit 2 -------------------------------------------------------
+    # --- quota unit 2, and the one under investigation -----------------------
+    # Counted defensively for now. If the headers logged below show this call
+    # moving no counter, the count here is what should be dropped -- see
+    # _dump_headers.
     probe._record_bio_attempt()
     fin = s.post(url, timeout=60)
+    _dump_headers("POST persona finalise (unit 2: UNDER TEST -- does this "
+                  "actually cost a unit?)", fin)
     who = s.get(f"{API}/users/self", timeout=60)      # free: not a biometric call
+    _dump_headers("GET /users/self (known free -- control)", who)
     print(f"finalise={fin.status_code} users/self={who.status_code}")
     if who.status_code == 200:
         save(s)
