@@ -41,6 +41,8 @@ class Arm:
     scan_pass: int = 0
     refine_trials: int = 0
     gate_pass: int = 0
+    corr_trials: int = 0
+    corr_pass: int = 0
     deep_trials: int = 0
     deep_pass: int = 0
     submitted: int = 0
@@ -73,8 +75,16 @@ class Arm:
                              1.0 + max(0, self.scan_trials - self.scan_pass))
         s2 = rng.betavariate(prior_a + self.gate_pass,
                              prior_b + max(0, self.refine_trials - self.gate_pass))
-        s3 = rng.betavariate(1.0 + self.deep_pass,
-                             3.0 + max(0, self.deep_trials - self.deep_pass))
+        # Stage 3 learns on corr_*, not deep_*. deep_pass is 0 for EVERY arm
+        # on this account's whole history -- it is a composite bit that only
+        # fires when yearly consistency, recency and crowding all pass at once,
+        # so it carries no information to separate arms and the posterior is
+        # just the prior. corr_* isolates the part an arm actually controls
+        # (did PROD_CORRELATION clear its limit), measured on 152 independent
+        # lineages instead of a bit that is always zero. deep_* is still
+        # recorded and still reported -- it just no longer drives allocation.
+        s3 = rng.betavariate(1.0 + self.corr_pass,
+                             3.0 + max(0, self.corr_trials - self.corr_pass))
         return s1 * s2 * s3
 
     @property
@@ -89,6 +99,11 @@ class Arm:
     @property
     def deep_rate(self) -> float:
         return self.deep_pass / self.deep_trials if self.deep_trials else 0.0
+
+    @property
+    def corr_rate(self) -> float:
+        """PROD_CORRELATION survival -- the stage sample() actually learns on."""
+        return self.corr_pass / self.corr_trials if self.corr_trials else 0.0
 
 
 class Bandit:
@@ -111,6 +126,8 @@ class Bandit:
                 scan_pass=_col(r, "scan_pass"),
                 refine_trials=_col(r, "refine_trials"),
                 gate_pass=_col(r, "gate_pass"),
+                corr_trials=_col(r, "corr_trials"),
+                corr_pass=_col(r, "corr_pass"),
                 deep_trials=_col(r, "deep_trials"),
                 deep_pass=_col(r, "deep_pass"),
                 submitted=_col(r, "submitted"),
@@ -140,6 +157,9 @@ class Bandit:
     STAGES = {
         "scan":      ("scan_trials", "scan_pass"),
         "gate":      ("refine_trials", "gate_pass"),
+        # "corr" is what sample() learns on; "deep" is true end-to-end
+        # conversion, kept for reporting. A caller records both, separately.
+        "corr":      ("corr_trials", "corr_pass"),
         "deep":      ("deep_trials", "deep_pass"),
         "submitted": (None, "submitted"),
     }
@@ -167,15 +187,20 @@ class Bandit:
             a.sum_sharpe += abs(sharpe)
 
     def report(self) -> list[tuple[str, int, float, float, float, float]]:
-        """(arm, trials, scan%, gate%, deep%, avg|sharpe|), worst-stage first.
+        """(arm, trials, scan%, gate%, corr%, avg|sharpe|), worst-stage first.
 
         Sorted by the composite conversion so the table answers "where is the
         budget converting", and the per-stage columns show WHERE an arm dies
         rather than collapsing three very different failures into one number.
+
+        The last rate is corr%, not deep% -- deep% is 0 for every arm ever
+        recorded here, so a column of zeroes told the reader nothing. corr%
+        (PROD_CORRELATION survival) is the stage sample() learns on and the
+        one that actually varies.
         """
         rows = []
         for a in self.arms.values():
-            rows.append((a.name, a.trials, a.scan_rate, a.rate, a.deep_rate,
+            rows.append((a.name, a.trials, a.scan_rate, a.rate, a.corr_rate,
                          a.sum_sharpe / a.trials if a.trials else 0.0))
         return sorted(rows, key=lambda r: (-(r[2] * r[3]), -r[3], -r[1]))
 

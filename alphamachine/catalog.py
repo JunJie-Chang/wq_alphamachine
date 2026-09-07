@@ -63,6 +63,27 @@ class Catalog:
         os.makedirs(cache_dir, exist_ok=True)
 
     # ------------------------------------------------------------- fetching
+    def operators(self, *, refresh=False) -> list[dict]:
+        """BRAIN's own operator catalogue, cached like fields.
+
+        Never fetched once in this project's history -- client.operators()
+        existed with no call site -- which is how templates.py came to use ~20
+        of the 85 operators the platform offers, with the Logical and Vector
+        categories untouched entirely. Cheap (one request, no quota), and the
+        `level` field on each record is the account-tier gate, so this is also
+        how to tell a typo from an operator this tier simply cannot use.
+        """
+        path = os.path.join(self.cache_dir, "operators.json")
+        if os.path.exists(path) and not refresh:
+            with open(path) as fh:
+                return json.load(fh)
+        ops = self.c.operators()
+        os.makedirs(self.cache_dir, exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(ops, fh)
+        log.info("cached %d operators", len(ops))
+        return ops
+
     def fields(self, *, region="USA", delay=1, universe="TOP3000",
                refresh=False) -> list[dict]:
         path = os.path.join(

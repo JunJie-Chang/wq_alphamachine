@@ -164,7 +164,7 @@ def _capture_corr_profile(store, client, alpha_id: str) -> None:
           f"expected_max={prof['expected_max']:.4f}")
 
 
-def _teach_deep(store, bandit, candidate_id, arm, dv) -> None:
+def _teach_deep(store, bandit, candidate_id, arm, dv, alpha_id=None) -> None:
     """Count one deep verdict against its arm, at most once per lineage.
 
     Every site that computes a deep verdict calls this -- refine, select and
@@ -182,6 +182,36 @@ def _teach_deep(store, bandit, candidate_id, arm, dv) -> None:
     root = store.lineage_root(candidate_id)
     if store.claim_bandit_trial("deep", root, arm):
         bandit.update(arm, stage="deep", passed=dv.ok)
+    # And separately, the half the ARM actually controls. dv.ok is a composite
+    # that is false whenever anything failed -- crowding, recency, one lucky
+    # year -- so it cannot tell "this shape is crowded" (the arm's fault) from
+    # "this field had decayed" (not the arm's fault), and in practice it is
+    # false for essentially every candidate. PROD_CORRELATION on its own is
+    # the signal the bandit can learn a transform shape from. Claimed under
+    # its own stage key so a lineage already counted for "deep" still counts
+    # here exactly once.
+    corr = _corr_passed(store, alpha_id)
+    if corr is not None and store.claim_bandit_trial("corr", root, arm):
+        bandit.update(arm, stage="corr", passed=corr)
+
+
+def _corr_passed(store, alpha_id: str | None) -> bool | None:
+    """Did this alpha's stored /check clear PROD_CORRELATION? None if unknown.
+
+    Reads the cached deep_checks payload rather than re-fetching: deep_verdict
+    has just written it, and an extra request here would spend budget to learn
+    something already on disk.
+    """
+    if not alpha_id:
+        return None
+    cached = store.load_deep(alpha_id, ttl_hours=24.0) or {}
+    for entry in cached.get("checks") or []:
+        if entry.get("name") == "PROD_CORRELATION":
+            value, limit = entry.get("value"), entry.get("limit")
+            if value is None:
+                return None
+            return float(value) < float(limit or 0.70)
+    return None
 
 
 def cmd_refine(args):
@@ -302,7 +332,7 @@ def cmd_refine(args):
             else:
                 print(f"       deep: "
                       f"{'PASS' if dv.ok else '; '.join(dv.reasons[:2])}")
-                _teach_deep(store, bandit, best_id, arm, dv)
+                _teach_deep(store, bandit, best_id, arm, dv, aid)
             _capture_corr_profile(store, client, aid)
         store.record_gate_check(best_id, aid, r.get("expr", ""), best, qv, g,
                                 deep=dv)
@@ -330,7 +360,7 @@ def cmd_select(args):
         dv = sub.deep_verdict(aid) if (qv.ok and aid) else None
         store.record_gate_check(r["id"], aid, r["expr"], rec, qv, g, deep=dv)
         _teach_deep(store, bandit, r["id"],
-                    arm_name(r["theme"], r["template"]), dv)
+                    arm_name(r["theme"], r["template"]), dv, aid)
         if not qv.ok:
             continue
         qualified += 1
@@ -538,8 +568,62 @@ def _prod_corr_table(store) -> None:
         ok = sum(1 for x in s if x < 0.70)
         print(f"  {name:<12}{len(s):>4}{s[0]:>8.3f}{med:>8.3f}{s[-1]:>8.3f}"
               f"{ok:>7}/{len(s):<4}")
+    _corr_lineage_counts(store)
     _corr_profile_table(store)
     print()
+
+
+def _corr_lineage_counts(store) -> None:
+    """The same wins, counted by LINEAGE instead of by row.
+
+    Deduplicating by expression (above) is not enough: a ladder's rung-2
+    variant wraps the expression in winsorize, so it is a different expr but
+    the same idea, with essentially the same correlation. Reading the raw rows
+    once made a single winning lineage look like "8 wins out of 10" for its
+    template when the honest number was 1 out of 1 -- an eightfold overcount
+    that would have justified a template change on no evidence at all.
+
+    So print both. The row count is what we paid to measure; the lineage count
+    is how many independent bets those measurements actually represent, and it
+    is the only one a hit rate should ever be computed from.
+    """
+    rows = store.conn().execute(
+        "SELECT cd.id cid, d.checks FROM deep_checks d "
+        "JOIN sims s ON s.alpha_id = d.alpha_id "
+        "JOIN candidates cd ON cd.id = s.candidate_id "
+        "WHERE d.checks IS NOT NULL").fetchall()
+    best: dict[str, bool] = {}
+    n_rows = wins_rows = 0
+    for r in rows:
+        try:
+            checks = json.loads(r["checks"] or "[]")
+        except ValueError:
+            continue
+        entry = next((ch for ch in checks
+                      if ch.get("name") == "PROD_CORRELATION"), None)
+        value = (entry or {}).get("value")
+        if value is None:
+            continue
+        limit = float((entry or {}).get("limit") or 0.70)
+        won = float(value) < limit
+        n_rows += 1
+        wins_rows += won
+        # Best-of, matching store._backfill_corr_arms exactly. Two lineages
+        # genuinely hold both a 0.64 and a 0.88 sibling, so "first row seen"
+        # would make this number depend on SQL row order.
+        root = store.lineage_root(r["cid"])
+        best[root] = best.get(root, False) or won
+    if not n_rows:
+        return
+    wins_lineage = sum(1 for v in best.values() if v)
+    print(f"\n  by row:     {wins_rows}/{n_rows} "
+          f"({wins_rows * 100 / n_rows:.1f}%)")
+    print(f"  by lineage: {wins_lineage}/{len(best)} "
+          f"({wins_lineage * 100 / len(best):.1f}%)  <- independent bets")
+    print(f"  the two rates are similar; the SAMPLE SIZE is not. {n_rows} rows "
+          f"is {len(best)} real\n  bets -- any hit rate or per-template "
+          f"comparison must use the lineage count,\n  or a single lineage's "
+          f"siblings look like an eightfold-confirmed result.")
 
 
 def _corr_profile_table(store) -> None:
@@ -712,7 +796,7 @@ def cmd_report(args):
     if n_fly:
         print(f"  {n_fly} simulation(s) dispatched but unresolved -- the next "
               f"scan/refine run will reclaim them rather than re-pay for them")
-    print("\narm                                trials   scan%   gate%   deep%"
+    print("\narm                                trials   scan%   gate%   corr%"
           "   avg|sharpe|")
     b = Bandit(store, [r["arm"] for r in store.arms()])
     for name, trials, scan_r, gate_r, deep_r, avg in b.report()[:30]:
@@ -766,7 +850,7 @@ def cmd_gatelog(args):
             store.record_gate_check(r["id"], r["alpha_id"], r["expr"], rec,
                                     qv, g, deep=dv)
             _teach_deep(store, bandit, r["id"],
-                        arm_name(r["theme"], r["template"]), dv)
+                        arm_name(r["theme"], r["template"]), dv, r["alpha_id"])
         rows = store.gate_passing_now(limit=args.limit)
         print(f"\n{len(rows)} candidate(s) submit-grade RIGHT NOW "
               f"(sharpe>={g.sharpe} fitness>={g.fitness} "

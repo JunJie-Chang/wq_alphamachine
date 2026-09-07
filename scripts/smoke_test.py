@@ -660,8 +660,15 @@ check("an explored-but-never-gated arm is not punished for being explored",
       al25[_explored] > al25[_rejected],
       f"explored={al25[_explored]} gate-rejected={al25[_rejected]}")
 
-# B. The deep gate has to actually move budget, or the extra API calls buy
-# nothing. Two arms identical through scan and gate; one dies at the deep gate.
+# B. The expensive gate has to actually move budget, or the extra API calls
+# buy nothing. Two arms identical through scan and gate; one dies at it.
+#
+# That gate is now CORR, not DEEP. deep_pass was a composite bit -- true only
+# when crowding, recency AND yearly consistency all passed -- which made it 0
+# for every arm this account has ever recorded, i.e. a column that cannot
+# separate anything. sample() learns on corr_* instead; deep_* is still
+# recorded and still reported, it just no longer allocates. Both halves of
+# that contract are asserted here.
 _clean, _lucky = _an25("analyst", "change"), _an25("insiders", "event_gated")
 b25b = _B25(st25, [_clean, _lucky])
 for _ in range(30):
@@ -669,16 +676,37 @@ for _ in range(30):
         b25b.update(a, stage="scan", passed=True)
         b25b.update(a, stage="gate", passed=True)
 for _ in range(10):
-    b25b.update(_clean, stage="deep", passed=True)
-    b25b.update(_lucky, stage="deep", passed=False)   # lucky year / prod-corr
+    b25b.update(_clean, stage="corr", passed=True)
+    b25b.update(_lucky, stage="corr", passed=False)   # crowded shape
 al25b = b25b.allocate(400)
-check("an arm that dies at the deep gate loses budget to one that does not",
+check("an arm that dies at the correlation gate loses budget to one that "
+      "does not",
       al25b[_clean] > 3 * al25b[_lucky],
-      f"clean={al25b[_clean]} deep-blocked={al25b[_lucky]}")
+      f"clean={al25b[_clean]} corr-blocked={al25b[_lucky]}")
 
 # C. Three stacked priors must not flatten everything into noise.
 check("compounded priors still let a converting arm win decisively",
       al25b[_clean] > 0.6 * 400, f"{al25b[_clean]}/400")
+
+# B2. deep_* is recorded but deliberately does NOT allocate any more -- the
+# whole point of splitting the two. Teaching only deep must leave allocation
+# even, or we are back to learning from a bit that is always zero.
+_d1, _d2 = _an25("news", "change"), _an25("macro", "change")
+b25c = _B25(st25, [_d1, _d2])
+for _ in range(30):
+    for a in (_d1, _d2):
+        b25c.update(a, stage="scan", passed=True)
+        b25c.update(a, stage="gate", passed=True)
+for _ in range(10):
+    b25c.update(_d1, stage="deep", passed=True)
+    b25c.update(_d2, stage="deep", passed=False)
+al25c = b25c.allocate(400)
+check("teaching only the deep stage no longer swings allocation",
+      abs(al25c[_d1] - al25c[_d2]) < 0.35 * 400,
+      f"{al25c[_d1]} vs {al25c[_d2]}")
+_row25c = {r["arm"]: r for r in st25.arms()}
+check("...but the deep counters are still recorded for reporting",
+      _row25c[_d1]["deep_pass"] == 10 and _row25c[_d2]["deep_pass"] == 0)
 
 # D. Submissions write back to the arm -- the loop the pipeline diagram claims.
 _cid25 = st25.add_candidate(expr="rank(close)", settings=SimSettings().payload(),
@@ -2311,6 +2339,110 @@ check("and independently backfills portability_ratio from the rung-5 sibling",
       f"{_r38b['portability_ratio']}")
 check("both backfills are idempotent", Store(db38b) is not None)
 os.remove(db38); os.remove(db38b)
+
+print("\n[38] reward decomposition + wider operator vocabulary")
+from alphamachine.bandit import Arm as _Arm39
+import random as _rnd39
+
+# --- Fix A: corr_* is what sample() learns on, deep_* is reporting only ---
+_a39 = _Arm39("x::y", scan_trials=100, scan_pass=50, refine_trials=50,
+              gate_pass=25, corr_trials=1, corr_pass=1, deep_trials=1, deep_pass=0)
+_b39 = _Arm39("x::z", scan_trials=100, scan_pass=50, refine_trials=50,
+              gate_pass=25, corr_trials=86, corr_pass=1, deep_trials=1, deep_pass=0)
+_rng39 = _rnd39.Random(7)
+_wins39 = sum(1 for _ in range(400)
+              if _a39.sample(_rng39) > _b39.sample(_rng39))
+check("an arm at corr 1/1 outdraws a well-measured loser at 1/86",
+      _wins39 > 300, f"{_wins39}/400 draws")
+check("...even though BOTH have deep_pass=0 -- the old signal could not "
+      "separate them", _a39.deep_pass == _b39.deep_pass == 0)
+_fresh39 = _Arm39("x::new", scan_trials=100, scan_pass=50, refine_trials=50,
+                  gate_pass=25)
+check("an unmeasured arm still draws above the well-measured loser "
+      "(stays explorable)",
+      sum(1 for _ in range(400) if _fresh39.sample(_rng39) > _b39.sample(_rng39)) > 250)
+check("corr_rate reports the stage sample() actually uses",
+      abs(_b39.corr_rate - 1/86) < 1e-9)
+
+# --- store: schema, bump_arm round-trip, lineage-deduped backfill ---
+db39 = os.path.join(tempfile.gettempdir(), "am_corr_arms.db")
+if os.path.exists(db39): os.remove(db39)
+st39 = Store(db39)
+st39.bump_arm("t::tmpl", corr_trials=1, corr_pass=1)
+_r39 = st39.conn().execute(
+    "SELECT corr_trials, corr_pass FROM arms WHERE arm='t::tmpl'").fetchone()
+check("bump_arm round-trips the corr counters",
+      _r39["corr_trials"] == 1 and _r39["corr_pass"] == 1)
+
+# 4 sibling variants of ONE lineage, all winning -- must count 1/1, not 4/4.
+_root39 = st39.add_candidate(expr="rank(f39)", settings=SimSettings().payload(),
+                             theme="risk", template="change", field="f39")
+st39.record_sim(_root39, {"alpha_id": "R39", "status": "OK", "sharpe": 2.0, "checks": []})
+st39.save_deep("R39", checks=[{"name": "PROD_CORRELATION", "value": 0.64, "limit": 0.70}])
+for i in range(3):
+    kid = st39.add_candidate(expr=f"winsorize(rank(f39), std={i}.0)",
+                             settings=SimSettings().payload(), theme="risk",
+                             template="change", field="f39", parent_id=_root39)
+    st39.record_sim(kid, {"alpha_id": f"K39{i}", "status": "OK", "sharpe": 2.0, "checks": []})
+    st39.save_deep(f"K39{i}", checks=[{"name": "PROD_CORRELATION", "value": 0.64, "limit": 0.70}])
+# a genuinely separate losing lineage
+_other39 = st39.add_candidate(expr="rank(g39)", settings=SimSettings().payload(),
+                              theme="risk", template="change", field="g39")
+st39.record_sim(_other39, {"alpha_id": "O39", "status": "OK", "sharpe": 2.0, "checks": []})
+st39.save_deep("O39", checks=[{"name": "PROD_CORRELATION", "value": 0.91, "limit": 0.70}])
+st39._backfill_corr_arms()
+_r39b = st39.conn().execute(
+    "SELECT corr_trials, corr_pass FROM arms WHERE arm='risk::change'").fetchone()
+check("backfill counts 4 sibling rows as ONE lineage, not four",
+      _r39b["corr_trials"] == 2 and _r39b["corr_pass"] == 1,
+      f"got {_r39b['corr_trials']}/{_r39b['corr_pass']}, want 2 trials / 1 pass")
+_before39 = dict(_r39b)
+st39._backfill_corr_arms()
+_r39c = st39.conn().execute(
+    "SELECT corr_trials, corr_pass FROM arms WHERE arm='risk::change'").fetchone()
+check("corr backfill is idempotent",
+      dict(_r39c) == _before39, f"{dict(_r39c)} vs {_before39}")
+check("a row whose PROD_CORRELATION has no value is skipped, never guessed",
+      st39.conn().execute("SELECT corr_trials FROM arms WHERE arm='t::tmpl'"
+                          ).fetchone()["corr_trials"] == 1)
+os.remove(db39)
+
+# --- Fix B: the eight new templates ---
+_new39 = ("change_zscore", "change_scale", "av_diff", "decay_change",
+          "peak_recency", "staleness", "regime_change", "quantile_change")
+check("all eight new templates are in the library",
+      all(n in T.BY_NAME for n in _new39))
+for _n in _new39:
+    _e = T.BY_NAME[_n].render("fld", days=66, group="subindustry")
+    if T.lint(_e):
+        check(f"{_n} lints clean", False, str(T.lint(_e)))
+check("every new template renders and lints clean",
+      all(not T.lint(T.BY_NAME[n].render("fld", days=66, group="subindustry"))
+          for n in _new39))
+# Power Pool allows <=8 DISTINCT operators (ts_backfill/group_backfill exempt).
+import re as _re39
+def _ops39(expr):
+    return {m for m in _re39.findall(r"([a-z_][a-z0-9_]*)\s*\(", expr)
+            if m not in ("ts_backfill", "group_backfill")}
+check("every new template stays inside Power Pool's <=8 distinct operators",
+      all(len(_ops39(T.BY_NAME[n].render("fld", days=66, group="subindustry"))) <= 8
+          for n in _new39),
+      str({n: len(_ops39(T.BY_NAME[n].render("fld", days=66, group="subindustry")))
+           for n in _new39}))
+# The point of the exercise: these use operators nothing else in the library did.
+_old_ops39 = set()
+for _t in T.LIBRARY:
+    if _t.name in _new39: continue
+    _old_ops39 |= _ops39(_t.render("fld", days=66, group="subindustry", field2="fld2"))
+_new_ops39 = set()
+for _n in _new39:
+    _new_ops39 |= _ops39(T.BY_NAME[_n].render("fld", days=66, group="subindustry"))
+check("the new templates introduce operators the library never used",
+      len(_new_ops39 - _old_ops39) >= 6,
+      f"new operators: {sorted(_new_ops39 - _old_ops39)}")
+check("group_rank is no longer universal -- some templates use another wrapper",
+      any(not T.BY_NAME[n].render("fld", days=66, group="subindustry").startswith("group_rank")
+          for n in _new39))
 
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")

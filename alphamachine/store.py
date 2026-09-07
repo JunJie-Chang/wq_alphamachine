@@ -130,6 +130,15 @@ CREATE TABLE IF NOT EXISTS submissions (
 -- "failures" at a gate it was never presented to -- i.e. the bandit penalises
 -- an arm for having been explored. Each stage therefore keeps its own
 -- denominator, and bandit.Arm.sample() multiplies the three rates.
+--
+-- corr_* vs deep_*: the deep counters record TRUE end-to-end conversion (did
+-- deep_verdict pass everything), which is what `report` should show but is a
+-- terrible learning signal -- it is 0 for every arm, because ~97% of
+-- candidates fail SOMETHING and the bit collapses "this transform shape is
+-- crowded" (attributable to the arm) with "this field's history decayed"
+-- (a property of the field, not the shape). corr_* isolates the half the arm
+-- actually controls: did PROD_CORRELATION come in under its limit. sample()
+-- learns on corr_*; deep_* stays for reporting.
 CREATE TABLE IF NOT EXISTS arms (
     arm           TEXT PRIMARY KEY,      -- "theme::template"
     trials        INTEGER DEFAULT 0,     -- reporting total across all stages
@@ -137,6 +146,8 @@ CREATE TABLE IF NOT EXISTS arms (
     scan_pass     INTEGER DEFAULT 0,
     refine_trials INTEGER DEFAULT 0,
     gate_pass     INTEGER DEFAULT 0,
+    corr_trials   INTEGER DEFAULT 0,
+    corr_pass     INTEGER DEFAULT 0,
     deep_trials   INTEGER DEFAULT 0,
     deep_pass     INTEGER DEFAULT 0,
     submitted     INTEGER DEFAULT 0,
@@ -290,7 +301,9 @@ class Store:
         "arms": [("scan_trials", "INTEGER DEFAULT 0"),
                  ("refine_trials", "INTEGER DEFAULT 0"),
                  ("deep_trials", "INTEGER DEFAULT 0"),
-                 ("deep_pass", "INTEGER DEFAULT 0")],
+                 ("deep_pass", "INTEGER DEFAULT 0"),
+                 ("corr_trials", "INTEGER DEFAULT 0"),
+                 ("corr_pass", "INTEGER DEFAULT 0")],
         "gate_history": [("deep_ok", "INTEGER"),
                          ("deep_reasons", "TEXT")],
         "candidates": [("field2", "TEXT")],
@@ -315,6 +328,8 @@ class Store:
         c.commit()
         if "arms.scan_trials" in added:
             self._backfill_arm_stages()
+        if "arms.corr_trials" in added:
+            self._backfill_corr_arms()
         if "sims.two_year_sharpe" in added:
             self._backfill_recency()
         if "sims.pyramid_multiplier" in added:
@@ -542,6 +557,69 @@ class Store:
             log.info("rebuilt deep-stage evidence from gate_history: "
                      "%d lineage(s)", len(by_root))
 
+    def _backfill_corr_arms(self) -> None:
+        """Seed corr_trials/corr_pass from the /check results already on disk.
+
+        DEDUPED BY LINEAGE ROOT, and that is the whole point. A ladder produces
+        several sibling variants of one idea (rung 2/4/5 tweaks), all of which
+        keep essentially the same PROD_CORRELATION -- counting them separately
+        turns one win into five and one loss into five. That inflation is not
+        hypothetical: reading the raw rows made a single winning lineage look
+        like "8/10 for this template" when the honest number was 1/1.
+
+        Matches the per-lineage discipline claim_bandit_trial() already applies
+        to live teaching, so the backfilled history and anything taught from
+        here on are counted the same way.
+        """
+        c = self.conn()
+        rows = c.execute(
+            "SELECT cd.id cid, cd.theme, cd.template, d.checks "
+            "FROM deep_checks d "
+            "JOIN sims s ON s.alpha_id=d.alpha_id "
+            "JOIN candidates cd ON cd.id=s.candidate_id "
+            "WHERE d.checks IS NOT NULL").fetchall()
+        # A lineage counts ONCE, and counts as a pass if ANY of its measured
+        # variants cleared the limit. Two of them genuinely disagree -- one
+        # lineage has siblings at 0.641 and 0.883 -- so the rule matters and
+        # "whichever row SQL happened to return first" is not a rule. Best-of
+        # is the honest measure of what an ARM can produce: the ladder's job is
+        # to search variants and keep the best, so if any variant cleared
+        # crowding, that arm did produce a crowding-clearing alpha. (Whether
+        # champion SELECTION then picks it is a separate problem, measured
+        # separately -- _score has no visibility into correlation at all.)
+        best: dict[tuple[str, str], bool] = {}
+        for r in rows:
+            if not r["theme"] or not r["template"]:
+                continue
+            try:
+                checks = json.loads(r["checks"] or "[]")
+            except (ValueError, TypeError):
+                continue
+            entry = next((x for x in checks
+                          if x.get("name") == "PROD_CORRELATION"), None)
+            value = (entry or {}).get("value")
+            if value is None:
+                continue
+            limit = (entry or {}).get("limit") or 0.70
+            key = (f"{r['theme']}::{r['template']}", self.lineage_root(r["cid"]))
+            best[key] = best.get(key, False) or float(value) < float(limit)
+        seen = set(best)
+        tally: dict[str, list[int]] = {}
+        for (arm, _root), won in best.items():
+            t = tally.setdefault(arm, [0, 0])
+            t[0] += 1
+            t[1] += int(won)
+        for arm, (trials, passes) in tally.items():
+            c.execute("INSERT OR IGNORE INTO arms(arm,updated) VALUES (?,?)",
+                      (arm, time.time()))
+            c.execute("UPDATE arms SET corr_trials=?, corr_pass=? WHERE arm=?",
+                      (trials, passes, arm))
+        c.commit()
+        log.info("corr backfill: %d rows -> %d distinct (arm, lineage) pairs "
+                 "across %d arms, %d passes",
+                 len(rows), len(seen), len(tally),
+                 sum(v[1] for v in tally.values()))
+
     def _backfill_arm_stages(self) -> None:
         """Split the old pooled `trials` counter into per-stage denominators.
 
@@ -733,6 +811,7 @@ class Store:
     # --------------------------------------------------------------- arms
     def bump_arm(self, arm: str, *, trial=0, scan_trials=0, scan_pass=0,
                  refine_trials=0, gate_pass=0, deep_trials=0, deep_pass=0,
+                 corr_trials=0, corr_pass=0,
                  submitted=0, sharpe=0.0) -> None:
         with self.conn() as c:
             c.execute("INSERT OR IGNORE INTO arms(arm,updated) VALUES (?,?)",
@@ -742,10 +821,12 @@ class Store:
                 " scan_trials=scan_trials+?, scan_pass=scan_pass+?,"
                 " refine_trials=refine_trials+?, gate_pass=gate_pass+?,"
                 " deep_trials=deep_trials+?, deep_pass=deep_pass+?,"
+                " corr_trials=corr_trials+?, corr_pass=corr_pass+?,"
                 " submitted=submitted+?, sum_sharpe=sum_sharpe+?,"
                 " updated=? WHERE arm=?",
                 (trial, scan_trials, scan_pass, refine_trials, gate_pass,
-                 deep_trials, deep_pass, submitted, sharpe, time.time(), arm))
+                 deep_trials, deep_pass, corr_trials, corr_pass,
+                 submitted, sharpe, time.time(), arm))
 
     def arms(self) -> list[sqlite3.Row]:
         return self.conn().execute("SELECT * FROM arms").fetchall()

@@ -192,6 +192,54 @@ LIBRARY: tuple[Template, ...] = (
              "A and B have been moving together -- mutual confirmation from "
              "two independent sources.",
              needs_field2=True),
+
+    # ---------------------------------------------------- WIDER VOCABULARY
+    # Everything above uses ~20 of the 85 operators BRAIN offers, and every
+    # single template above ends in group_rank -- a construction so universal
+    # it is a prime suspect for being crowded platform-wide. These eight each
+    # change EXACTLY ONE axis of a shape already in the library, so when the
+    # bandit measures them the difference is attributable. All use level=ALL
+    # operators and stay inside Power Pool's <=8 distinct-operator rule.
+    #
+    # Two axes are deliberately untested here and left for a later probe:
+    # vector_neut / regression_neut (expression-level neutralization, the same
+    # lever settings-level neutralization proved to be) and the Vector family
+    # -- both report level=None, so tier availability is unverified.
+    Template("change_zscore", "CHANGE",
+             "group_zscore(ts_delta({f}, {d}), {g})", (22, 66, 126), True, "mid",
+             "The CHANGE hypothesis, normalised by dispersion instead of "
+             "ranked -- same claim, different crowd."),
+    Template("change_scale", "CHANGE",
+             "group_scale(ts_delta({f}, {d}), {g})", (22, 66, 126), True, "mid",
+             "The CHANGE hypothesis scaled within its group rather than "
+             "ranked; keeps magnitude information ranking throws away."),
+    Template("av_diff", "SURPRISE",
+             "group_rank(ts_av_diff({f}, {d}), {g})", (66, 126, 252), True, "mid",
+             "Distance from the field's own trailing mean, as a native "
+             "operator rather than a hand-built difference of two means."),
+    Template("decay_change", "CHANGE",
+             "group_rank(ts_decay_linear(ts_delta({f}, {d}), {d}), {g})",
+             (22, 66, 126), True, "mid",
+             "Improvement, weighted toward the recent part of the window -- "
+             "smoother than a raw delta without lagging like decay."),
+    Template("peak_recency", "EVENT",
+             "group_rank(ts_arg_max({f}, {d}), {g})", (66, 126, 252), True, "low",
+             "How long since this field last peaked. A timing hypothesis, not "
+             "a level or a change one -- nothing else in the library asks it."),
+    Template("staleness", "EVENT",
+             "group_rank(days_from_last_change({f}), {g})", (0,), True, "low",
+             "How long the data has been unchanged. Stale fundamentals and "
+             "freshly-revised ones are different regimes."),
+    Template("regime_change", "EVENT",
+             "group_rank(if_else(greater(ts_zscore({f}, {d}), 1), "
+             "ts_delta({f}, {d}), 0), {g})", (66, 126), True, "mid",
+             "Trade the change only when the level is unusually high -- the "
+             "library's first conditional, and a turnover killer."),
+    Template("quantile_change", "CHANGE",
+             "group_rank(quantile(ts_delta({f}, {d})), {g})", (22, 66, 126),
+             True, "mid",
+             "Improvement, reshaped to a gaussian before ranking -- blunts the "
+             "tail that dominates a raw delta."),
 )
 
 BY_FAMILY: dict[str, list[Template]] = {}
