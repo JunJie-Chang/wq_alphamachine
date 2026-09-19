@@ -47,6 +47,7 @@ import json
 import os
 import re
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -201,15 +202,19 @@ def evaluate(alpha: dict, operator_names: set[str]) -> dict:
     for g in failed_gates:
         reasons.append(f"{g} FAIL")
 
+    settings = alpha.get("settings") or {}
     return {
         "alpha_id": rec["alpha_id"],
         "status": rec["status"],
         "sharpe": sharpe,
+        "region": settings.get("region"),
+        "delay": settings.get("delay"),
         "n_operators": len(operators),
         "operators": sorted(operators),
         "n_fields": len(fields),
         "fields": sorted(fields),
         "power_pool_correlation": pp_corr,
+        "pyramids": pyramid_names(checks),
         "gates": gates,
         "pending_gates": pending_gates,
         "description_needs_work": description_needs_work,
@@ -218,6 +223,22 @@ def evaluate(alpha: dict, operator_names: set[str]) -> dict:
         "verified": not pending_gates,
         "reasons": reasons,
     }
+
+
+def pyramid_names(checks: list[dict]) -> list[str]:
+    """Which region×delay×dataset-category Pyramid(s) this alpha counts toward.
+
+    Matters for two mechanisms beyond raw eligibility (see issue #4): Genius
+    level needs a COUNT of distinct completed pyramids (>=3 alphas each), not
+    total alpha count, and the Dynamic Pyramid Multiplier (1.0x-2.0x on base
+    payment) rewards submitting into LESS-used pyramids. Piling picks into
+    whichever pyramid the pipeline happened to generate the most candidates
+    for helps neither.
+    """
+    for c in checks or []:
+        if c.get("name") == "MATCHES_PYRAMID":
+            return [p.get("name") for p in c.get("pyramids") or [] if p.get("name")]
+    return []
 
 
 def deepen(client: BrainClient, r: dict) -> dict:
@@ -231,6 +252,7 @@ def deepen(client: BrainClient, r: dict) -> dict:
     gates = gate_status(checks)
     r["gates"] = gates
     r["power_pool_correlation"] = check_value(checks, "POWER_POOL_CORRELATION")
+    r["pyramids"] = pyramid_names(checks)
     r["pending_gates"] = [k for k, v in gates.items() if v in (None, "PENDING")]
     r["verified"] = not r["pending_gates"]
     r["description_needs_work"] = [name for name in DESCRIPTION_CHECKS
@@ -256,13 +278,49 @@ def main() -> int:
     ap.add_argument("--top", type=int, default=None,
                      help="with --deep, only deepen the top N candidates "
                           "(ranked by Sharpe) instead of all of them")
+    ap.add_argument("--delay", type=float, default=2.0,
+                     help="seconds to sleep between --deep calls (default "
+                          "2.0). BRAIN computes POWER_POOL_CORRELATION "
+                          "asynchronously; firing requests back-to-back "
+                          "enqueues faster than it can compute and every "
+                          "candidate comes back PENDING regardless of alpha "
+                          "quality -- confirmed live 2026-09-19. Pass 0 only "
+                          "if BRAIN has already shown fast, resolved (non-"
+                          "PENDING) results on a small --top sample first.")
     ap.add_argument("--since", default=None,
                      help="ISO 8601 datetime with timezone offset (e.g. "
                           "2026-08-01T00:00:00+00:00); when given, pages "
                           "through the FULL history from this date via "
                           "date-window bisection instead of one capped query")
+    ap.add_argument("--from-file", default=None,
+                     help="load already-evaluated records (this script's own "
+                          "--json output, e.g. after local dedup) instead of "
+                          "re-fetching + re-evaluating from BRAIN -- only "
+                          "--deep/--top/--json make sense combined with this")
     ap.add_argument("--json", action="store_true", help="dump raw JSON instead of a table")
     args = ap.parse_args()
+
+    if args.from_file:
+        results = json.load(open(args.from_file))
+        eligible = sorted((r for r in results if r["eligible"]),
+                          key=lambda r: -(r["sharpe"] or 0))
+        _load_env()
+        email = os.environ.get("WQ_EMAIL", "")
+        password = os.environ.get("WQ_PASSWORD", "")
+        if not email or not password:
+            print("WQ_EMAIL / WQ_PASSWORD not set.", file=sys.stderr)
+            return 2
+        client = BrainClient(email, password)
+        try:
+            client.authenticate()
+        except BiometricRequired as e:
+            print(f"BRAIN wants a browser persona check: {e}\nRun "
+                  f"scripts/auth_wait.py first.", file=sys.stderr)
+            return 1
+        except AuthError as e:
+            print(f"authentication failed: {e}", file=sys.stderr)
+            return 1
+        return _process_and_report(client, results, eligible, args)
 
     _load_env()
     email = os.environ.get("WQ_EMAIL", "")
@@ -299,7 +357,11 @@ def main() -> int:
     results = [evaluate(a, operator_names) for a in alphas]
     eligible = sorted((r for r in results if r["eligible"]),
                       key=lambda r: -(r["sharpe"] or 0))
+    return _process_and_report(client, results, eligible, args)
 
+
+def _process_and_report(client: BrainClient, results: list[dict],
+                        eligible: list[dict], args) -> int:
     if args.deep:
         pool = eligible[:args.top] if args.top else eligible
         print(f"deepening {len(pool)} candidate(s) with a live /check call each ...",
@@ -307,8 +369,11 @@ def main() -> int:
         for i, r in enumerate(pool):
             deepen(client, r)
             print(f"  [{i+1}/{len(pool)}] {r['alpha_id']}: "
-                  f"eligible={r['eligible']} pending={r['pending_gates']}",
+                  f"eligible={r['eligible']} pending={r['pending_gates']} "
+                  f"pyramids={r.get('pyramids')}",
                   file=sys.stderr)
+            if args.delay and i + 1 < len(pool):
+                time.sleep(args.delay)
         eligible = sorted((r for r in results if r["eligible"]),
                           key=lambda r: -(r["sharpe"] or 0))
 
@@ -330,7 +395,8 @@ def main() -> int:
         print(f"  [OK]  {r['alpha_id']}  sharpe={r['sharpe']:.2f}  "
               f"ops={r['n_operators']}({','.join(r['operators'])})  "
               f"fields={r['n_fields']}({','.join(r['fields'])})  "
-              f"pp_corr={r['power_pool_correlation']}{desc_flag}")
+              f"pp_corr={r['power_pool_correlation']}  "
+              f"pyramids={r.get('pyramids')}{desc_flag}")
     for r in provisional:
         print(f"  [??]  {r['alpha_id']}  sharpe={r['sharpe']:.2f}  "
               f"ops={r['n_operators']}({','.join(r['operators'])})  "
