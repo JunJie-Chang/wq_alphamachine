@@ -2444,6 +2444,233 @@ check("group_rank is no longer universal -- some templates use another wrapper",
       any(not T.BY_NAME[n].render("fld", days=66, group="subindustry").startswith("group_rank")
           for n in _new39))
 
+print("\n[39] Power Pool dedup: twins collapse, plumbing fields do not lock ideas out")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+import copy as _copy40
+import dedup_powerpool as D40
+
+def _rec40(aid, sharpe, ops, fields, pyr, *, region="USA", eligible=True):
+    return {"alpha_id": aid, "sharpe": sharpe, "operators": ops,
+            "n_operators": len(ops), "fields": fields, "n_fields": len(fields),
+            "region": region, "delay": 1, "pyramids": [pyr], "eligible": eligible,
+            "verified": False}
+
+_in40 = [
+    _rec40("a1", 2.0, ["rank", "ts_delta"], ["f1"], "USA/D1/MODEL"),
+    _rec40("a2", 1.5, ["rank", "ts_delta"], ["f1"], "USA/D1/MODEL"),    # twin of a1
+    _rec40("a3", 1.8, ["rank", "ts_zscore"], ["f1"], "USA/D1/MODEL"),   # same field
+    _rec40("a4", 1.7, ["rank", "ts_delta"], ["f2", "cap"], "USA/D1/ANALYST"),
+    _rec40("a5", 1.6, ["rank", "ts_delta"], ["f3", "cap"], "USA/D1/FUNDAMENTAL"),
+    _rec40("a6", 3.0, ["rank"], ["f9"], "USA/D1/MODEL", eligible=False),
+    _rec40("a7", 1.4, ["rank", "ts_delta"], ["f1"], "USA/D1/MODEL", region="EUR"),
+]
+_snap40 = _copy40.deepcopy(_in40)
+_ids = lambda rs: [r["alpha_id"] for r in rs]
+
+_sig = D40.by_signature([r for r in _in40 if r["eligible"]])
+check("signature stage keeps the best Sharpe of a twin group",
+      "a1" in _ids(_sig) and "a2" not in _ids(_sig))
+check("signature stage records how many variants a survivor absorbed",
+      {r["alpha_id"]: r["dedup_group_size"] for r in _sig}["a1"] == 2)
+
+_k, _st = D40.dedup(_in40, max_per_field=1)
+check("an ineligible record never comes back, however good its Sharpe",
+      "a6" not in _ids(_k))
+check("field cap 1 drops a different-operator alpha on an already-used field",
+      "a3" not in _ids(_k), str(_ids(_k)))
+check("field cap 2 lets that second alpha on the field through",
+      "a3" in _ids(D40.dedup(_in40, max_per_field=2)[0]))
+check("a shared plumbing field (`cap`) does not lock the second idea out",
+      "a4" in _ids(_k) and "a5" in _ids(_k), str(_ids(_k)))
+check("the same field in another region is a different series",
+      "a7" in _ids(_k))
+check("per-stage counts narrow monotonically",
+      _st["eligible"] >= _st["after_signature"] >= _st["after_field_cap"],
+      str(_st))
+check("the input records are not mutated", _in40 == _snap40)
+check("output keeps every key the downstream scripts read",
+      all({"alpha_id", "eligible", "verified", "fields", "operators"} <= set(r) for r in _k))
+
+_fd40 = {"f1": "ds1", "f2": "ds1", "f3": "ds2"}
+_kd, _std = D40.dedup(_in40, max_per_field=2, max_per_dataset=1, field_datasets=_fd40)
+check("dataset cap 1 drops a second alpha from the same dataset (f2 shares ds1 with f1)",
+      "a4" not in _ids(_kd) and "a5" in _ids(_kd), str(_ids(_kd)))
+check("the dataset cap is skipped, not crashed, when the catalog is unavailable",
+      "after_dataset_cap" not in D40.dedup(_in40, max_per_dataset=1, field_datasets={})[1])
+
+_pool40 = [_rec40(f"m{i}", 3.0 - i * 0.1, ["rank"], [f"g{i}"], "USA/D1/MODEL") for i in range(4)]
+_pool40.append(_rec40("z1", 0.5, ["rank"], ["gz"], "USA/D1/ANALYST"))
+_pool40.append(_rec40("y1", 0.4, ["rank"], ["gy"], "USA/D1/NEWS"))
+_o40 = D40.interleave_pyramids(_pool40)
+check("interleave: the first three picks cover three pyramids, not the top-3 Sharpe",
+      len({D40.pyramid_key(r) for r in _o40[:3]}) == 3, str(_ids(_o40)))
+check("interleave loses and duplicates nothing",
+      sorted(_ids(_o40)) == sorted(_ids(_pool40)))
+
+# --- against: what is already submitted uses up its fields' quota ------------
+_act40 = [_rec40("s1", 1.9, ["rank", "ts_delta"], ["f1"], "USA/D1/MODEL")]
+_ka, _sta = D40.dedup(_in40, max_per_field=1, existing=_act40)
+check("--against: a candidate on a field a submitted alpha holds is dropped",
+      "a1" not in _ids(_ka) and "a3" not in _ids(_ka), str(_ids(_ka)))
+check("--against: unrelated ideas and other regions are untouched",
+      {"a4", "a5", "a7"} <= set(_ids(_ka)), str(_ids(_ka)))
+_twin40 = [_rec40("s2", 1.0, ["rank", "ts_delta"], ["close", "vwap"], "USA/D1/PV")]
+_tin40 = [_rec40("t1", 2.0, ["rank", "ts_delta"], ["close", "vwap"], "USA/D1/PV"),
+          _rec40("t2", 1.9, ["rank", "ts_delta"], ["close", "high"], "USA/D1/PV")]
+check("--against: an exact twin built only from plumbing fields is still dropped",
+      _ids(D40.dedup(_tin40, existing=_twin40)[0]) == ["t2"])
+check("--against: dataset quota is seeded too",
+      "a5" not in _ids(D40.dedup(_in40, max_per_field=2, max_per_dataset=1,
+                                 field_datasets={"f1": "ds1", "f3": "ds1"},
+                                 existing=_act40)[0]))
+check("--against: without it, behaviour is unchanged",
+      _ids(D40.dedup(_in40)[0]) == _ids(D40.dedup(_in40, existing=None)[0]))
+
+# --- shape cap: one construction on many fields is not many ideas ------------
+_shp40 = [_rec40(f"r{i}", 3.0 - i * 0.1, ["group_rank", "ts_regression"], [f"x{i}"],
+                 "USA/D1/MODEL") for i in range(6)]
+_shp40.append(_rec40("d1", 1.2, ["group_rank", "ts_delta"], ["y1"], "USA/D1/OTHER"))
+_ks, _sts = D40.dedup(_shp40, max_per_field=1, max_per_shape=2)
+check("shape cap: six different fields under one operator set collapse to the cap",
+      sum(1 for r in _ks if r["alpha_id"].startswith("r")) == 2, str(_ids(_ks)))
+check("shape cap: it keeps the BEST Sharpe of the shape, and other shapes are untouched",
+      {"r0", "r1", "d1"} == set(_ids(_ks)), str(_ids(_ks)))
+check("shape cap: seeded by what is already submitted",
+      sum(1 for r in D40.dedup(_shp40, max_per_shape=2, existing=[
+          _rec40("s9", 1.0, ["group_rank", "ts_regression"], ["zz"], "USA/D1/MODEL")])[0]
+          if r["alpha_id"].startswith("r")) == 1)
+check("shape cap: off when not asked for (the pure function's default)",
+      len(D40.dedup(_shp40, max_per_field=1)[0]) == 7)
+check("shape cap: a different region is a different shape",
+      len(D40.dedup([_rec40("e1", 2.0, ["a"], ["u"], "P"), _rec40("e2", 1.9, ["a"], ["v"], "P", region="EUR")],
+                    max_per_shape=1)[0]) == 2)
+
+# --- tag_powerpool: nothing is PATCHed unless the description would pass ------
+import tag_powerpool as TG40
+_good40 = ("Idea: " + "x" * 60 + "\n\nRationale for data used:\n- f: d\n\n"
+           "Rationale for operators used:\n- rank: r")
+check("validate_description accepts a complete description", not TG40.validate_description(_good40))
+check("validate_description rejects a missing section header",
+      any("Rationale for operators" in p for p in
+          TG40.validate_description(_good40.replace("Rationale for operators used:", "Operators:"))))
+check("validate_description rejects text under 100 chars",
+      any("< 100" in p for p in TG40.validate_description(
+          "Idea: a\nRationale for data used: b\nRationale for operators used: c")))
+check("validate_description rejects sections in the wrong order",
+      any("out of order" in p for p in TG40.validate_description(
+          "Rationale for data used: " + "y" * 40 + "\nIdea: " + "x" * 40
+          + "\nRationale for operators used: z")))
+_tpl40 = TG40.build_description(["some_field"], ["group_rank", "ts_delta"],
+                                {"some_field": "what it measures " * 3},
+                                {"group_rank": {"definition": "group_rank(x, g)", "description": "rank within group"},
+                                 "ts_delta": {"definition": "ts_delta(x, d)", "description": "change over d days"}})
+check("the script's own template output passes the same validation",
+      not TG40.validate_description(_tpl40), str(TG40.validate_description(_tpl40)))
+
+# --- recency: a whole-period Sharpe hides a signal that died years ago -------
+import check_powerpool as CP40
+_ck40 = lambda name, value, limit, result="WARNING": [{"name": name, "value": value,
+                                                       "limit": limit, "result": result}]
+check("recency: a 2Y Sharpe below BRAIN's own limit is not ok",
+      CP40.recency(_ck40("LOW_2Y_SHARPE", 0.0, 1.58)) == {"kind": "2Y", "value": 0.0,
+                                                          "limit": 1.58, "ok": False})
+check("recency: judged on the VALUE, never the WARNING/FAIL string",
+      CP40.recency(_ck40("LOW_2Y_SHARPE", 1.9, 1.58, "FAIL"))["ok"] is True
+      and CP40.recency(_ck40("LOW_2Y_SHARPE", 0.4, 1.58, "WARNING"))["ok"] is False)
+check("recency: falls back to the IS ladder, with ITS per-alpha limit",
+      CP40.recency(_ck40("IS_LADDER_SHARPE", 2.30, 2.02)) == {"kind": "LADDER", "value": 2.30,
+                                                              "limit": 2.02, "ok": True})
+check("recency: neither check present is unknown (None), not fine and not failed",
+      CP40.recency([]) == {"kind": None, "value": None, "limit": None, "ok": None})
+
+_rc40 = lambda aid, ok: {**_rec40(aid, 2.0, ["rank"], [f"q{aid}"], "USA/D1/MODEL"),
+                         "recency": {"kind": "2Y", "value": 0.0, "limit": 1.58, "ok": ok}}
+_mix40 = [_rc40("dead", False), _rc40("live", True), _rec40("unk", 1.9, ["rank"], ["qunk"], "USA/D1/MODEL")]
+check("dedup drops decayed alphas when asked, keeps healthy AND unknown ones",
+      set(_ids(D40.dedup(_mix40, drop_decayed=True)[0])) == {"live", "unk"})
+check("dedup keeps decayed alphas unless asked (the pure function's default)",
+      set(_ids(D40.dedup(_mix40)[0])) == {"dead", "live", "unk"})
+check("a decayed alpha with the best Sharpe cannot be the survivor of its own idea",
+      _ids(D40.dedup([{**_rc40("old", False), "sharpe": 3.0},
+                      {**_rc40("new", True), "sharpe": 1.6}], drop_decayed=True)[0]) == ["new"])
+
+import sqlite3 as _sq40
+_dbp40 = os.path.join(tempfile.mkdtemp(), "m.db")
+_cn40 = _sq40.connect(_dbp40)
+_cn40.execute("CREATE TABLE sims (alpha_id TEXT, two_year_sharpe REAL, is_ladder_sharpe REAL, is_ladder_limit REAL)")
+_cn40.executemany("INSERT INTO sims VALUES (?,?,?,?)",
+                  [("a", 0.0, None, None), ("b", None, 2.5, 2.0), ("c", None, None, None)])
+_cn40.commit(); _cn40.close()
+_old40 = [{"alpha_id": x} for x in "abcz"]
+_n40 = D40.recency_from_db(_old40, _dbp40)
+check("recency_from_db fills old reports from the local db (2Y, ladder), skips the unknown",
+      _n40 == 2 and _old40[0]["recency"]["ok"] is False and _old40[1]["recency"]["ok"] is True
+      and "recency" not in _old40[2] and "recency" not in _old40[3], str(_old40))
+
+# --- BRAIN correlates over the LAST 4 YEARS, not the whole history -----------
+from alphamachine.correlate import BRAIN_CORR_YEARS, aligned_corr as _ac40
+import numpy as _np40
+_rng40 = _np40.random.default_rng(7)
+_dates40 = [f"{y}-{m:02d}-{d:02d}" for y in range(2014, 2024) for m in range(1, 13) for d in range(1, 22)]
+_x40 = _rng40.normal(size=len(_dates40))
+_n_old = sum(1 for d in _dates40 if d < "2020-01-01")
+# identical in the last four years, opposite before -> the window decides the answer
+_y40 = _np40.where(_np40.array(_dates40) < "2020-01-01", -_x40, _x40)
+_A40, _B40 = (_dates40, _x40), (_dates40, _y40)
+check("BRAIN_CORR_YEARS is 4", BRAIN_CORR_YEARS == 4)
+check("a 4-year window sees only 2020-2023 (perfectly correlated there)",
+      abs(_ac40(_A40, _B40, years=4) - 1.0) < 1e-9)
+check("the whole-history default still sees the opposite years too (unchanged behaviour)",
+      _ac40(_A40, _B40) < 0.5, f"{_ac40(_A40, _B40):.3f}")
+check("the window starts on Jan 1 of (last year - N + 1), not a rolling 1461 days",
+      abs(_ac40(_A40, _B40, years=4) - 1.0) < 1e-9 and _ac40(_A40, _B40, years=5) < 1.0)
+check("a window with too little overlap returns 0.0, not garbage",
+      _ac40((_dates40[:30], _x40[:30]), (_dates40[:30], _x40[:30]), years=4) == 0.0)
+
+_v40 = {"alpha_id": "v", "eligible": True, "verified": True, "pending_gates": []}
+_u40 = {"alpha_id": "u", "eligible": True, "verified": False, "pending_gates": ["POWER_POOL_CORRELATION"]}
+_t40 = {"alpha_id": "t", "eligible": True, "verified": False, "pending_gates": ["POWER_POOL_CORRELATION", "LOW_TURNOVER"]}
+_n40 = {"alpha_id": "n", "eligible": False, "verified": True, "pending_gates": []}
+_sel = lambda inc: [r["alpha_id"] for r in TG40.select_candidates([_v40, _u40, _t40, _n40], inc)]
+check("tag: by default only fully verified, eligible records are tagged", _sel(False) == ["v"])
+check("tag: --include-unverified admits a record whose ONLY pending gate is the PP correlation",
+      _sel(True) == ["v", "u"])
+check("tag: --include-unverified still excludes any other unresolved gate, and ineligible ones",
+      "t" not in _sel(True) and "n" not in _sel(True))
+
+# --- check_powerpool --from-file must keep the FILE's order ------------------
+import io as _io40, contextlib as _cx40
+import check_powerpool as CP40
+
+class _FakeClient40:
+    checked: list = []
+    def __init__(self, *a, **k): pass
+    def authenticate(self): pass
+    def alpha_check(self, aid):
+        _FakeClient40.checked.append(aid); return {"is": {"checks": []}}
+
+_ord40 = [_rec40("lo", 1.1, ["rank"], ["p"], "USA/D1/ANALYST"),
+          _rec40("mid", 1.5, ["rank"], ["q"], "USA/D1/MODEL"),
+          _rec40("hi", 2.9, ["rank"], ["r"], "USA/D1/MODEL")]
+for _r in _ord40:
+    _r.update({"gates": {}, "pending_gates": [], "reasons": [], "power_pool_correlation": None,
+               "description_needs_work": [], "all_checks": []})
+_tmp40 = os.path.join(tempfile.mkdtemp(), "order.json")
+json.dump(_ord40, open(_tmp40, "w"))
+_saved40 = (CP40.BrainClient, sys.argv, dict(os.environ))
+CP40.BrainClient = _FakeClient40
+os.environ["WQ_EMAIL"], os.environ["WQ_PASSWORD"] = "t@example.com", "x"
+sys.argv = ["check_powerpool.py", "--from-file", _tmp40, "--deep", "--top", "2",
+            "--delay", "0", "--json"]
+try:
+    with _cx40.redirect_stdout(_io40.StringIO()):
+        CP40.main()
+finally:
+    CP40.BrainClient, sys.argv = _saved40[0], _saved40[1]
+    os.environ.clear(); os.environ.update(_saved40[2])
+check("--from-file --top N deepens the first N of the FILE, not the top-N Sharpes",
+      _FakeClient40.checked == ["lo", "mid"], str(_FakeClient40.checked))
+
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")
 sys.exit(1 if fail else 0)
