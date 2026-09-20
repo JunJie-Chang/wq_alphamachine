@@ -5,6 +5,17 @@ the way BRAIN actually scores consultants rather than around raw backtest huntin
 
 ---
 
+## Repository layout
+
+| Path | What it is |
+|---|---|
+| `alphamachine/` | the pipeline: `catalog` → `generator` (+ `bandit`, `templates`, `priors`) → `executor` → `refine` → `metrics` → `correlate` → `submit`, on top of `client` (HTTP), `store` (SQLite) and `config` (every threshold). `audit` checks the live database; `cli` wires it together. |
+| `scripts/` | unattended operation (`autoloop.py`, `night_check.sh`, `status.sh`, `progress.sh`), persona auth (`auth_wait.py`), the offline test (`smoke_test.py`), and the **Power Pool** track (`check_powerpool.py`, `dedup_powerpool.py`, `corr_powerpool.py`, `tag_powerpool.py`, `submit_powerpool.py` — see Part 6). |
+| `docs/` | rule references, in Traditional Chinese. `BRAIN_RULES.md` is the authority for every number; `新手指南.md` is a from-scratch walkthrough; `docs/README.md` explains the priority order. |
+| `data/` | runtime state — **entirely gitignored** (`machine.db`, session cookie, caches, logs). It is per-machine: a `git pull` on another computer brings the code, never this state. |
+
+---
+
 ## Part 1 — The rules of the game (researched)
 
 ### How an alpha is counted
@@ -169,6 +180,17 @@ out of sample. A book of coin flips scores badly and cannot be un-submitted.
 > platform's own `alphaCount`, i.e. a direct crowding measure). Four of the five
 > are minimal generalisations of shapes already in the list, and every one
 > reuses an existing family so `priors.py` scores them with no extra LLM call.
+>
+> A third axis widened the **operator vocabulary**. BRAIN offers 85 operators
+> and the library used about twenty — and *every* template ended in
+> `group_rank`, a universal construction and a prime suspect for being crowded
+> platform-wide. Eight templates now each change exactly one axis of an existing
+> shape (`group_zscore` / `group_scale` in place of `group_rank`, `ts_av_diff`,
+> `ts_decay_linear`, `ts_arg_max`, `days_from_last_change`, the library's first
+> conditional via `if_else`, `quantile`) so the bandit's measurement stays
+> attributable. All stay within Power Pool's ≤ 8 distinct operators.
+> `Catalog.operators()` caches `/operators` the way fields are cached. No
+> template was deleted: a weak one sinks on the bandit's own evidence.
 
 > **② Diagnose, don't sweep.** A survivor's failing metric tells you which knob
 > to turn. Reading the failure and turning that one knob costs ~20 sims; a full
@@ -260,6 +282,20 @@ curve; both need extra API calls, and both routinely block alphas that cleared
 every local metric. An arm that keeps producing them converts far worse than its
 gate rate implies. Run `alphamachine report` to see which stage an arm dies at.
 
+**The third stage learns on `PROD_CORRELATION` alone, not on the whole deep
+verdict.** `deep_verdict.ok` is true only when crowding, recency *and* yearly
+consistency all pass. That one bit collapses "this transform shape is crowded"
+(attributable to the arm) with "this field's history decayed" (a property of the
+field), and since ~97% of candidates fail *something* it was 0 for every arm in
+the account's history — the bandit was allocating on its prior at the stage that
+decides everything. A real case: an alpha cleared `PROD_CORRELATION` at 0.49, then
+failed `LOW_2Y_SHARPE`, and taught `deep_pass = 0`. So `arms.corr_trials` /
+`corr_pass` isolate the half the arm controls and `sample()` reads those;
+`deep_*` is still recorded and still shown by `report` as true end-to-end
+conversion, it just no longer allocates. Teaching is idempotent — keyed on the
+**lineage root** (`bandit_taught`), because sibling rung variants of one idea are
+one bet, not several: 820 measured rows collapse to 152 independent lineages.
+
 **Unknown is neither pass nor fail.** When a deep check cannot be fetched the
 verdict is *inconclusive*, recorded as NULL. An unverified alpha is never
 reported as submittable, and the bandit is never taught a loss that was really
@@ -274,7 +310,10 @@ degrade the allocation into noise.
 *basket*, the marginal alpha is worth its quality discounted by its redundancy.
 
 **The metric gate is not the bar — measured, not assumed.** The funnel over the
-whole accumulated database, recomputed live rather than read off a stored flag:
+whole accumulated database, recomputed live rather than read off a stored flag.
+This block is a **snapshot from 2026-09-02**; the database has grown since
+(2026-09-13, last write: 77,712 simulations, 55,296 completed OK, 4,503 with
+|Sharpe| ≥ 1.58 — re-run `gatelog --passing` for current gate counts):
 
 ```
 28,535   simulations dispatched
@@ -384,6 +423,19 @@ score order, so a bigger eligible pool only improves what the cap buys.
 | Drawdown | — | **≤ 0.12** | — |
 | Margin | — | — | **≥ 4 bps** |
 | Years positive | — | **≥ 70%, no year > 50% of PnL** | — |
+| IS ladder Sharpe | per-alpha ladder | **BRAIN's own reported limit** (the other recency check — BRAIN sends this or 2Y, never both) | — |
+| Portability (rung 5) | — | **real TOP1000/TOP500 re-simulation vs `subuniverse_floor`** — a champion that collapses under its own falsification test is blocked | — |
+| Pyramid multiplier | 1.0 – 2.0 payout factor | — | additive tilt, capped at 0.15 (below one failed check's 0.25) |
+| Neutralization survival | — | — | rung 1 only: Beta(1,3) posterior of `PROD_CORRELATION` survival, weight 0.20 |
+
+The two `PREFER` tilts are payout and learning signals, never eligibility: each
+is kept smaller than one failed check, so it breaks a near-tie and can never buy
+a broken variant. The pyramid one exists because BRAIN reports the **minimum**
+multiplier over every pyramid an expression matches (9,414 of 9,414 multi-pyramid
+alphas — never the max, never the mean), so one `returns` / `cap` / `volume` /
+`adv20` token pulls the whole alpha into the USA/D1/PV pyramid at 1.1. It cannot
+live on a bandit arm: the regex `theme` agrees with BRAIN's actual pyramid
+category on only 25% of simulations, so it is read per candidate.
 
 `AutoGates` — the bar for submitting *without a human looking* — is a whole
 tier stricter (Sharpe 2.10, prod-corr 0.45, turnover 0.22) and there the
@@ -396,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 279 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 390 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 3 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -406,9 +458,20 @@ python3 -m alphamachine gatelog --passing                     # what can I submi
 python3 -m alphamachine --concurrency 3 select --n 10
 python3 -m alphamachine --concurrency 3 submit --n 3          # dry run
 python3 -m alphamachine --concurrency 3 submit --n 3 --live   # for real
-python3 -m alphamachine report --corr                         # observed prod-corr
+python3 -m alphamachine report --corr                         # observed prod-corr (by row AND by lineage)
+python3 -m alphamachine report --pyramid                      # payout multiplier earned vs available
+python3 -m alphamachine report --neutralization               # PROD_CORRELATION survival by neutralization
 python3 -m alphamachine audit                                 # live-db consistency
 ```
+
+`report --corr` prints by-row **and** by-lineage on purpose. Sibling rung
+variants of one idea are not independent observations, and reading the row count
+is exactly how an 8/10 template "win rate" turned out to be 5 wins in 152
+independent lineages (3.3%) — every winning arm sitting on n = 1. The
+neutralization finding survives the same dedup (new-family 7/41 against classic
+0/305); a per-template ranking does not. The only template claim that holds is a
+negative one: `resid_vs_returns` is 1 win in 90 lineages while consuming the
+largest share of deep-check budget.
 
 **Two test surfaces, and they answer different questions.**
 `scripts/smoke_test.py` proves the **write path** is correct against a fresh
@@ -523,6 +586,15 @@ the inquiry, one to finalise it. Waiting happens on a local sentinel file
 enforces a client-side budget of **20 per rolling 24h** and raises rather than
 requesting a 21st — a hard stop, not a warning.
 
+**Open question, not a fact:** whether the *finalise* call counts against the 25
+at all. It completes an existing inquiry rather than creating one, so it may
+not. If it doesn't, the client-side 20 throttles at about half the real
+headroom — and biometric downtime was measured at 101 of 208 hours, 49% of the
+pipeline's wall-clock life. `auth_wait.py` now logs the `RateLimit-*` headers of
+the inquiry POST, the finalise POST and a known-free `GET /users/self` control
+(`data/logs/biometric_headers.log`, secrets redacted) so the next verification
+settles it. The budget stays at two units per attempt until that data is in.
+
 A verified session's cookie jar is persisted to `data/cookies.json` (mode 600,
 gitignored) and reused, so in normal operation you do the face check once and
 never spend quota again.
@@ -619,9 +691,13 @@ recency fix and the sub-universe fix were the same bug twice: BRAIN sends every
 check's value *and* its per-alpha limit in `is.checks` on every simulation, and
 the pipeline stored the whole list and read three fields out of it. Fixing that
 cost zero extra requests and recovered 6,989 two-year Sharpes and 15,707
-trailing Sharpes from simulations already on disk. `MATCHES_PYRAMID`, which
-carries the payout multiplier, is arriving free in that same list today and is
-still unread — the same shape, still open.
+trailing Sharpes from simulations already on disk. It has since been done three
+more times, each with no API call: `MATCHES_PYRAMID` (the payout multiplier, on
+100% of OK simulations; 24,378 stored rows backfilled), `IS_LADDER_SHARPE` (the
+other recency check, the larger bucket; 19,702 rows), and rung 5's own children
+(a `portability_ratio` for 1,246 already-gated champions). The habit is the
+lesson: before adding an endpoint call, look at what the stored payload already
+carries.
 
 A worked example, straight from the database — the whole thesis in four lines:
 
@@ -674,8 +750,9 @@ regions beyond non-CHN D1 (`config.CONSULTANT_CHECKS` / `CHN_CHECKS`).
 `volume`, `adv20` exist in USA; the YIELD templates will error in regions where
 the denominators are named differently. Run `catalog` first and check.
 
-**`ts_regression(..., rettype=0)`** — confirm the rettype your BRAIN version uses
-for residuals before relying on the RESIDUAL family.
+**`ts_regression(..., rettype=0)`** — confirmed 2026-09-20 against BRAIN's own
+operator documentation: `0` is the Error Term, so the RESIDUAL family does compute
+residuals (see Part 6 for how to read the page).
 
 **No auto-submit loop by design.** `submit` defaults to dry run and is
 day-capped. Submissions are effectively irreversible; a human should look at the
@@ -684,7 +761,8 @@ than the manual gates (Sharpe 2.10 vs 1.58), and queues anything borderline for
 review instead of sending it. The asymmetry is the point: a bad simulation
 wastes a slot, a bad submission occupies book space and cannot be withdrawn.
 `autoloop.py` runs the entire pipeline unattended and still never constructs
-`--live`; the one alpha submitted so far was sent by hand.
+`--live`; every submission is a human decision. (Power Pool alphas are submitted
+by hand too, through their own script — see Part 6.)
 
 **A `200` is not evidence.** Several endpoints compute lazily and return `200`
 with an empty body while they do. This caused a real bug worth guarding against
@@ -721,6 +799,256 @@ subprocess dying as FATAL and stops the whole pipeline. Sending a signal to the
 `python3 -m alphamachine <stage>` process directly therefore halts everything;
 `SIGTERM` to the `autoloop.py` parent is the designed path, and its handler
 terminates the child cleanly.
+
+---
+
+## Part 6 — The Power Pool track
+
+A separate, hand-driven track that sits *beside* the pipeline rather than inside
+it. Power Pool alphas are small, simple, high-quality signals with their own
+eligibility rules (`docs/Power_Pool_Alpha_規則.md`); the pool worth screening is
+the **UNSUBMITTED** alphas already sitting in your account from simulation.
+
+**Eligibility — all required:** Sharpe ≥ 1.0 · ≤ 8 distinct operators
+(`ts_backfill` / `group_backfill` don't count) · ≤ 3 distinct data fields (group
+fields such as `industry` or `sector` don't count) · Power Pool correlation < 0.5
+(or Sharpe ≥ 10% above the most-correlated pool member) · turnover test and
+sub-universe test pass. It also needs a compliant **Idea / Rationale** description
+of at least 100 characters in Properties, or it earns no Power Pool payout even
+if tagged.
+
+**Why it has its own submit script.** A *pure* Power Pool alpha — one that fails
+the Regular-alpha bar — is exempt from the thresholds `Submitter` applies.
+Confirmed live on 2026-09-19: once an alpha carries `PowerPoolSelected` plus a
+compliant description, BRAIN itself reclassifies `LOW_FITNESS`,
+`PROD_CORRELATION` and `LOW_2Y_SHARPE` from FAIL to WARNING. Sending it through
+the Regular path would apply this project's stricter private bar and reject
+alphas the platform would accept. So `submit_powerpool.py` gates on BRAIN's own
+live `/check` and nothing else.
+
+```bash
+# 1. screen: fetch every UNSUBMITTED alpha, evaluate locally, write a JSON report
+#    (no --deep here: that is one live call per alpha)
+python3 scripts/check_powerpool.py --since 2026-08-01T00:00:00+00:00 --json > pp.json
+
+# 2. dedup, offline: thousands of eligible alphas are a few dozen ideas.
+#    --against makes it count what you have ALREADY submitted (ACTIVE).
+python3 scripts/check_powerpool.py --status ACTIVE --json > pp_active.json
+python3 scripts/dedup_powerpool.py pp.json --against pp_active.json \
+        --max-per-field 1 --max-per-dataset 2 --max-per-shape 3 -o pp_dedup.json
+#    decayed alphas (recent Sharpe < BRAIN's limit) are dropped by default;
+#    --allow-decayed keeps them. A report made before `recency` existed needs
+#    --recency-db data/machine.db to fill it in.
+
+# 2b. the gate that matters: recompute correlation from PnL against the WHOLE
+#     ACTIVE book, exactly as BRAIN does (last 4 years). Re-run right before submitting.
+#     Feed it a WIDE dedup (e.g. --max-per-field 3 --max-per-dataset 6
+#     --max-per-shape 15), not the tight one: the tight caps are a proxy for what
+#     this measures, and they threw away good candidates (see below).
+python3 scripts/corr_powerpool.py --from-file pp_dedup_wide.json --top 200 --json > corr.json
+
+# 3. deep-verify a small slice of the deduped list. The output order already
+#    spreads pyramids, so --top N is a spread, not just the N highest Sharpes.
+#    --from-file re-reads a saved report without re-fetching.
+python3 scripts/check_powerpool.py --from-file pp_dedup.json --deep --top 10 --delay 10 --json > pp_deep.json
+
+# 4. tag + describe the verified ones (never overwrites an existing tag/description).
+#    The built-in template only fits "field changes -> price follows" signals;
+#    for anything else write the descriptions yourself and pass them in.
+python3 scripts/tag_powerpool.py pp_deep.json --dry-run
+python3 scripts/tag_powerpool.py pp_deep.json --descriptions hand_written.json
+#    --include-unverified also tags a record whose ONLY unresolved gate is
+#    POWER_POOL_CORRELATION (see the note on a stuck queue, below).
+
+# 5. submit by id — dry run unless --live; re-reads the alpha and confirms ACTIVE
+python3 scripts/submit_powerpool.py ID1 ID2 ID3 ID4 --used-today 0
+python3 scripts/submit_powerpool.py ID1 ID2 ID3 ID4 --live
+```
+
+**Daily quota.** The 3-month rule in `docs/Power_Pool_Alpha_規則.md` §4: *after* a
+consultant's first submission is three months old, pure Power Pool alphas are
+limited to **1 per day and 10 per calendar month** (single scope). *Before* that,
+the standard limit applies — **up to 4 alphas per day**. The rule is measured
+from the first submission, which this database records as 2026-09-02; that would
+put the switch near 2026-12-02, but the database only sees submissions made
+through this pipeline, so confirm your true first-submission date on the
+platform before relying on it.
+
+**Things that will bite you:**
+
+* **State is per-machine.** `data/` is gitignored, so `machine.db` — and with it
+  the local submit counter — is not shared between computers, and a `git pull`
+  brings only the scripts. The `--json` report is likewise a plain file you must
+  carry across yourself (or re-generate: `check_powerpool.py` re-fetches from
+  BRAIN). If you submit from two machines or through the web UI, pass
+  `--used-today N` to `submit_powerpool.py`; BRAIN's platform cap is the final
+  authority regardless of any local counter.
+* **"Today" is the code's assumption.** The counter uses a scoring day starting
+  **03:00 America/New_York** (`submit.scoring_day_start()`), i.e. 15:00 in Taiwan
+  during US daylight time and 16:00 otherwise. That boundary is the project's own;
+  the docs in this repo mention 3 AM EST only for Community Activity updates, not
+  for submission counting. Treat it as unverified.
+* **`POWER_POOL_CORRELATION` is computed lazily, and pacing is not solved.**
+  Without `--deep` it sits at `PENDING`; firing `/check` requests back-to-back
+  enqueues the computation faster than BRAIN resolves it, so *every* candidate
+  comes back `PENDING` regardless of quality (confirmed live 2026-09-19 — 193 of
+  245 in the first batch). The default `--delay 2` is **not enough on its own**:
+  a 10-candidate test at `--delay 3` still resolved 0 of 10. Test a small
+  `--top N` first; if it is all `PENDING`, try 10 s or more, or spread a large
+  list across several sessions. `/check` also timed out repeatedly under load
+  (`timed out waiting for /alphas/.../check`), so stop and wait rather than push
+  through. `PENDING` means unknown, never pass — such a candidate is reported
+  provisional.
+* **Do not hammer `/check`; a PENDING can outlast the session.** After a burst of
+  roughly forty `/check` calls on 2026-09-20, `POWER_POOL_CORRELATION` stayed
+  `PENDING` on every candidate for over an hour — including one that had resolved
+  earlier the same day — consistent with issue #4's report that volume aggravates
+  the queue. Tagging does not need the value, and `corr_powerpool.py` measures it
+  without touching `/check`, so the pattern is: measure locally, tag with
+  `--include-unverified`, let the queue drain, and let the submit attempt itself
+  do the authoritative recompute.
+* **Rank by recent performance, not whole-period Sharpe.** Every number in a
+  screening report is a full-history aggregate, so a signal that earned Sharpe 3
+  early and nothing since sorts to the top. On the real 2026-09-20 pull **11,715
+  of the 17,509 structurally eligible alphas (67%) had a recent Sharpe below
+  BRAIN's own limit** — and the three highest-Sharpe survivors of the first dedup
+  (2.82, 2.57, 2.22) had a trailing Sharpe of **0.00**. One of them (`akLnG3XW`)
+  showed `LOW_2Y_SHARPE 0.0` against 1.58, `LOW_DURATION 242` against 500 and
+  `CONCENTRATED_WEIGHT 0.197` against 0.10 on `/check`; the last is exempt for a
+  pure Power Pool alpha, the other two are not covered by the docs. `evaluate()`
+  now records `recency` (BRAIN's `LOW_2Y_SHARPE` value, else `IS_LADDER_SHARPE`,
+  each against its own per-alpha limit — the value, never the result string, which
+  reads `WARNING` at simulation time and only flips to `FAIL` on `/check`) and
+  `dedup_powerpool.py` drops the decayed ones before choosing each idea's best
+  variant. Unknown recency is kept, not dropped.
+* **Dedup is not optional, and field identity is not enough.** A full `--since`
+  scan returns tens of thousands of near-duplicate ideas, and submitting twins
+  fails the Power Pool correlation check the first twin just tightened.
+  `dedup_powerpool.py` narrows in four stages: (1) **signature** — (region,
+  delay, operator set, field set), best Sharpe wins; (2) **field cap** — an
+  underlying field backs at most N kept alphas, with ubiquitous plumbing fields
+  (`returns`, `cap`, `assets`, …) exempt because they are denominators, not
+  ideas; (3) optional **dataset cap**, from the field catalog cache; (4) **shape
+  cap** — at most N alphas per operator set. `--against` seeds all of it with the
+  alphas you have already submitted.
+  The fourth stage exists because of what stages 1–3 left behind. On the real
+  2026-09-20 pull (55,845 UNSUBMITTED, 17,509 eligible) the funnel was 2,926
+  signatures → 2,920 after dropping twins of the 18 ACTIVE → 397 at one per field
+  → 157 at two per dataset — and **89 of those 157 had the identical operator set
+  `{group_rank, ts_regression}`**: `-ts_regression(returns, <field>, 126, rettype=0)`,
+  the residual of `returns` on some field, which is mostly `returns` again. One
+  reversal factor written 89 times, each on a "different" field. Transform shape
+  drives correlation more than field identity does — the same finding as
+  `resid_vs_returns` converting at 1 in 90 lineages. With three per shape the
+  list is **46 alphas across 21 operator sets** (2 → 33, 5 → 62, 8 → 73).
+  Stage 1 lands exactly on the 2,926 that issue #4's ad hoc dedup got, which is
+  the cross-check that stage is doing the same thing.
+  **The caps are still a heuristic, not a measurement.** Two alphas of that shape
+  each passed `POWER_POOL_CORRELATION` against the pool (0.26 and 0.17) yet
+  correlate **0.7162 with each other** — submitting both fails the second, since by
+  then the first is in the pool. The heuristics do not catch that on their own:
+  with one `ts_regression` reversal alpha already submitted and `--max-per-shape
+  3`, two more of that shape are still allowed, and `returns` is exempt from the
+  field cap — so `qMjaRoNP` was still on the list after its rejection. The gate
+  that does is `corr_powerpool.py` (next bullet); `--max-per-shape 1` is the
+  conservative setting.
+* **Screen wide, then measure; do not screen tight and hope.** The tight dedup
+  (1 per field, 2 per dataset, 3 per shape) left 41 candidates, and 28 of the 33
+  non-reversal ones measured over 0.5. Widening to 171 and measuring every one
+  found candidates the tight caps had discarded — Sharpe 2.25 / 2Y 3.22 and
+  Sharpe 2.41 / ladder 2.58 among them — and a greedy pick (take the best, add it
+  to the book, recompute the rest) gave **15 alphas that are mutually compatible**
+  at ≥ 0.10 under both limits. The order matters: fix what is already verified
+  and tagged into the book *first*, or a higher-Sharpe newcomer displaces it.
+* **The earlier batch of 52 was not deduped, and it shows.** Listed with
+  `GET /users/self/alphas?status=UNSUBMITTED&tag=PowerPoolSelected` (the singular
+  `tag` filters; `tags` is silently ignored and returns everything), 50 remain
+  tagged. Many are copies of each other with identical correlation numbers (six on
+  `inst6_num_of_institutional_holders`, five on `search_interest_1y_corporate_name`),
+  and about half are variants of the four already submitted, at **correlation
+  1.000** with them. Only a handful clear 0.5.
+* **BRAIN correlates over the last four years, and the book is the WHOLE book.**
+  `scripts/corr_powerpool.py` recomputes each candidate's correlation from PnL
+  against every ACTIVE alpha — Power Pool ones (limit 0.5) and regular ones
+  (`SELF_CORRELATION`, limit 0.7) — with `correlate.aligned_corr(years=4)`. The
+  window is the finding: Pearson on daily PnL *changes* over the last four calendar
+  years reproduces BRAIN's own numbers **to four decimals, eleven times** (`SELF`
+  0.3434, `POWER_POOL` 0.3365, 0.1637, 0.7162 and seven earlier `/check` values such
+  as 0.6258, 0.5404, 0.4797, 0.4938); the whole 10-year history read 0.03–0.05
+  **low** every time — the unsafe direction for a "too correlated?" gate. One
+  number does not reproduce (`SELF_CORRELATION 0.2271` for one alpha, mine 0.1791),
+  unexplained. Two mistakes this corrected, both mine: the first pass measured
+  candidates against only *that day's* submissions and missed the alphas submitted
+  the day before, so `qMWWmAnK` — a Power Pool alpha that turns out to be the
+  worst-correlated member of the book for almost every candidate — never entered
+  the comparison; and it used the full window. Of 33 recency-healthy, non-reversal
+  candidates, **28 were over 0.5**, several I had called safe (`zqYRPw6o` 0.56,
+  `P07YOQlM` 0.62, `zqYW73a1` 0.62). Run it again immediately before each
+  submission: the book changes with every alpha sent.
+* **Operator/field counts are parsed heuristically** from the expression against
+  the live `/operators` list. Usually right, not a substitute for the counts on
+  the alpha's own page.
+* **No robust-universe check by name.** No check in the live payload obviously
+  maps to it; every check an alpha carries is in the JSON under `all_checks`.
+* **Description phrasing is hand-authored, and the template is narrow.**
+  `tag_powerpool.py`'s `FIELD_CHANNEL` maps each field to a sentence about what
+  it measures; a field it doesn't know gets a vaguer description and a warning.
+  Worse, the template's Idea sentence is "when the field changes, price follows",
+  which misstates any alpha that is not a field-change signal — e.g. the
+  `-ts_regression(returns, x, 126, rettype=0)` reversal family, where the idea is
+  that the part of returns a field cannot explain tends to revert. Use
+  `--descriptions FILE` (`{alpha_id: text}`) for those. Every description, template
+  or hand-written, is validated before anything is PATCHed: the three headers
+  (`Idea:`, `Rationale for data used:`, `Rationale for operators used:`) in order,
+  and at least 100 characters.
+* **Verify a write by reading it back, and know what "absent" means.** Before
+  tagging, `/check` lists `POWER_POOL_DESCRIPTION_LENGTH` and `_FORMAT` as
+  `WARNING`; after a compliant description they are simply no longer listed.
+  That is the expected outcome, but it is absence, not an explicit `PASS`.
+* **`rettype=0` is confirmed.** BRAIN's operator record only says "returns various
+  parameters"; the operator's documentation page (`GET /operators/ts_regression`)
+  gives the table, and `0` is **Error Term** (`1` intercept, `2` slope, `3`
+  y-estimate, `4` SSE, `5` SST, `6` R², …). The old caveat in Part 5 is settled.
+* **`--descriptions` does not fix the field lookup.** On 2026-09-20 the template
+  path's `data_fields(search=…)` calls returned `400 maximum offset + limit for
+  search query is 100`, so template descriptions would read "(說明未取得)" for
+  every field. It was not failing on 2026-09-19 (the four submitted Power Pool
+  alphas have full descriptions). Not yet fixed.
+* **A "pure" Power Pool alpha is one that fails the Regular bar,** and once
+  tagged BRAIN shows its would-be failures as `WARNING` (`PROD_CORRELATION 0.7285`
+  against a 0.70 limit, seen live). Docs §3 say such an alpha must also match the
+  *current* Power Pool theme, and `MATCHES_THEMES` read `WARNING` — but it did not
+  block: `omqbbG2v` went `ACTIVE` on 2026-09-20 that way, classified `Power Pool
+  Alpha` + `Cluster Alpha`, as did the four on 2026-09-19. Two observations, not a
+  rule.
+* **That `WARNING` is conditional on staying Power Pool eligible.** `qMjaRoNP`
+  (Sharpe 2.85) was tagged with `LOW_FITNESS 0.97`, `CLUSTER_TEST 1.06` and
+  `PROD_CORRELATION 0.74` all shown as warnings. It had passed
+  `POWER_POOL_CORRELATION` (0.17) — until `omqbbG2v`, a same-shape alpha with
+  daily-return correlation 0.7162, joined the pool. At submission the check
+  recomputed to **0.7162** against the 0.5 limit, its Sharpe was not 10% above
+  `omqbbG2v`'s 3.01 so the exemption did not apply, it stopped counting as a Power
+  Pool alpha, and the Regular bar returned: `LOW_FITNESS` and `PROD_CORRELATION`
+  became **FAIL** and the submit came back `403`. The shape cap and the pairwise
+  PnL check exist to catch exactly this *before* a slot is spent.
+* **"In order to submit this alpha, you have to add an alpha description
+  following the given template"** is BRAIN's web UI refusing to submit an
+  untagged, undescribed alpha — no API attempt is made (`GET /alphas/{id}/submit`
+  is `404`, versus `403` with a check list for a real rejection). The fix is the
+  tag and description step, but check the alpha first: it is the last thing to
+  do, not the first, and it is easy to describe an alpha that should not be sent.
+* **`/check` is cached; the submit attempt is not.** After `omqbbG2v` was
+  submitted, `/check` on `qMjaRoNP` still said `POWER_POOL_CORRELATION PASS 0.1691`
+  and `REGULAR_SUBMISSION 0/4`, while the submit attempt saw `0.7162` and `3/4`.
+  A candidate's `/check` does not update when the pool changes under it, so
+  recompute pairwise correlation against what is *now* in the book before
+  trusting a PASS. A rejected attempt's checks can be read back with
+  `GET /alphas/{id}/submit` (it returns the `403` body with the check list at
+  rejection time) — that is where the real reason lives.
+* **Diversity still applies.** Piling every pick into one pyramid helps neither
+  Genius (which counts distinct completed pyramids) nor the Dynamic Pyramid
+  Multiplier (which rewards under-used ones); `check_powerpool.py` prints each
+  candidate's pyramids for that reason.
 
 ### Sources
 
