@@ -35,15 +35,33 @@ def daily_returns(dates: Sequence[str], cum_pnl: Sequence[float]
     return list(dates[1:]), np.diff(v)
 
 
+# BRAIN measures alpha-vs-alpha correlation (SELF_CORRELATION, and the Power Pool
+# correlation) on the LAST FOUR YEARS of daily PnL changes, not the whole
+# history. Established 2026-09-20 by reproducing BRAIN's own reported numbers to
+# four decimals -- 0.3434 / 0.3365 / 0.1637 / 0.7162 -- from PnL series fetched
+# for the same alphas; the full 10-year window read 0.03-0.05 LOW on every one of
+# them, which is the unsafe direction for a "is this too correlated" gate.
+BRAIN_CORR_YEARS = 4
+
+
 def aligned_corr(a: tuple[list[str], np.ndarray],
-                 b: tuple[list[str], np.ndarray]) -> float:
-    """Pearson correlation of two daily-return series on their shared dates."""
+                 b: tuple[list[str], np.ndarray], *,
+                 years: int | None = None) -> float:
+    """Pearson correlation of two daily-return series on their shared dates.
+
+    `years` keeps only the last N calendar years of the overlap (a window that
+    starts on Jan 1 of `last_year - N + 1`); pass BRAIN_CORR_YEARS to match what
+    the platform reports. Default None = the whole overlap, as before.
+    """
     da, va = a
     db, vb = b
     if va.size == 0 or vb.size == 0:
         return 0.0
     idx = {d: i for i, d in enumerate(da)}
     common = [(idx[d], j) for j, d in enumerate(db) if d in idx]
+    if years is not None and common:
+        cutoff = f"{int(max(db[j] for _, j in common)[:4]) - years + 1}-01-01"
+        common = [(i, j) for i, j in common if db[j] >= cutoff]
     if len(common) < 60:                       # < ~3 months of overlap
         return 0.0
     ia = np.array([i for i, _ in common])
