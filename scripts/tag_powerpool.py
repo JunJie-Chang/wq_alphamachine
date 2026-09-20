@@ -7,6 +7,16 @@ eligible=True and verified=True are touched). Never overwrites an alpha that
 already has a tag or description -- those are left untouched and reported.
 
     python3 scripts/tag_powerpool.py /tmp/pp_full.json [--dry-run] [--limit N]
+    python3 scripts/tag_powerpool.py report.json --descriptions hand_written.json
+
+`--descriptions` maps alpha_id -> a description you wrote yourself, used instead
+of the template. The template's Idea sentence is "when <field> changes, price
+follows", which is wrong for any alpha that is not a field-change signal (a
+residual-of-returns reversal, a rank spread, ...) -- and a Power Pool
+description that misstates the mechanism is worse than a short one. Every
+description, template or hand-written, is validated before anything is PATCHed:
+all three section headers present and at least 100 characters (the two checks
+BRAIN itself runs as POWER_POOL_DESCRIPTION_FORMAT / _LENGTH).
 """
 from __future__ import annotations
 
@@ -58,6 +68,42 @@ CROSS_PHRASE = [
 ]
 
 
+REQUIRED_HEADERS = ("Idea:", "Rationale for data used:", "Rationale for operators used:")
+MIN_DESCRIPTION_CHARS = 100
+
+
+def validate_description(desc: str) -> list[str]:
+    """Problems that would make BRAIN's own description checks warn. Empty = ok."""
+    problems = [f"missing section header {h!r}" for h in REQUIRED_HEADERS if h not in desc]
+    if len(desc) < MIN_DESCRIPTION_CHARS:
+        problems.append(f"{len(desc)} chars < {MIN_DESCRIPTION_CHARS}")
+    order = [desc.find(h) for h in REQUIRED_HEADERS]
+    if all(i >= 0 for i in order) and order != sorted(order):
+        problems.append("sections out of order (Idea, data, operators)")
+    return problems
+
+
+def select_candidates(data: list[dict], include_unverified: bool = False) -> list[dict]:
+    """Records to tag. Default: eligible AND verified (every server gate resolved).
+
+    `include_unverified` also admits eligible records whose ONLY unresolved gate is
+    POWER_POOL_CORRELATION. BRAIN computes that lazily and, after the pool changes
+    or a burst of /check calls, can leave it PENDING for hours; tagging is
+    reversible and does not consume a submission slot, so it is allowed -- but the
+    correlation must then have been measured another way (corr_powerpool.py).
+    Any other pending or failed gate still excludes the record.
+    """
+    out = []
+    for r in data:
+        if not r.get("eligible"):
+            continue
+        if r.get("verified"):
+            out.append(r)
+        elif include_unverified and set(r.get("pending_gates") or []) <= {"POWER_POOL_CORRELATION"}:
+            out.append(r)
+    return out
+
+
 def build_description(fields: list[str], operators: list[str],
                        field_descs: dict[str, str], op_descs: dict[str, dict]) -> str:
     field_lines = [f"- {f}: {field_descs.get(f, '(說明未取得)')}" for f in fields]
@@ -86,7 +132,23 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                      help="build and print descriptions but do not PATCH anything")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--include-unverified", action="store_true",
+                    help="also tag eligible records whose only unresolved gate is "
+                         "POWER_POOL_CORRELATION (measure it with corr_powerpool.py)")
+    ap.add_argument("--descriptions", default=None,
+                    help="JSON {alpha_id: description}; used instead of the "
+                         "template for those alphas")
     args = ap.parse_args()
+
+    custom: dict[str, str] = {}
+    if args.descriptions:
+        custom = json.load(open(args.descriptions))
+        bad = {a: validate_description(d) for a, d in custom.items()
+               if validate_description(d)}
+        if bad:
+            print(f"refusing: hand-written description(s) fail validation: {bad}",
+                  file=sys.stderr)
+            return 2
 
     _load_env()
     email = os.environ.get("WQ_EMAIL", "")
@@ -103,7 +165,11 @@ def main() -> int:
         return 1
 
     data = json.load(open(args.report))
-    candidates = [r for r in data if r.get("eligible") and r.get("verified")]
+    candidates = select_candidates(data, args.include_unverified)
+    unverified = [r["alpha_id"] for r in candidates if not r.get("verified")]
+    if unverified:
+        print(f"NOTE: {len(unverified)} candidate(s) have POWER_POOL_CORRELATION "
+              f"still PENDING at BRAIN: {unverified}", file=sys.stderr)
     if args.limit:
         candidates = candidates[: args.limit]
     print(f"{len(candidates)} verified candidate(s) to process.\n", file=sys.stderr)
@@ -145,7 +211,14 @@ def main() -> int:
                   f"tags={existing_tags} or a description)", file=sys.stderr)
             continue
 
-        desc = build_description(r["fields"], r["operators"], field_descs, op_descs)
+        desc = custom.get(aid) or build_description(
+            r["fields"], r["operators"], field_descs, op_descs)
+        problems = validate_description(desc)
+        if problems:
+            errors.append((aid, f"description fails validation: {problems}"))
+            print(f"  [{i+1}/{len(candidates)}] {aid}: NOT WRITTEN, {problems}",
+                  file=sys.stderr)
+            continue
         if args.dry_run:
             print(f"\n===== {aid} (dry run) =====\n{desc}\n", file=sys.stderr)
             written.append(aid)
