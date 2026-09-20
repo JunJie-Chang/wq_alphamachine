@@ -53,7 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from alphamachine.cli import _load_env
 from alphamachine.client import AuthError, BiometricRequired, BrainClient
-from alphamachine.metrics import check_result, check_value, extract
+from alphamachine.metrics import check_limit, check_result, check_value, extract
 
 GROUP_FIELDS = {"country", "industry", "subindustry", "currency", "market",
                 "sector", "exchange"}
@@ -174,6 +174,28 @@ def gate_status(checks: list[dict]) -> dict:
     return {name: check_result(checks, name) for name in SERVER_GATES}
 
 
+def recency(checks: list[dict]) -> dict:
+    """Has the signal held up lately? BRAIN's own evidence, judged on the VALUE.
+
+    Every other number in a screening report is a whole-period aggregate, so a
+    signal that earned Sharpe 3 in its first years and nothing since ranks at the
+    top of a list sorted by Sharpe. BRAIN sends exactly one of two recency checks
+    per alpha -- LOW_2Y_SHARPE (trailing two years) or IS_LADDER_SHARPE -- each
+    with its own per-alpha limit. The result STRING is not to be trusted here: at
+    simulation time it reads WARNING, and only /check flips it to FAIL. Compare
+    the value to the limit. ok is None when BRAIN sent neither (unknown, not fine).
+    """
+    for kind, name, default in (("2Y", "LOW_2Y_SHARPE", 1.58),
+                                ("LADDER", "IS_LADDER_SHARPE", None)):
+        v = check_value(checks, name)
+        if v is None:
+            continue
+        lim = check_limit(checks, name) or default
+        return {"kind": kind, "value": v, "limit": lim,
+                "ok": None if lim is None else v >= lim}
+    return {"kind": None, "value": None, "limit": None, "ok": None}
+
+
 def evaluate(alpha: dict, operator_names: set[str]) -> dict:
     rec = extract(alpha)
     checks = rec["checks"]
@@ -215,6 +237,8 @@ def evaluate(alpha: dict, operator_names: set[str]) -> dict:
         "fields": sorted(fields),
         "power_pool_correlation": pp_corr,
         "pyramids": pyramid_names(checks),
+        "recency": recency(checks),
+        "test_sharpe": rec.get("test_sharpe"),
         "gates": gates,
         "pending_gates": pending_gates,
         "description_needs_work": description_needs_work,
@@ -302,8 +326,11 @@ def main() -> int:
 
     if args.from_file:
         results = json.load(open(args.from_file))
-        eligible = sorted((r for r in results if r["eligible"]),
-                          key=lambda r: -(r["sharpe"] or 0))
+        # Keep the FILE's order. dedup_powerpool.py writes it deliberately
+        # interleaved across pyramids so that `--top N` is a spread; re-sorting
+        # by Sharpe here would silently undo that and spend the whole slice on
+        # whichever pyramid has the most candidates.
+        eligible = [r for r in results if r["eligible"]]
         _load_env()
         email = os.environ.get("WQ_EMAIL", "")
         password = os.environ.get("WQ_PASSWORD", "")
