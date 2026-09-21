@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 413 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 426 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -893,6 +893,10 @@ python3 scripts/dedup_powerpool.py pp.json --against pp_active.json \
 #     this measures, and they threw away good candidates (see below).
 python3 scripts/corr_powerpool.py --from-file pp_dedup_wide.json --top 200 --json > corr.json
 
+# 2c. choose the next batch: greedy (each pick joins the book before the next is
+#     judged), pyramid-aware. Shows which picks still need a tag + description.
+python3 scripts/corr_powerpool.py --from-file pp_dedup_wide.json --top 400 --pick 4
+
 # 3. deep-verify a small slice of the deduped list. The output order already
 #    spreads pyramids, so --top N is a spread, not just the N highest Sharpes.
 #    --from-file re-reads a saved report without re-fetching.
@@ -1013,6 +1017,23 @@ platform before relying on it.
   `inst6_num_of_institutional_holders`, five on `search_interest_1y_corporate_name`),
   and about half are variants of the four already submitted, at **correlation
   1.000** with them. Only a handful clear 0.5.
+* **Pick by pyramid progress, not by Sharpe alone.** A pyramid (region × delay × dataset
+  category) counts toward Genius tier only once it holds 3 alphas, and Expert needs 10
+  such pyramids. The Power Pool alphas submitted by 2026-09-20 sat in two pyramids
+  (OTHER 4, MODEL 3, PV 2, ANALYST 1), and the four prepared for the next day put two more
+  into the already-full MODEL. `corr_powerpool.py --pick N` chooses a batch greedily —
+  best remaining, add it to the book, re-measure the rest against the grown book — with
+  Sharpe plus a tilt for **progress toward completing a pyramid**
+  (`config.PYRAMID_PICK_WEIGHT` × (k+1)/3 for taking one from k to k+1). The hard floors
+  (Sharpe ≥ 1.0, recent performance not decayed, the correlation margins) apply first and
+  are never traded against the tilt. The first version gave a flat credit per pyramid
+  touched, which ranked "0 → 1 in a new pyramid" level with "2 → 3"; only the latter changes
+  the number of formulated pyramids. On the real book, ANALYST sat at 2 with exactly one
+  feasible candidate, which lost to a 0 → 1 pick until the credit became proportional to
+  progress. With it, the same pool yields a batch that takes formulated pyramids from 4 to
+  5. The weight is a judgement ("completing a pyramid ≈ one Sharpe point"), not a
+  measurement; the tool prints every pick's Sharpe so a 1.03 that only completes a pyramid
+  is visible as what it is.
 * **BRAIN correlates over the last four years, and the book is the WHOLE book.**
   `scripts/corr_powerpool.py` recomputes each candidate's correlation from PnL
   against every ACTIVE alpha — Power Pool ones (limit 0.5) and regular ones
@@ -1055,11 +1076,16 @@ platform before relying on it.
   parameters"; the operator's documentation page (`GET /operators/ts_regression`)
   gives the table, and `0` is **Error Term** (`1` intercept, `2` slope, `3`
   y-estimate, `4` SSE, `5` SST, `6` R², …). The old caveat in Part 5 is settled.
-* **`--descriptions` does not fix the field lookup.** On 2026-09-20 the template
-  path's `data_fields(search=…)` calls returned `400 maximum offset + limit for
-  search query is 100`, so template descriptions would read "(說明未取得)" for
-  every field. It was not failing on 2026-09-19 (the four submitted Power Pool
-  alphas have full descriptions). Not yet fixed.
+* **The template's field lookup works; its `400` is log noise.** `tag_powerpool.py`
+  looks each field up with `data_fields(search=…)`, and `_paged` asks for a second page
+  the server refuses (`400 maximum offset + limit for search query is 100`), logs it,
+  and returns the first 100 hits — which is enough. Verified 2026-09-21 by dry-running
+  the template on an untagged alpha: it wrote the real field description and the real
+  operator definitions. (An earlier version of this note, and a commit message, said
+  template descriptions would read "(說明未取得)" for every field. That was inferred
+  from the log line and never tested; it is wrong.) The residual risk is narrower and
+  unverified: if a field's exact id is not among the first 100 search hits the lookup
+  falls back to `results[0]`, which could be another field's description.
 * **A "pure" Power Pool alpha is one that fails the Regular bar,** and once
   tagged BRAIN shows its would-be failures as `WARNING` (`PROD_CORRELATION 0.7285`
   against a 0.70 limit, seen live). Docs §3 say such an alpha must also match the
