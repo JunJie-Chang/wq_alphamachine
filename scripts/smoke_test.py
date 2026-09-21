@@ -2888,6 +2888,73 @@ _ex43(_SF43("simulate [400]: Invalid data field foo"))._bundle([_id3])
 check("regression guard: a genuine failure is STILL recorded as ERROR",
       _st43.conn().execute("SELECT status FROM sims WHERE candidate_id=?", (_id3,)).fetchone()[0] == "ERROR")
 
+# --- repairing the capacity-error rows, and re-running what they held back ----
+import sqlite3 as _sq44
+import repair_capacity_errors as RC44
+from alphamachine import cli as _cli44
+_db44 = os.path.join(tempfile.mkdtemp(), "rep.db"); _st44 = Store(_db44)
+_CAP44 = 'simulate [429]: {"detail":"CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}'
+def _add44(n, parent=None, theme="t1"):
+    return _st44.add_candidate(expr=f"rank(r{n})", settings=SimSettings().payload(), theme=theme,
+                               template="tp", field=f"r{n}", stage="refine" if parent else "scan",
+                               parent_id=parent)
+_root = _add44(0); _st44.record_sim(_root, {"status": "OK", "sharpe": 1.2})
+_s1, _s2 = _add44(1), _add44(2, theme="t2")                  # scan, poisoned
+_v1 = _add44(3, parent=_root)                                # refine variant, poisoned
+_bad = _add44(4)                                             # a GENUINE error
+_okv = _add44(5, parent=_root); _st44.record_sim(_okv, {"status": "OK", "sharpe": 0.9})
+for _c in (_s1, _s2, _v1):
+    _st44.record_sim(_c, {"status": "ERROR", "error": _CAP44})
+_st44.record_sim(_bad, {"status": "ERROR", "error": "Invalid data field foo"})
+_st44.conn().executemany("INSERT OR REPLACE INTO arms(arm,trials,scan_trials,scan_pass) VALUES (?,?,?,?)",
+                         [("t1::tp", 10, 8, 3), ("t2::tp", 1, 1, 1)]); _st44.conn().commit()
+_cn44 = _sq44.connect(_db44, isolation_level=None)
+_before = _cn44.execute("SELECT COUNT(*) FROM sims").fetchone()[0]
+_pl = RC44.plan(_cn44)
+check("repair plan: exactly the capacity rows, split by stage, scan-origin per arm",
+      _pl["total"] == 3 and _pl["by_stage"] == {"scan": 2, "refine": 1}
+      and _pl["per_arm"] == {"t1::tp": 1, "t2::tp": 1}, str(_pl))
+check("repair dry run (plan) writes nothing", _cn44.execute("SELECT COUNT(*) FROM sims").fetchone()[0] == _before)
+check("before repair: no incomplete ladders (the poisoned variant HAS a row)",
+      _st44.incomplete_lineage_roots() == set())
+_ap = RC44.apply(_cn44, "sims_capacity_errors_test")
+_arms = dict((a, (t, st, sp)) for a, t, st, sp in _cn44.execute("SELECT arm,trials,scan_trials,scan_pass FROM arms"))
+check("repair deletes only the capacity rows; the genuine ERROR and OK rows stay",
+      _ap["applied"] and _cn44.execute("SELECT COUNT(*) FROM sims").fetchone()[0] == _before - 3
+      and _cn44.execute("SELECT status FROM sims WHERE candidate_id=?", (_bad,)).fetchone()[0] == "ERROR")
+check("repair keeps a restorable copy of every deleted row",
+      _cn44.execute("SELECT COUNT(*) FROM sims_capacity_errors_test").fetchone()[0] == 3)
+check("repair subtracts scan trials per arm and never below scan_pass",
+      _arms["t1::tp"] == (9, 7, 3) and _arms["t2::tp"] == (0, 1, 1), str(_arms))
+check("repair records what it did in kv",
+      json.loads(_cn44.execute("SELECT v FROM kv WHERE k='repair_capacity_errors'").fetchone()[0])["total"] == 3)
+check("repair run twice is a no-op", RC44.apply(_cn44, "sims_capacity_errors_test")["applied"] is False
+      and _cn44.execute("SELECT COUNT(*) FROM sims_capacity_errors_test").fetchone()[0] == 3)
+check("after repair the poisoned scan candidates are pending again, the genuine error is not",
+      {r["id"] for r in _st44.pending("scan")} == {_s1, _s2})
+check("after repair the ladder missing its variant is found by incomplete_lineage_roots",
+      _st44.incomplete_lineage_roots() == {_root})
+
+class _FakeEx44:
+    seen = None
+    def __init__(self, cfg, store): pass
+    def reclaim(self): return {"reclaimed": 0, "still_running": 0, "lost": 0}
+    def run(self, ids, on_result=None):
+        _FakeEx44.seen = list(ids); return {"ok": 0, "error": 0, "skipped": 0, "deferred": 0}
+_saved44 = (_cli44._setup, _cli44.Executor, _cli44.generate)
+_cli44._setup = lambda a: (RunConfig(), _st44, None)
+_cli44.Executor = _FakeEx44
+_cli44.generate = lambda *a, **k: (_ for _ in ()).throw(AssertionError("generate must not run"))
+try:
+    with open(os.devnull, "w") as _dn:
+        import contextlib as _cxx44
+        with _cxx44.redirect_stdout(_dn):
+            _cli44.main(["scan", "--pending", "--budget", "50"])
+finally:
+    _cli44._setup, _cli44.Executor, _cli44.generate = _saved44
+check("scan --pending dispatches exactly the pending scan candidates, never generates new ones",
+      sorted(_FakeEx44.seen or []) == sorted([_s1, _s2]), str(_FakeEx44.seen))
+
 import io as _io41, contextlib as _cx41
 from alphamachine import cli as _cli41
 # (an earlier section replaces subprocess.Popen with a fake, so drive argparse directly)

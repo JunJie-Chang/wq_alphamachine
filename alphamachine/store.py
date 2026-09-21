@@ -889,6 +889,22 @@ class Store:
             cur = row["parent_id"]
         return cur
 
+    def incomplete_lineage_roots(self) -> set[str]:
+        """Roots of every ladder that has a refine variant with no simulation record
+        and nothing in flight -- a rung whose champion was elected without it.
+
+        Such variants exist when a record was removed (e.g. the capacity-error repair,
+        scripts/repair_capacity_errors.py) or a run died between registering and
+        dispatching. `refine --redo-incomplete` re-ladders exactly these.
+        """
+        rows = self.conn().execute(
+            "SELECT c.id FROM candidates c"
+            " LEFT JOIN sims s ON s.candidate_id=c.id"
+            " LEFT JOIN inflight f ON f.candidate_id=c.id"
+            " WHERE c.parent_id IS NOT NULL AND s.candidate_id IS NULL"
+            "   AND f.candidate_id IS NULL").fetchall()
+        return {self.lineage_root(r["id"]) for r in rows}
+
     def claim_bandit_trial(self, stage: str, key: str, arm: str = "") -> bool:
         """Claim the right to count this trial. True only for the first caller.
 

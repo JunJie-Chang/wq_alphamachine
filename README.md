@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 434 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 445 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -728,9 +728,16 @@ variants that were never simulated. `simulate()` now waits for a slot (polling e
 for up to 20 min) and only then raises `SlotsBusy`, which the Executor **defers**: no
 `sims` row is written, the candidate stays pending, `stats["deferred"]` counts it, and
 `on_result` is never called. A genuine failure (HTTP 400, an invalid field) is still a
-plain `SimulationFailed` and still recorded. The 21k historical rows and the arm counters
-they inflated are **not repaired by this change**; see the repair note in the commit
-history. Throughput at 13 slots: ~1,500–1,800 alphas/hour, against ~127 at 3.
+plain `SimulationFailed` and still recorded. Repairing the existing rows is a separate, explicit step:
+`scripts/repair_capacity_errors.py` (dry run by default, `--apply` to act) copies every
+matching row to a backup table, subtracts the scan-origin ones from their arms'
+`scan_trials`, deletes them in one transaction and records the counts in kv. It matches
+only this exact error and is idempotent. Then re-run the held-back work with
+`scan --pending --budget N` (re-dispatches existing scan candidates with no record —
+`generate()` only ever makes new ones) and `refine --redo-incomplete --top N` (re-ladders
+only ladders with an unsimulated variant; variants on file are replayed, not re-paid).
+As with `--redo`, a ladder that elects a new champion marks it `gated` without un-marking
+the old one, and its gate verdict was already taught to the bandit once per lineage. Throughput at 13 slots: ~1,500–1,800 alphas/hour, against ~127 at 3.
 
 ### Where the quality actually comes from
 

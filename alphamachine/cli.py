@@ -88,15 +88,22 @@ def cmd_catalog(args):
 
 def cmd_scan(args):
     cfg, store, client = _setup(args)
-    cat = Catalog(client, cfg.cache_dir)
-    fields = cat.usable(cat.fields(region=args.region, delay=args.delay,
-                                   universe=args.universe))
-    fields = cat.stratified_sample(fields, per_dataset=args.per_dataset)
-    print(f"sampling from {len(fields)} fields across "
-          f"{len(cat.by_dataset(fields))} datasets")
-
-    ids = generate(store, fields, budget=args.budget,
-                   base=_base_settings(args), seed=args.seed)
+    if getattr(args, "pending", False):
+        # Re-dispatch scan candidates that exist but have no simulation record.
+        # generate() only ever makes NEW candidates, so without this nothing would
+        # run them again -- e.g. the ones scripts/repair_capacity_errors.py returned
+        # to the queue after they were wrongly recorded as ERROR.
+        ids = [r["id"] for r in store.pending("scan", limit=args.budget)]
+        print(f"re-dispatching {len(ids)} pending scan candidate(s)")
+    else:
+        cat = Catalog(client, cfg.cache_dir)
+        fields = cat.usable(cat.fields(region=args.region, delay=args.delay,
+                                       universe=args.universe))
+        fields = cat.stratified_sample(fields, per_dataset=args.per_dataset)
+        print(f"sampling from {len(fields)} fields across "
+              f"{len(cat.by_dataset(fields))} datasets")
+        ids = generate(store, fields, budget=args.budget,
+                       base=_base_settings(args), seed=args.seed)
     if not ids:
         print("nothing new to scan (everything already simulated)")
         return
@@ -222,11 +229,24 @@ def cmd_refine(args):
     # would otherwise be re-picked by every later run -- costing no simulation
     # quota (already_simulated dedupes) but spending the --top budget on
     # finished work while lower-ranked survivors never get a turn.
-    fresh = ("" if getattr(args, "redo", False) else
-             " AND NOT EXISTS (SELECT 1 FROM candidates k WHERE k.parent_id=c.id)")
-    rows = store.sims_where(
-        "s.status='OK' AND abs(s.sharpe) >= ? AND c.stage='scan'" + fresh +
-        " ORDER BY abs(s.sharpe) DESC LIMIT ?", (g.scan_abs_sharpe, args.top))
+    if getattr(args, "redo_incomplete", False):
+        # Only ladders with a variant that has no simulation record: a rung that
+        # elected its champion without it. Ranked like any refine run; the
+        # variants already on file are replayed, not re-paid.
+        roots = sorted(store.incomplete_lineage_roots())
+        print(f"{len(roots)} ladder(s) have an unsimulated variant")
+        rows = []
+        for i in range(0, len(roots), 500):
+            chunk = roots[i:i + 500]
+            rows += store.sims_where(
+                f"s.status='OK' AND c.id IN ({','.join('?' * len(chunk))})", chunk)
+        rows = sorted(rows, key=lambda r: -abs(r["sharpe"] or 0))[:args.top]
+    else:
+        fresh = ("" if getattr(args, "redo", False) else
+                 " AND NOT EXISTS (SELECT 1 FROM candidates k WHERE k.parent_id=c.id)")
+        rows = store.sims_where(
+            "s.status='OK' AND abs(s.sharpe) >= ? AND c.stage='scan'" + fresh +
+            " ORDER BY abs(s.sharpe) DESC LIMIT ?", (g.scan_abs_sharpe, args.top))
     if not rows:
         print("no un-refined scan survivors -- run `scan`, or pass --redo "
               "to re-ladder ones already done")
@@ -942,6 +962,9 @@ def main(argv=None):
     s = sub.add_parser("scan")
     s.add_argument("--budget", type=int, default=200)
     s.add_argument("--per-dataset", type=int, default=8)
+    s.add_argument("--pending", action="store_true",
+                   help="re-dispatch existing scan candidates with no simulation "
+                        "record (up to --budget) instead of generating new ones")
     s.set_defaults(fn=cmd_scan)
 
     s = sub.add_parser("refine")
@@ -950,6 +973,9 @@ def main(argv=None):
                    help="also re-ladder candidates already refined; costs no "
                         "simulation quota (variants are deduped) but can pick "
                         "a different champion after a Gates change")
+    s.add_argument("--redo-incomplete", action="store_true",
+                   help="re-ladder only ladders that have a variant with no "
+                        "simulation record (up to --top)")
     s.set_defaults(fn=cmd_refine)
 
     s = sub.add_parser("select"); s.add_argument("--n", type=int, default=10)
