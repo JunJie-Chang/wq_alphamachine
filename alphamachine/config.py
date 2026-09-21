@@ -333,6 +333,20 @@ PYRAMID_SCORE_WEIGHT = 0.15
 # Tier sets the biometric re-auth interval (Gold 4h -> GM 24h), which is an
 # operational cost, not only a payout one.
 PYRAMID_MIN_ALPHAS = 3
+# What COMPLETING a pyramid is worth when picking the next batch to submit
+# (scripts/corr_powerpool.py --pick), in Sharpe points. A pyramid counts toward Genius
+# tier only at PYRAMID_MIN_ALPHAS alphas, so the reward is by PROGRESS: an alpha that
+# takes a pyramid from k to k+1 earns weight * (k+1)/PYRAMID_MIN_ALPHAS -- a third of the
+# weight for the first, two thirds for the second, all of it for the one that crosses the
+# line. Flat credit per advance ranked "0 -> 1 in a new pyramid" level with "2 -> 3",
+# though only the latter changes the number of formulated pyramids (found on the real
+# book: ANALYST sat at 2 with one feasible candidate, which lost to a 0 -> 1). A pyramid
+# already at the threshold adds nothing, so another alpha there is worth its Sharpe alone.
+# A PREFER, like PYRAMID_SCORE_WEIGHT above: it breaks near-ties and steers, and the hard
+# Sharpe / recency / correlation floors apply first, so it can never buy a broken alpha.
+# 1.0 is a judgement, not a measurement ("completing a pyramid is worth about one point
+# of Sharpe"); raise it to spread harder, 0 to ignore pyramids.
+PYRAMID_PICK_WEIGHT = 1.0
 GENIUS_PYRAMIDS = {"EXPERT": 10, "MASTER": 30, "GRAND_MASTER": 60}
 
 

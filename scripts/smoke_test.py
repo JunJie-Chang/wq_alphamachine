@@ -2757,6 +2757,71 @@ check("status: a candidate that can never pass is flagged (turnover 1.299 was li
       "turnover>0.7" in ST41.blockers(3.05, 1.16, 1.299, _G41())
       and ST41.blockers(2.0, 1.2, 0.3, _G41()) == [])
 
+# --- pick_batch: greedy, pyramid-aware, floors are never traded off ----------
+import corr_powerpool as CP42
+from collections import Counter as _Ctr42
+_rng42 = np.random.default_rng(11)
+_dates42 = [f"{y}-{m:02d}-{d:02d}" for y in range(2014, 2024) for m in range(1, 13) for d in range(1, 23)]
+def _s42(base=None, noise=1.0):
+    x = _rng42.normal(size=len(_dates42))
+    return (_dates42, x if base is None else base[1] + noise * x)
+_bk42 = _s42(); _bk2_42 = _s42()
+def _c42(aid, sharpe, pyr, rec=True, **kw):
+    return {"alpha_id": aid, "sharpe": sharpe, "pyramids": pyr,
+            "recency": {"ok": rec}, **kw}
+_full = ["USA/D1/MODEL"]; _new = ["USA/D1/ANALYST"]
+_ser42 = {"X": _s42(), "Y": _s42(), "Z": _s42()}
+_pool42 = {"BK": _bk42}; _reg42 = {"RG": _bk2_42}
+_cnt42 = _Ctr42({"USA/D1/MODEL": 3, "USA/D1/ANALYST": 2})   # ANALYST is one alpha from completing
+
+def _ids42(picks): return [p["alpha_id"] for p in picks]
+check("an alpha that COMPLETES a pyramid outranks a slightly better alpha in a full one",
+      _ids42(CP42.pick_batch([_c42("X", 2.0, _full), _c42("Y", 1.7, _new)], _ser42, _pool42, _reg42, _cnt42, 1)) == ["Y"])
+check("...but not a much better one: the tilt breaks near-ties, it does not buy a weak alpha",
+      _ids42(CP42.pick_batch([_c42("X", 3.0, _full), _c42("Y", 1.7, _new)], _ser42, _pool42, _reg42, _cnt42, 1)) == ["X"])
+check("weight 0 ignores pyramids entirely",
+      _ids42(CP42.pick_batch([_c42("X", 2.0, _full), _c42("Y", 1.7, _new)], _ser42, _pool42, _reg42, _cnt42, 1, weight=0.0)) == ["X"])
+
+# Y and Z share a pyramid at 2 of 3; W is in a full one. Picking Y completes it, so Z
+# loses its bonus and W (better Sharpe) comes next.
+_ser42.update({"W": _s42()})
+_two = _Ctr42({"USA/D1/ANALYST": 2, "USA/D1/MODEL": 3})
+_r = CP42.pick_batch([_c42("Y", 1.5, _new), _c42("Z", 1.45, _new), _c42("W", 1.8, _full)],
+                     _ser42, _pool42, _reg42, _two, 3)
+check("counts update after each pick: once a pyramid is complete its bonus is gone",
+      _ids42(_r) == ["Y", "W", "Z"], str(_ids42(_r)))
+# completion is worth more than early progress: 2->3 (full weight) vs 0->1 (a third)
+_ser42.update({"C1": _s42(), "C2": _s42()})
+_prog = _Ctr42({"USA/D1/ANALYST": 2, "USA/D1/SOCIALMEDIA": 0, "USA/D1/MODEL": 3})
+_rp = CP42.pick_batch([_c42("C2", 1.5, ["USA/D1/SOCIALMEDIA"]), _c42("C1", 1.4, ["USA/D1/ANALYST"])],
+                      _ser42, _pool42, _reg42, _prog, 2)
+check("crossing the threshold (2->3) beats a slightly higher-Sharpe alpha that only starts a pyramid (0->1)",
+      _ids42(_rp) == ["C1", "C2"], str(_ids42(_rp)))
+check("a pick records which pyramid it advanced and from what count",
+      _r[0]["advances"] == ["USA/D1/ANALYST"] and _r[0]["counts_before"] == {"USA/D1/ANALYST": 2}
+      and _r[1]["advances"] == [])
+
+# floors
+check("Sharpe under 1.0 is excluded however good its pyramid",
+      CP42.pick_batch([_c42("Y", 0.9, _new)], _ser42, _pool42, _reg42, _cnt42, 1) == [])
+check("a decayed alpha (recency.ok False) is excluded; unknown recency is not",
+      CP42.pick_batch([_c42("Y", 2.0, _new, rec=False)], _ser42, _pool42, _reg42, _cnt42, 1) == []
+      and _ids42(CP42.pick_batch([{"alpha_id": "Y", "sharpe": 2.0, "pyramids": _new}], _ser42, _pool42, _reg42, _cnt42, 1)) == ["Y"])
+_ser42["TWIN"] = _s42(_bk42, noise=0.2)
+check("an alpha nearly identical to one already in the book is excluded",
+      CP42.pick_batch([_c42("TWIN", 2.5, _new)], _ser42, _pool42, _reg42, _cnt42, 1) == [])
+# the pool GROWS: B is fine against the original book but is a twin of A, which is picked first
+_ser42["A"] = _s42(); _ser42["B"] = _s42(_ser42["A"], noise=0.25)
+_r2 = CP42.pick_batch([_c42("A", 2.0, _new), _c42("B", 1.9, _new)], _ser42, _pool42, _reg42, _cnt42, 2)
+check("a twin of an alpha picked earlier in the same batch drops out (the book grows)",
+      _ids42(_r2) == ["A"], str(_ids42(_r2)))
+check("an empty pool is 'nothing to correlate with', not a reason to reject",
+      _ids42(CP42.pick_batch([_c42("Y", 1.5, _new)], _ser42, {}, {}, _cnt42, 1)) == ["Y"])
+check("asking for more than exist returns what cleared the floors, without error",
+      len(CP42.pick_batch([_c42("Y", 1.5, _new)], _ser42, _pool42, _reg42, _cnt42, 5)) == 1)
+check("pyramid_coverage counts pyramids at or above the formulated threshold",
+      CP42.pyramid_coverage(_Ctr42({"a": 3, "b": 2, "c": 5})) == 2)
+
 import io as _io41, contextlib as _cx41
 from alphamachine import cli as _cli41
 # (an earlier section replaces subprocess.Popen with a fake, so drive argparse directly)
