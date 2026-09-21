@@ -803,10 +803,17 @@ class Store:
                       (alpha_id, time.time(), verdict, final_status,
                        json.dumps(detail)))
 
-    def submits_since(self, epoch: float) -> int:
-        return self.conn().execute(
-            "SELECT COUNT(*) n FROM submissions WHERE submitted_at>=? "
-            "AND final_status='ACTIVE'", (epoch,)).fetchone()["n"]
+    def import_submission(self, alpha_id: str, submitted_at: float,
+                          detail: dict) -> bool:
+        """Record a submission made OUTSIDE this pipeline (the web UI, another
+        machine). INSERT OR IGNORE, never REPLACE: a row this pipeline wrote itself
+        carries the verdict and dossier it acted on, and must not be overwritten by
+        a thinner platform-derived one. True if a row was added."""
+        with self.conn() as c:
+            cur = c.execute("INSERT OR IGNORE INTO submissions VALUES (?,?,?,?,?)",
+                            (alpha_id, submitted_at, "SYNCED", "ACTIVE",
+                             json.dumps(detail)))
+            return cur.rowcount == 1
 
     # --------------------------------------------------------------- arms
     def bump_arm(self, arm: str, *, trial=0, scan_trials=0, scan_pass=0,

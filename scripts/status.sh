@@ -7,8 +7,6 @@ cd "$(dirname "$0")/.." || exit 1
 show() {
   echo
   echo "════════════ alphamachine ════════════"
-  r=$(pgrep -af "python3 -m alphamachine" | sed 's/.*alphamachine //' | awk '{print $1}' | head -1)
-  echo "  執行中  : ${r:-(無)}"
   python3 scripts/_status.py
   echo
   echo "  log 檔  : data/logs/"

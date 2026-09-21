@@ -36,7 +36,7 @@ from .metrics import (Verdict, corr_profile, headroom, pnl_series,
                       quality_verdict)
 from .refine import Refiner
 from .store import Store
-from .submit import Submitter
+from .submit import Submitter, sync_active_submissions
 
 
 def _load_env(path: str = ".env") -> None:
@@ -435,6 +435,16 @@ def cmd_submit(args):
                    "Run `gatelog --passing` to see what is blocking candidates.")
         return
     book = fetch_book(client, store)
+    # The daily cap is read from the platform (Submitter.submitted_today), not from
+    # this table. Refreshing the local ledger is bookkeeping and best-effort.
+    try:
+        synced = sync_active_submissions(client, store)
+        if synced["added"]:
+            print(f"recorded {synced['added']} submission(s) made outside this "
+                  f"pipeline (platform ACTIVE: {synced['platform_active']})")
+    except Exception as e:
+        print(f"note: could not refresh the local submissions ledger ({e}); the "
+              f"daily cap is read from the platform and is not affected")
     sub = Submitter(cfg, store, client)
 
     if getattr(args, "auto", False):

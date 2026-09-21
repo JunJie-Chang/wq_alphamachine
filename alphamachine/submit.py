@@ -178,8 +178,13 @@ class Submitter:
     # ------------------------------------------------------------- submit
     def submit(self, alpha_id: str, *, dry_run: bool = True,
                book: CorrelationBook | None = None) -> dict:
-        if self._daily_budget_spent():
-            return {"alpha_id": alpha_id, "skipped": "daily submit budget spent"}
+        try:
+            if self._daily_budget_spent():
+                return {"alpha_id": alpha_id, "skipped": "daily submit budget spent"}
+        except Exception as e:
+            return {"alpha_id": alpha_id,
+                    "skipped": f"could not read today's submissions from the platform "
+                               f"({e}); not submitting on a guess"}
 
         dossier = self.vet(alpha_id, book=book)
         if not dossier["ok"]:
@@ -262,22 +267,25 @@ class Submitter:
                                                       a.get("headroom", 0.0)))
         return [ordered[i:i + n] for i in range(0, len(ordered), n)]
 
+    def _active(self) -> list[dict]:
+        """The platform's own list of your ACTIVE alphas. The daily cap and the
+        quarterly day count are read from THIS -- never from a local counter: a table
+        only this pipeline wrote could not see an alpha sent from the web UI, and
+        undercounted both."""
+        return self.c.my_alphas(status="ACTIVE", limit=100)
+
     def submission_days_this_quarter(self) -> int:
         """Distinct days with at least one live submission, this quarter.
 
         This is the number that gates quarterly payment (>=20) and keeps
         Value Factor off its floor -- it matters more than total alpha count.
+        Read from the platform's `dateSubmitted`, in New York calendar days.
         """
         import datetime as _dt
         now = _dt.datetime.now(timezone.utc)
         q_start = _dt.datetime(now.year, 3 * ((now.month - 1) // 3) + 1, 1,
                                tzinfo=timezone.utc).timestamp()
-        rows = self.store.conn().execute(
-            "SELECT submitted_at FROM submissions WHERE submitted_at>=? "
-            "AND final_status='ACTIVE'", (q_start,)).fetchall()
-        days = {_dt.datetime.fromtimestamp(r["submitted_at"],
-                                           timezone.utc).date() for r in rows}
-        return len(days)
+        return submission_days(self._active(), q_start)
 
     def days_shortfall(self) -> int:
         """How many more submission days this quarter still needs."""
@@ -285,7 +293,12 @@ class Submitter:
                    - self.submission_days_this_quarter())
 
     def submitted_today(self) -> int:
-        return self.store.submits_since(scoring_day_start())
+        """Alphas submitted in the current scoring day, read from the platform.
+
+        The day boundary (`scoring_day_start`) is still the code's own assumption;
+        the platform's REGULAR_SUBMISSION check, read inside server_check, is the
+        authority at the moment of submitting."""
+        return count_submitted_today(self._active())
 
     def remaining_today(self) -> int:
         if not self.cfg.hold_surplus:
@@ -401,11 +414,81 @@ class Submitter:
         return out
 
     def _daily_budget_spent(self) -> bool:
-        used = self.store.submits_since(scoring_day_start())
+        used = self.submitted_today()
         if used >= self.cfg.max_submits_per_day:
             log.info("daily submit budget reached (%d since 3am ET)", used)
             return True
         return False
+
+
+def _et():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("America/New_York")
+    except Exception:                              # no tzdata: approximate EST
+        return timezone(timedelta(hours=-5))
+
+
+def count_submitted_today(alphas: list[dict], day_start: float | None = None) -> int:
+    """How many of these ACTIVE alphas were submitted in the current scoring day,
+    from the platform's own `dateSubmitted`. Pure: pass the list in."""
+    start = scoring_day_start() if day_start is None else day_start
+    n = 0
+    for a in alphas:
+        ds = a.get("dateSubmitted")
+        if ds and datetime.fromisoformat(ds).timestamp() >= start:
+            n += 1
+    return n
+
+
+def submission_days(alphas: list[dict], since_epoch: float | None = None) -> int:
+    """Distinct New York calendar days on which one of these was submitted."""
+    et, days = _et(), set()
+    for a in alphas:
+        ds = a.get("dateSubmitted")
+        if not ds:
+            continue
+        t = datetime.fromisoformat(ds)
+        if since_epoch is not None and t.timestamp() < since_epoch:
+            continue
+        days.add(t.astimezone(et).date())
+    return len(days)
+
+
+def sync_active_submissions(client, store, rows: list[dict] | None = None) -> dict:
+    """Mirror the platform's ACTIVE alphas into the local `submissions` table.
+
+    A HISTORY LEDGER only. Nothing that decides whether to submit reads it any more:
+    the daily cap and the quarterly day count are read straight from the platform
+    (`Submitter._active`, `count_submitted_today`). The table still feeds the
+    Genius-pyramid coverage report (joined to sims) and the status display.
+
+    Insert-only: never overwrites a row the pipeline wrote itself, never deletes.
+    """
+    import datetime as _dt
+    rows = client.my_alphas(status="ACTIVE", limit=100) if rows is None else rows
+    added = already = power_pool = 0
+    for a in rows:
+        cls = [c.get("name") if isinstance(c, dict) else c
+               for c in a.get("classifications") or []]
+        is_pp = "Power Pool Alpha" in cls or "PowerPoolSelected" in (a.get("tags") or [])
+        power_pool += is_pp
+        ds = a.get("dateSubmitted")
+        if not ds:
+            continue                                   # ACTIVE but no timestamp
+        ts = _dt.datetime.fromisoformat(ds).timestamp()
+        if store.import_submission(a["id"], ts, {
+                "source": "platform-sync", "power_pool": is_pp,
+                "classifications": cls, "tags": a.get("tags") or [],
+                "dateSubmitted": ds}):
+            added += 1
+        else:
+            already += 1
+    out = {"platform_active": len(rows), "power_pool": power_pool,
+           "added": added, "already_recorded": already,
+           "submitted_today": count_submitted_today(rows)}
+    store.put("submissions_synced", {"at": time.time(), **out})
+    return out
 
 
 def scoring_day_start() -> float:

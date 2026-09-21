@@ -2669,6 +2669,86 @@ check("a 404 streak is reset by any non-404 answer",
       _client40([_Resp40(404)] * 3 + [_Resp40(200, {}, {"Retry-After": "0"})] + [_Resp40(404)] * 3
                 + [_Resp40(200, _ok40, {"Retry-After": "0"})]).poll("http://x/sim/3", interval=0.0, timeout=30.0) == _ok40)
 
+# --- submissions ledger: the web UI must not be invisible --------------------
+import datetime as _dt41
+from alphamachine.submit import sync_active_submissions as _sync41, scoring_day_start as _sds41
+_st41 = Store(os.path.join(tempfile.mkdtemp(), "led.db"))
+_st41.record_submission("PIPE1", "ACCEPTED", "ACTIVE", {"dossier": "the pipeline's own"})
+_iso_today = (_dt41.datetime.fromtimestamp(_sds41() + 3600, _dt41.timezone.utc)
+              .astimezone(_dt41.timezone(_dt41.timedelta(hours=-4))).isoformat())
+_iso_old = "2026-04-12T03:34:38-04:00"
+class _Fake41:
+    def __init__(self, rows): self.rows = rows
+    def my_alphas(self, **kw): return self.rows
+_rows41 = [
+    {"id": "PIPE1", "dateSubmitted": _iso_old, "classifications": [], "tags": []},
+    {"id": "UI_PP", "dateSubmitted": _iso_today, "tags": ["PowerPoolSelected"],
+     "classifications": [{"name": "Power Pool Alpha"}]},
+    {"id": "UI_REG", "dateSubmitted": _iso_old, "classifications": [{"name": "Single Data Set Alpha"}], "tags": []},
+    {"id": "NO_TS", "dateSubmitted": None, "classifications": [], "tags": []},
+]
+_r41 = _sync41(_Fake41(_rows41), _st41)
+check("sync adds what the pipeline never recorded, skips an ACTIVE row with no timestamp",
+      _r41["added"] == 2 and _r41["already_recorded"] == 1 and _r41["platform_active"] == 4, str(_r41))
+check("sync flags Power Pool from the platform's own classification",
+      _r41["power_pool"] == 1 and _st41.conn().execute(
+          "SELECT json_extract(detail,'$.power_pool') FROM submissions WHERE alpha_id='UI_PP'").fetchone()[0] == 1)
+check("sync NEVER overwrites a row the pipeline wrote itself",
+      _st41.conn().execute("SELECT verdict FROM submissions WHERE alpha_id='PIPE1'").fetchone()[0] == "ACCEPTED")
+check("the submitted_at of a synced row is the platform's timestamp, not 'now'",
+      abs(_st41.conn().execute("SELECT submitted_at FROM submissions WHERE alpha_id='UI_REG'").fetchone()[0]
+          - _dt41.datetime.fromisoformat(_iso_old).timestamp()) < 1)
+check("sync is idempotent", _sync41(_Fake41(_rows41), _st41)["added"] == 0)
+check("the sync reports today's count FROM THE PLATFORM's dateSubmitted, not from local rows",
+      _r41["submitted_today"] == 1, str(_r41))
+from alphamachine.submit import count_submitted_today as _cst41, submission_days as _sd41, Submitter as _Sub41
+from alphamachine.config import RunConfig as _RC41
+check("count_submitted_today counts a web-UI submission from today and not old ones",
+      _cst41(_rows41) == 1 and _cst41([]) == 0)
+_days41 = [{"dateSubmitted": "2026-09-19T03:23:39-04:00"}, {"dateSubmitted": "2026-09-19T05:00:00-04:00"},
+           {"dateSubmitted": "2026-09-20T08:37:26-04:00"}, {"dateSubmitted": "2026-08-01T10:00:00-04:00"},
+           {"dateSubmitted": None}]
+check("submission_days counts distinct New York calendar days, ignores no-timestamp rows",
+      _sd41(_days41) == 3 and _sd41(_days41, _dt41.datetime(2026, 9, 1, tzinfo=_dt41.timezone.utc).timestamp()) == 2)
+class _Plat41:
+    def __init__(self, rows, boom=False): self.rows, self.boom = rows, boom
+    def my_alphas(self, **kw):
+        if self.boom: raise RuntimeError("network down")
+        return self.rows
+_four = [{"id": f"T{i}", "dateSubmitted": _iso_today, "classifications": [], "tags": []} for i in range(4)]
+_sub41 = _Sub41(_RC41(), _st41, _Plat41(_four))
+check("Submitter's cap reads the platform: 4 submitted today -> budget spent",
+      _sub41.submitted_today() == 4 and _sub41._daily_budget_spent() is True)
+check("...and 0 submitted today -> budget open",
+      _Sub41(_RC41(), _st41, _Plat41([]))._daily_budget_spent() is False)
+_r = _Sub41(_RC41(), _st41, _Plat41([], boom=True)).submit("X", dry_run=True)
+check("if the platform cannot be read, submit refuses rather than guess at the count",
+      "not submitting on a guess" in (_r.get("skipped") or ""), str(_r))
+check("a stale local ledger cannot change the cap (no submits_since left to read)",
+      not hasattr(Store, "submits_since"))
+check("the sync time is recorded, for status to show how fresh 'submitted' is",
+      (_st41.get("submissions_synced") or {}).get("platform_active") == 4)
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+import _status as ST41
+from alphamachine.config import Gates as _G41
+check("status: the stage is the subcommand, not the first global option",
+      ST41.stage_from_args("python3 -m alphamachine --concurrency 3 refine --top 25") == "refine"
+      and ST41.stage_from_args("python3 -m alphamachine --db x.db --region EUR scan --budget 5") == "scan"
+      and ST41.stage_from_args("python3 -m alphamachine --concurrency 3") is None)
+_ps41 = """  100 500 /bin/bash -c eval 'python3 -m alphamachine --concurrency 3 scan; python3 scripts/autoloop.py'
+  200 32000 python3 scripts/autoloop.py --scan-budget 300
+  201 40 python3 -m alphamachine --concurrency 3 refine --top 25
+  300 5 grep alphamachine"""
+_pr41 = ST41.running_processes(_ps41)
+check("status: finds autoloop and the running stage",
+      _pr41["autoloop"] == (200, 32000) and _pr41["stage"] == ("refine", 201, 40), str(_pr41))
+check("status: a shell whose command line merely CONTAINS the words is not a process",
+      ST41.running_processes(_ps41.split("\n")[0])["stage"] is None)
+check("status: a candidate that can never pass is flagged (turnover 1.299 was listed bare)",
+      "turnover>0.7" in ST41.blockers(3.05, 1.16, 1.299, _G41())
+      and ST41.blockers(2.0, 1.2, 0.3, _G41()) == [])
+
 # --- check_powerpool --from-file must keep the FILE's order ------------------
 import io as _io40, contextlib as _cx40
 import check_powerpool as CP40

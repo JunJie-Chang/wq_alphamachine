@@ -17,11 +17,10 @@ Without --live this is a dry run (fetches + server-checks, never POSTs
 /submit). --live actually submits and polls for status == ACTIVE (a 201 is
 "accepted for processing", not "live" -- submit.py's own lesson).
 
-Respects the local daily-submit counter in data/machine.db, but that counter
-only knows about submissions made THROUGH this script -- if you also submit
-via the BRAIN web UI, tell this script how many you've already used with
---used-today, since BRAIN's own platform cap is the real, final authority
-regardless of what any local counter thinks.
+Today's count is read from the PLATFORM (your ACTIVE alphas' dateSubmitted), so
+alphas sent from the web UI are counted. There is no local counter to keep in sync
+and no --used-today; BRAIN's own REGULAR_SUBMISSION check, read inside the live
+/check right before each submit, remains the final authority.
 """
 from __future__ import annotations
 
@@ -94,10 +93,6 @@ def main() -> int:
     ap.add_argument("alpha_ids", nargs="+")
     ap.add_argument("--live", action="store_true",
                      help="actually POST /submit (default: dry run)")
-    ap.add_argument("--used-today", type=int, default=0,
-                     help="submissions already made today OUTSIDE this script "
-                          "(e.g. via the BRAIN web UI) -- counted against the "
-                          "daily cap before this batch proceeds")
     args = ap.parse_args()
 
     _load_env()
@@ -114,13 +109,21 @@ def main() -> int:
         return 1
 
     store = Store(cfg.db_path)
-    from alphamachine.submit import scoring_day_start
-    local_used = store.submits_since(scoring_day_start())
-    used = max(local_used, args.used_today)
+    from alphamachine.submit import count_submitted_today, sync_active_submissions
+    try:
+        active = client.my_alphas(status="ACTIVE", limit=100)
+    except Exception as e:
+        print(f"cannot read your ACTIVE alphas from the platform ({e}); not "
+              f"submitting on a guess about today's count.", file=sys.stderr)
+        return 1
+    used = count_submitted_today(active)
     remaining = max(0, cfg.max_submits_per_day - used)
-    print(f"remaining today: {remaining}/{cfg.max_submits_per_day} "
-          f"(local counter={local_used}, told about {args.used_today} more)",
-          file=sys.stderr)
+    print(f"submitted today (platform): {used}/{cfg.max_submits_per_day}  "
+          f"-> {remaining} left", file=sys.stderr)
+    try:                                   # bookkeeping only; nothing depends on it
+        sync_active_submissions(client, store, rows=active)
+    except Exception as e:
+        print(f"note: could not refresh the local ledger ({e})", file=sys.stderr)
 
     if args.live and len(args.alpha_ids) > remaining:
         print(f"refusing: {len(args.alpha_ids)} alpha(s) requested but only "
