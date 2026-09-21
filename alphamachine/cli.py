@@ -925,8 +925,9 @@ def cmd_audit(args):
 def main(argv=None):
     p = argparse.ArgumentParser("alphamachine")
     p.add_argument("--db", default="data/machine.db")
-    p.add_argument("--concurrency", type=int, default=3,
-                   help="MUST match your account's simulation slot count")
+    p.add_argument("--concurrency", type=int, default=13,
+                   help="your account's simulation slot count (13 as of 2026-09-21); "
+                        "above it you only build a server-side queue")
     p.add_argument("--region", default="USA")
     p.add_argument("--universe", default="TOP3000")
     p.add_argument("--delay", type=int, default=1)

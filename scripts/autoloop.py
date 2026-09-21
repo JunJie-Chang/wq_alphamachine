@@ -192,7 +192,7 @@ def run_stage(concurrency: int, name: str, args: list[str]) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(__doc__)
-    p.add_argument("--concurrency", type=int, default=3)
+    p.add_argument("--concurrency", type=int, default=13)
     p.add_argument("--scan-budget", type=int, default=300)
     p.add_argument("--refine-top", type=int, default=25)
     p.add_argument("--select-n", type=int, default=10)

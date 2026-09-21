@@ -97,73 +97,35 @@ class BrainClient:
         except OSError as e:
             log.warning("could not persist cookies: %s", e)
 
-    # ------------------------------------------------- biometric quota guard
-    # BRAIN allows only 25 biometric/persona requests PER DAY, and every
-    # POST /authentication that comes back 401-persona mints a fresh inquiry --
-    # so a naive retry loop burns the day's quota in about two minutes and
-    # locks the account out with BIOMETRICS_THROTTLED. The budget is therefore
-    # enforced client-side, below the platform cap, and it is a hard stop
-    # rather than a warning.
+    # ------------------------------------------ biometric quota: NOT counted here
+    # There used to be a client-side budget in this spot (20 of the platform's 25 a
+    # day, kept in data/biometric_attempts.json). It was added after an early retry
+    # loop burned the day's quota in minutes, and it later caused more downtime than
+    # it prevented: a session that expires every ~4 h ran into OUR number before the
+    # platform's. The platform exposes no count anywhere (checked 2026-09-21:
+    # /users/self is profile only, and the only rate-limit headers on
+    # /authentication are per-minute), so the counter was a guess.
     #
-    # Was 10. Once autoloop.py started running the pipeline unattended, a
-    # session expiring every ~4h (SESSION_TTL_HOURS) started hitting this
-    # SELF-imposed number rather than the platform's, halting the loop and
-    # paging a human to raise a fresh inquiry by hand purely to work around our
-    # own margin -- 2026-08-30 alone needed several manual overrides. Same
-    # mistake as the Gates rewrite the same day: a conservative guess, applied
-    # as a hard stop, ends up doing more harm than the real limit it was
-    # guarding against. 20 keeps a real 5-request buffer below the platform's
-    # 25 -- enough to survive one manual re-auth misfire -- while no longer
-    # being the day's dominant cause of downtime.
-    BIOMETRIC_DAILY_CAP = 25
-    BIOMETRIC_SAFE_BUDGET = 20
+    # What still protects the account: a 429 BIOMETRICS_THROTTLED from the platform
+    # itself raises immediately and is never retried (see request()), and
+    # REAUTH_COOLDOWN stops one process re-POSTing /authentication in a loop.
 
-    def _bio_log_path(self) -> str:
-        return os.path.join(os.path.dirname(self.cookie_path) or ".",
-                            "biometric_attempts.json")
-
-    def _bio_attempts(self) -> list[float]:
-        try:
-            with open(self._bio_log_path()) as fh:
-                stamps = json.load(fh)
-        except (OSError, ValueError):
-            return []
-        cutoff = time.time() - 86400.0
-        return [float(t) for t in stamps if float(t) > cutoff]
-
-    def biometric_budget_left(self) -> int:
-        return max(0, self.BIOMETRIC_SAFE_BUDGET - len(self._bio_attempts()))
-
-    def _record_bio_attempt(self) -> None:
-        stamps = self._bio_attempts()
-        stamps.append(time.time())
-        try:
-            os.makedirs(os.path.dirname(self._bio_log_path()) or ".", exist_ok=True)
-            with open(self._bio_log_path(), "w") as fh:
-                json.dump(stamps, fh)
-        except OSError as e:
-            log.warning("could not record biometric attempt: %s", e)
-
-    def _check_bio_budget(self) -> None:
-        used = len(self._bio_attempts())
-        if used >= self.BIOMETRIC_SAFE_BUDGET:
-            oldest = min(self._bio_attempts())
-            hours = (oldest + 86400.0 - time.time()) / 3600.0
-            raise BiometricRequired(
-                f"biometric budget spent ({used}/{self.BIOMETRIC_SAFE_BUDGET} "
-                f"used in the last 24h; platform cap is {self.BIOMETRIC_DAILY_CAP}). "
-                f"Refusing to request another -- that is what triggers "
-                f"BIOMETRICS_THROTTLED. Quota frees up in ~{hours:.1f}h.")
-
-    SESSION_TTL_HOURS = 4.0
+    # The session's end is not a thing to guess: it is the `exp` claim of the JWT in
+    # the cookie, already read into _expires_at. This used to be the cookie FILE's
+    # mtime plus a hardcoded 4 h, a stand-in for a value sitting in the cookie.
+    SESSION_MARGIN = 60.0          # seconds: do not trust a session in its last minute
+    FALLBACK_TTL_HOURS = 4.0       # only when no expiry can be read at all
 
     def session_fresh(self) -> bool:
-        """Trust a recently-saved jar without spending a request on it."""
+        """Trust the persisted cookie without spending a request on it."""
+        exp = self._expires_at or self._jwt_expiry()
+        if exp is not None:
+            return time.time() < exp - self.SESSION_MARGIN
         try:
             age = time.time() - os.path.getmtime(self.cookie_path)
         except OSError:
             return False
-        return age < self.SESSION_TTL_HOURS * 3600.0
+        return age < self.FALLBACK_TTL_HOURS * 3600.0
 
     def session_alive(self) -> bool:
         """Is the loaded cookie still a live BRAIN session?"""
@@ -298,10 +260,8 @@ class BrainClient:
                 self._expires_at = self._jwt_expiry()
             log.info("reusing persisted session for %s", self._email)
             return {"reused": True}
-        # Every call to this endpoint can mint a persona inquiry, so it counts
-        # against the daily biometric quota whether or not we wanted a check.
-        self._check_bio_budget()
-        self._record_bio_attempt()
+        # Every call to this endpoint can mint a persona inquiry, so it is only
+        # reached once the session is really gone.
         r = self.s.post(f"{self.api}/authentication",
                         auth=HTTPBasicAuth(self._email, self._password),
                         timeout=self.timeout)

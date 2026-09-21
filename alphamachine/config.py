@@ -462,8 +462,10 @@ class RunConfig:
     # Concurrency == your account's simulation-slot count. Setting it above
     # your real slot count just builds a server-side queue -- it does not make
     # you faster, and it costs you the ability to react to results as they land.
-    # CONFIRMED for this account: 3 slots.
-    concurrency: int = 3
+    # Account slot count, as reported by the account owner: 13 (was 3 until
+    # 2026-09-21). The platform exposes no number for it -- /users/self does not
+    # carry one -- so this is configuration, not something the code can read.
+    concurrency: int = 13
     poll_interval: float = 5.0
     sim_timeout: float = 900.0
     max_submits_per_day: int = 4

@@ -535,32 +535,40 @@ check("bundle members are grouped and kept in child order",
 check("whole bundle is excluded from the pending queue", st3.pending() == [])
 os.remove(db3)
 
-print("\n[15] biometric quota guard (25/day platform cap)")
+print("\n[15] biometric quota is NOT counted locally; the session end is READ, not guessed")
 import tempfile as _tf, threading as _th3, requests as _rq3, time as _t
 from alphamachine.client import BrainClient, BiometricRequired
 _biodir = _tf.mkdtemp()
-bc = BrainClient.__new__(BrainClient)
-bc.s = _rq3.Session(); bc.api = "https://x"; bc.timeout = 1
-bc.cookie_path = os.path.join(_biodir, "cookies.json")
-bc._expires_at = None; bc._lock = _th3.Lock(); bc._authed = False
-check("starts with the full safe budget",
-      bc.biometric_budget_left() == BrainClient.BIOMETRIC_SAFE_BUDGET,
-      f"{bc.biometric_budget_left()}")
-for _ in range(BrainClient.BIOMETRIC_SAFE_BUDGET):
-    bc._record_bio_attempt()
-check("budget depletes as attempts are recorded", bc.biometric_budget_left() == 0)
+check("the client keeps no biometric counter any more",
+      not any(hasattr(BrainClient, n) for n in (
+          "BIOMETRIC_SAFE_BUDGET", "BIOMETRIC_DAILY_CAP", "biometric_budget_left",
+          "_bio_attempts", "_record_bio_attempt", "_check_bio_budget")))
+# 25 attempts recorded in the last minute used to make authenticate() REFUSE.
+json.dump([_t.time() - 60] * 25, open(os.path.join(_biodir, "biometric_attempts.json"), "w"))
+class _R15:
+    status_code = 201; headers = {}; text = ""
+    def json(self): return {"token": {"expiry": 14400}}
+bc = BrainClient("a@b.c", "x", cookie_path=os.path.join(_biodir, "cookies.json"))
+_posts = []
+bc.s.post = lambda *a, **kw: (_posts.append(a), _R15())[1]
 try:
-    bc._check_bio_budget()
-    check("refuses a further attempt once spent", False, "no exception")
-except BiometricRequired as e:
-    check("refuses a further attempt once spent", "budget spent" in str(e))
-# Attempts older than 24h must age out of the window.
-old_stamps = [_t.time() - 90000 for _ in range(20)]
-json.dump(old_stamps, open(bc._bio_log_path(), "w"))
-check("attempts older than 24h no longer count",
-      bc.biometric_budget_left() == BrainClient.BIOMETRIC_SAFE_BUDGET)
-check("safe budget sits well under the platform cap",
-      BrainClient.BIOMETRIC_SAFE_BUDGET < BrainClient.BIOMETRIC_DAILY_CAP == 25)
+    bc.authenticate(); _ok15 = True
+except BiometricRequired:
+    _ok15 = False
+check("authenticate() no longer refuses because of a stale local attempt log",
+      _ok15 and len(_posts) == 1)
+
+bc2 = BrainClient("a@b.c", "x", cookie_path=os.path.join(_biodir, "c2.json"))
+open(bc2.cookie_path, "w").write("{}")           # a brand-new file: the OLD mtime+4h rule says "fresh"
+bc2._expires_at = _t.time() + 600
+check("session_fresh trusts a session while its own JWT expiry is in the future", bc2.session_fresh())
+bc2._expires_at = _t.time() - 5
+check("session_fresh distrusts a session past its own expiry, even with a brand-new cookie file",
+      not bc2.session_fresh())
+bc2._expires_at = _t.time() + 30
+check("...and inside the last minute, when the next request could already 401", not bc2.session_fresh())
+bc2._expires_at = None; bc2._jwt_expiry = lambda: None
+check("only with NO readable expiry does it fall back to the cookie file's age", bc2.session_fresh())
 import shutil as _sh; _sh.rmtree(_biodir, ignore_errors=True)
 
 print("\n[14] rate-limit budget is honoured, biometrics throttle is not retried")
@@ -2748,6 +2756,18 @@ check("status: a shell whose command line merely CONTAINS the words is not a pro
 check("status: a candidate that can never pass is flagged (turnover 1.299 was listed bare)",
       "turnover>0.7" in ST41.blockers(3.05, 1.16, 1.299, _G41())
       and ST41.blockers(2.0, 1.2, 0.3, _G41()) == [])
+
+import io as _io41, contextlib as _cx41
+from alphamachine import cli as _cli41
+# (an earlier section replaces subprocess.Popen with a fake, so drive argparse directly)
+_buf41 = _io41.StringIO()
+try:
+    with _cx41.redirect_stdout(_buf41):
+        _cli41.main(["--help"])
+except SystemExit:
+    pass
+check("the account's simulation slot count is 13 by default (config and CLI)",
+      _RC41().concurrency == 13 and "13 as of" in " ".join(_buf41.getvalue().split()))
 
 # --- check_powerpool --from-file must keep the FILE's order ------------------
 import io as _io40, contextlib as _cx40

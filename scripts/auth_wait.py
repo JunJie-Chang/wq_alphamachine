@@ -14,6 +14,10 @@ So this script spends exactly two units:
 
 Waiting is done on a local sentinel file, not on the network. The verification
 read (GET /users/self) is a normal API call and does not touch the quota.
+
+Nothing here keeps a running count of the day's units -- the platform exposes none,
+and a client-side guess caused more downtime than it prevented -- so the design
+(never poll, wait on a file, finalise once) is what keeps the usage low.
 """
 import json
 import os
@@ -42,22 +46,12 @@ def save(session, expires_at=None) -> None:
     os.chmod(COOKIE_FILE, 0o600)
 
 
-# Every response header from both persona POSTs, appended to a log so the ONE
-# open question about this script's cost can be settled from evidence instead
-# of assumption.
-#
-# The script's docstring has always claimed it spends "exactly two units" --
-# one to raise the inquiry, one to finalise. The first is documented behaviour
-# (a 401-persona POST /authentication mints a fresh inquiry). The second is an
-# assumption nobody ever tested: the finalise POST COMPLETES an existing
-# inquiry rather than creating one, so it may well not touch the daily
-# biometric counter at all. If it does not, BIOMETRIC_SAFE_BUDGET is throttling
-# us at roughly half the real headroom -- which matters, because biometric
-# downtime was measured at 49% of this pipeline's wall-clock time.
-#
-# Costs nothing: no extra request, just recording what the responses already
-# carry. Compare the RateLimit-* values across the two calls to see whether
-# the second one moves any counter.
+# Every response header from both persona POSTs, appended to a log. This existed to
+# settle whether the finalise call costs a biometric unit -- a question that only
+# mattered while the client kept its own count of the day's units (it no longer does,
+# 2026-09-21: the platform exposes no such number, and the counter was a guess that
+# caused more downtime than it prevented). The log is kept because it costs nothing
+# and shows exactly what the platform does send back.
 HEADER_LOG = "data/logs/biometric_headers.log"
 
 
@@ -105,22 +99,12 @@ def main() -> int:
         pass
     s.cookies.clear()
 
-    from alphamachine.client import BrainClient
-    probe = BrainClient(email, pw)
-    left = probe.biometric_budget_left()
-    print(f"biometric budget: {left} of {BrainClient.BIOMETRIC_SAFE_BUDGET} "
-          f"remaining in the last 24h (platform cap {BrainClient.BIOMETRIC_DAILY_CAP}/day)")
-    if left < 2:
-        print("Not enough budget for a clean attempt (needs 2). Wait for it to free up.")
-        return 1
-
     if os.path.exists(SENTINEL):
         os.remove(SENTINEL)
 
-    # --- quota unit 1 -------------------------------------------------------
-    probe._record_bio_attempt()
+    # --- step 1: raise the inquiry ------------------------------------------
     r = s.post(f"{API}/authentication", auth=HTTPBasicAuth(email, pw), timeout=60)
-    _dump_headers("POST /authentication (unit 1: mints the inquiry)", r)
+    _dump_headers("POST /authentication (mints the inquiry)", r)
     if r.status_code == 201:
         save(s)
         print("AUTH OK (no persona needed); cookies saved.")
@@ -151,14 +135,9 @@ def main() -> int:
         print("TIMEOUT -- sentinel never appeared. No extra quota was spent.")
         return 1
 
-    # --- quota unit 2, and the one under investigation -----------------------
-    # Counted defensively for now. If the headers logged below show this call
-    # moving no counter, the count here is what should be dropped -- see
-    # _dump_headers.
-    probe._record_bio_attempt()
+    # --- step 2: finalise it, exactly once ------------------------------------
     fin = s.post(url, timeout=60)
-    _dump_headers("POST persona finalise (unit 2: UNDER TEST -- does this "
-                  "actually cost a unit?)", fin)
+    _dump_headers("POST persona finalise", fin)
     who = s.get(f"{API}/users/self", timeout=60)      # free: not a biometric call
     _dump_headers("GET /users/self (known free -- control)", who)
     print(f"finalise={fin.status_code} users/self={who.status_code}")
