@@ -323,13 +323,13 @@ from zoneinfo import ZoneInfo as _ZI
 import datetime as _dt
 _start = scoring_day_start()
 _ny = _dt.datetime.fromtimestamp(_start, _ZI("America/New_York"))
-check("scoring day starts 03:00 America/New_York, not UTC midnight",
-      _ny.hour == 3 and _ny.minute == 0, f"{_ny:%Y-%m-%d %H:%M %Z}")
+check("scoring day starts at MIDNIGHT America/New_York (measured 2026-09-21), not 03:00 or UTC midnight",
+      _ny.hour == 0 and _ny.minute == 0, f"{_ny:%Y-%m-%d %H:%M %Z}")
 check("the boundary is in the past and within 24h",
       0 <= (_t.time() - _start) < 86400)
 _utc_mid = _dt.datetime.now(_dt.timezone.utc).replace(
     hour=0, minute=0, second=0, microsecond=0).timestamp()
-check("differs from the UTC-midnight window it replaced",
+check("differs from UTC midnight (New York is 4-5 h behind it)",
       abs(_start - _utc_mid) > 3000, f"delta={(_start-_utc_mid)/3600:.1f}h")
 
 _sub = _Sub.__new__(_Sub); _sub.cfg = RunConfig()

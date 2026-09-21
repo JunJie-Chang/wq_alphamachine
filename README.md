@@ -933,11 +933,17 @@ platform before relying on it.
   carry across yourself (or re-generate: `check_powerpool.py` re-fetches from
   BRAIN). Today's submission count is not affected: it is read from the platform, so
   a submission from another machine or the web UI is counted.
-* **"Today" is the code's assumption.** The counter uses a scoring day starting
-  **03:00 America/New_York** (`submit.scoring_day_start()`), i.e. 15:00 in Taiwan
-  during US daylight time and 16:00 otherwise. That boundary is the project's own;
-  the docs in this repo mention 3 AM EST only for Community Activity updates, not
-  for submission counting. Treat it as unverified.
+* **The scoring day starts at midnight New York — measured, not assumed.** It used to
+  be coded as 03:00 (15:00 in Taiwan), an assumption nothing tested. On 2026-09-21 the
+  platform's own `REGULAR_SUBMISSION` check, polled every 4 minutes with a different
+  never-`/check`ed alpha each time (`/check` is cached per alpha), read **4/4 at 23:56
+  New York and 0/4 at 00:01** — so the day rolls at midnight, 12:00 in Taiwan during US
+  daylight time and 13:00 otherwise. With the old boundary the code reported "budget
+  spent" for three hours after the platform had reopened. The data agrees: the four
+  alphas submitted 2026-09-19 between 02:59 and 03:23 ET all counted as one day, which
+  03:00 would have split. `submit.scoring_day_start()` is now midnight
+  `America/New_York` (DST-aware); the platform's live `REGULAR_SUBMISSION` remains the
+  authority at the moment of submitting.
 * **`POWER_POOL_CORRELATION` is computed lazily, and pacing is not solved.**
   Without `--deep` it sits at `PENDING`; firing `/check` requests back-to-back
   enqueues the computation faster than BRAIN resolves it, so *every* candidate

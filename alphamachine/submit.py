@@ -416,7 +416,7 @@ class Submitter:
     def _daily_budget_spent(self) -> bool:
         used = self.submitted_today()
         if used >= self.cfg.max_submits_per_day:
-            log.info("daily submit budget reached (%d since 3am ET)", used)
+            log.info("daily submit budget reached (%d since midnight ET)", used)
             return True
         return False
 
@@ -492,22 +492,21 @@ def sync_active_submissions(client, store, rows: list[dict] | None = None) -> di
 
 
 def scoring_day_start() -> float:
-    """Epoch of the current BRAIN scoring day, which begins 03:00 America/New_York.
+    """Epoch of the current BRAIN scoring day, which begins at MIDNIGHT America/New_York.
 
-    Not UTC midnight. Getting this wrong splits one scoring day across two
-    local windows and merges parts of two scoring days into one -- so the
-    machine would think it had budget left when the cap was already spent, and
-    every surplus submission past the daily 2,000-point ceiling is a permanent
-    book slot bought for zero score. New York, not UTC, because the boundary
-    follows US daylight saving.
+    MEASURED, not assumed (2026-09-21): the platform's own REGULAR_SUBMISSION check,
+    polled with a never-checked alpha each time, read 4/4 at 23:56 New York and 0/4 at
+    00:01. This used to be 03:00 -- an assumption nothing ever tested -- which made the
+    code report "budget spent" for three hours after the platform had reopened. The data
+    agrees: the four alphas submitted 2026-09-19 between 02:59 and 03:23 ET all counted
+    as one day, which a 03:00 boundary would have split.
+
+    Not UTC midnight: the boundary follows New York, including US daylight saving. Getting
+    it wrong splits one day across two windows and merges parts of two into one.
     """
     try:
         from zoneinfo import ZoneInfo
         tz = ZoneInfo("America/New_York")
     except Exception:                              # no tzdata: approximate EST
         tz = timezone(timedelta(hours=-5))
-    now = datetime.now(tz)
-    start = now.replace(hour=3, minute=0, second=0, microsecond=0)
-    if now < start:
-        start -= timedelta(days=1)
-    return start.timestamp()
+    return datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
