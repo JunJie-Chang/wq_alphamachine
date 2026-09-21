@@ -2638,6 +2638,37 @@ check("tag: --include-unverified admits a record whose ONLY pending gate is the 
 check("tag: --include-unverified still excludes any other unresolved gate, and ineligible ones",
       "t" not in _sel(True) and "n" not in _sel(True))
 
+# --- poll: a 404 progress URL is a lost job, not a slow one -------------------
+import time as _t40
+from alphamachine.client import BrainClient as _BC40, SimulationFailed as _SF40
+class _Resp40:
+    def __init__(self, code, body=None, headers=None):
+        self.status_code, self._b, self.headers = code, body if body is not None else {}, headers or {}
+    def json(self): return self._b
+    text = ""
+def _client40(responses):
+    c = _BC40("a@b.c", "x", cookie_path=os.path.join(tempfile.mkdtemp(), "c.json"))
+    it = iter(responses)
+    c.get = lambda url, **kw: next(it)
+    return c
+_nf40 = _client40([_Resp40(404, {"detail": "Not found."})] * 20)
+_t0 = _t40.time()
+try:
+    _nf40.poll("http://x/sim/1", interval=0.0, timeout=90.0); _msg40 = None
+except _SF40 as e:
+    _msg40 = str(e)
+check("poll gives up on repeated 404s promptly instead of spinning to the timeout",
+      _msg40 is not None and _t40.time() - _t0 < 5.0, str(_msg40)[:70])
+check("the 404 error is not worded as a timeout (reclaim keeps markers for those)",
+      _msg40 is not None and "timeout" not in _msg40.lower())
+_ok40 = {"status": "COMPLETE", "alpha": "https://api/alphas/AbC123"}
+check("a transient 404 right after the POST is waited out, not treated as lost",
+      _client40([_Resp40(404), _Resp40(404), _Resp40(200, _ok40, {"Retry-After": "0"})])
+      .poll("http://x/sim/2", interval=0.0, timeout=30.0) == _ok40)
+check("a 404 streak is reset by any non-404 answer",
+      _client40([_Resp40(404)] * 3 + [_Resp40(200, {}, {"Retry-After": "0"})] + [_Resp40(404)] * 3
+                + [_Resp40(200, _ok40, {"Retry-After": "0"})]).poll("http://x/sim/3", interval=0.0, timeout=30.0) == _ok40)
+
 # --- check_powerpool --from-file must keep the FILE's order ------------------
 import io as _io40, contextlib as _cx40
 import check_powerpool as CP40

@@ -502,12 +502,34 @@ class BrainClient:
             return loc
         raise SimulationFailed(f"simulate [{r.status_code}]: {r.text[:500]}")
 
+    # BRAIN stops serving a progress URL some time after the job ends. A 404 body
+    # ({"detail": "Not found."}) has no children / status / alpha, so poll used to
+    # read it as "finished, payload not built yet" and spin until the deadline --
+    # and Executor.reclaim, seeing "timeout" in the error, kept the in-flight
+    # marker as "still running". Found 2026-09-20: 28 candidates from a run 261 h
+    # earlier were never re-simulated and cost ~4.5 min of dead polling on every
+    # start. Consecutive 404s, not one, so a URL queried the instant after the
+    # POST that briefly is not there yet is still waited for.
+    POLL_404_LIMIT = 5
+
     def poll(self, progress_url: str, *, interval: float = 5.0,
              timeout: float = 900.0) -> dict:
         """Block until the simulation resolves. Honours Retry-After."""
         deadline = time.time() + timeout
+        not_found = 0
         while time.time() < deadline:
             r = self.get(progress_url)
+            if r.status_code == 404:
+                not_found += 1
+                if not_found >= self.POLL_404_LIMIT:
+                    # Deliberately NOT worded as a timeout: reclaim() keeps the
+                    # marker for those, and this job is gone, not slow.
+                    raise SimulationFailed(
+                        f"progress URL not found (HTTP 404 x{not_found}); the job "
+                        f"expired or was deleted: {progress_url}")
+                time.sleep(interval)
+                continue
+            not_found = 0
             # BRAIN sends Retry-After on every progress read and sets it to "0"
             # when the job is finished. Treating any Retry-After as "still
             # running" hangs forever; treating its absence as "done" reads a
