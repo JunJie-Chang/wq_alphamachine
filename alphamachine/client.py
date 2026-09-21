@@ -44,6 +44,15 @@ class SimulationFailed(BrainError):
     pass
 
 
+class SlotsBusy(SimulationFailed):
+    """Every simulation slot on the account stayed busy for the whole wait.
+
+    NOT a verdict on the candidate: nothing was simulated. It subclasses
+    SimulationFailed so a caller that does not know about it still fails safe, but the
+    Executor catches it first and defers the bundle instead of recording an ERROR.
+    """
+
+
 class BrainClient:
     """One instance per thread. `requests.Session` cookie jars are not
     thread-safe under concurrent use, and BRAIN auth lives in a cookie."""
@@ -364,6 +373,11 @@ class BrainClient:
                     detail = (r.json() or {}).get("detail", "")
                 except ValueError:
                     pass
+                if "CONCURRENT_SIMULATION_LIMIT" in detail.upper():
+                    # Capacity, not a rate limit: backing off 2/4/8/16/32 s and then
+                    # giving up (what the branch below does) is the wrong shape. The
+                    # caller waits for a slot to free (see simulate()).
+                    return r
                 if "BIOMETRIC" in detail.upper():
                     # A separate, much longer counter that exposes no reset
                     # time. Retrying only digs the hole deeper -- surface it.
@@ -448,13 +462,38 @@ class BrainClient:
         return out
 
     # --------------------------------------------------------- simulation
+    # POST /simulations answers 429 CONCURRENT_SIMULATION_LIMIT_EXCEEDED when every slot
+    # on the account is busy -- including slots used by another session or machine. It
+    # used to be handled as a rate limit (5 backoffs, then give up), after which the
+    # Executor recorded the whole bundle as ERROR. Found 2026-09-21: 21,074 of the
+    # database's 22,470 errors (94%, since 2026-08-30) were exactly this -- candidates
+    # that were never simulated, marked failed for good, and counted as failed trials
+    # against their bandit arms. Wait for a slot instead; only if none frees up for
+    # SLOT_WAIT_SECONDS raise SlotsBusy, which the Executor DEFERS (no record written).
+    SLOT_WAIT_SECONDS = 1200.0
+    SLOT_POLL_SECONDS = 20.0
+
     def simulate(self, payload: dict | list[dict]) -> str:
         """Submit one alpha (dict) or a multi-simulation bundle (list).
 
         Multi-simulation accepts up to 10 children per bundle and is gated on
         account tier. Returns the progress URL from the Location header.
         """
-        r = self.post("/simulations", json=payload)
+        deadline = time.time() + self.SLOT_WAIT_SECONDS
+        announced = 0.0
+        while True:
+            r = self.post("/simulations", json=payload)
+            if r.status_code == 429 and "CONCURRENT_SIMULATION_LIMIT" in (r.text or "").upper():
+                now = time.time()
+                if now >= deadline:
+                    raise SlotsBusy(f"no simulation slot free for {self.SLOT_WAIT_SECONDS:.0f}s "
+                                    f"(CONCURRENT_SIMULATION_LIMIT_EXCEEDED); nothing was simulated")
+                if now - announced >= 60.0:
+                    log.info("all simulation slots busy; waiting for one to free up")
+                    announced = now
+                time.sleep(self.SLOT_POLL_SECONDS)
+                continue
+            break
         if r.status_code in (200, 201):
             loc = r.headers.get("Location")
             if not loc:

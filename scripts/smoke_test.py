@@ -2822,6 +2822,72 @@ check("asking for more than exist returns what cleared the floors, without error
 check("pyramid_coverage counts pyramids at or above the formulated threshold",
       CP42.pyramid_coverage(_Ctr42({"a": 3, "b": 2, "c": 5})) == 2)
 
+# --- a full-slots 429 is CAPACITY: wait for a slot, never record an ERROR -------
+import requests as _rq43, time as _t43
+from alphamachine.client import BrainClient as _BC43, SimulationFailed as _SF43, SlotsBusy as _SB43
+from alphamachine.executor import Executor as _Ex43
+def _r43(code, body=None, headers=None):
+    r = _rq43.Response(); r.status_code = code; r.headers.update(headers or {})
+    r._content = json.dumps(body if body is not None else {}).encode(); return r
+_CAP43 = {"detail": "CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}
+def _cl43(responses):
+    c = _BC43("a@b.c", "x", cookie_path=os.path.join(tempfile.mkdtemp(), "c.json"))
+    c._authed = True; c._save_cookies = lambda: None
+    seq, calls = iter(responses), []
+    c.s.request = lambda *a, **kw: (calls.append(1), next(seq))[1]
+    return c, calls
+_c, _calls = _cl43([_r43(429, _CAP43)] * 5)
+_t0 = _t43.time(); _rr = _c.request("POST", "/simulations")
+check("request() hands a capacity 429 straight back: one call, no 2/4/8/16/32 s backoff",
+      _rr.status_code == 429 and len(_calls) == 1 and _t43.time() - _t0 < 1.0, f"{len(_calls)} call(s)")
+_c, _calls = _cl43([_r43(429, {"detail": "rate limit"}, {"Retry-After": "0"}), _r43(200)])
+check("a genuine rate-limit 429 is still retried by request()",
+      _c.request("GET", "/x").status_code == 200 and len(_calls) == 2)
+_c, _calls = _cl43([_r43(429, _CAP43), _r43(429, _CAP43), _r43(201, {}, {"Location": "https://x/sim/1"})])
+_c.SLOT_POLL_SECONDS = 0.0
+check("simulate() waits for a slot and then goes through",
+      _c.simulate({"type": "REGULAR"}) == "https://x/sim/1" and len(_calls) == 3)
+_c, _calls = _cl43([_r43(429, _CAP43)] * 200)
+_c.SLOT_POLL_SECONDS, _c.SLOT_WAIT_SECONDS = 0.01, 0.1
+try:
+    _c.simulate({"type": "REGULAR"}); _sb = None
+except _SB43 as e:
+    _sb = e
+check("simulate() raises SlotsBusy (a SimulationFailed) only after the whole wait",
+      _sb is not None and isinstance(_sb, _SF43) and "nothing was simulated" in str(_sb))
+_c, _calls = _cl43([_r43(400, {"detail": "bad expression"})])
+try:
+    _c.simulate({"type": "REGULAR"}); _sf = None
+except _SF43 as e:
+    _sf = e
+check("a real failure (HTTP 400) is still a plain SimulationFailed, not SlotsBusy, and is not retried",
+      _sf is not None and not isinstance(_sf, _SB43) and len(_calls) == 1)
+
+_st43 = Store(os.path.join(tempfile.mkdtemp(), "cap.db"))
+def _cand43(n):
+    return _st43.add_candidate(expr=f"rank(cap{n})", settings=SimSettings().payload(), theme="t",
+                               template="tt", field=f"cap{n}", stage="scan")
+class _Fake43:
+    def __init__(self, exc): self.exc = exc
+    def refresh_if_stale(self): pass
+    def simulate(self, payload): raise self.exc
+def _ex43(exc):
+    e = _Ex43(RunConfig(), _st43); e.client = lambda: _Fake43(exc); return e
+_id1 = _cand43(1)
+_res = _ex43(_SB43("no slot"))._bundle([_id1])
+check("a deferred bundle writes NO sims row: the candidate is still pending, not failed",
+      _res == {_id1: {"status": "DEFERRED"}}
+      and _st43.conn().execute("SELECT COUNT(*) FROM sims WHERE candidate_id=?", (_id1,)).fetchone()[0] == 0
+      and any(r["id"] == _id1 for r in _st43.pending()))
+_id2 = _cand43(2); _seen = []
+_stats = _ex43(_SB43("no slot")).run([_id2], on_result=lambda cid, rec: _seen.append(cid))
+check("run() counts it as deferred, not error, and never teaches the bandit (no on_result)",
+      _stats["deferred"] == 1 and _stats["error"] == 0 and _seen == [], str(_stats))
+_id3 = _cand43(3)
+_ex43(_SF43("simulate [400]: Invalid data field foo"))._bundle([_id3])
+check("regression guard: a genuine failure is STILL recorded as ERROR",
+      _st43.conn().execute("SELECT status FROM sims WHERE candidate_id=?", (_id3,)).fetchone()[0] == "ERROR")
+
 import io as _io41, contextlib as _cx41
 from alphamachine import cli as _cli41
 # (an earlier section replaces subprocess.Popen with a fake, so drive argparse directly)

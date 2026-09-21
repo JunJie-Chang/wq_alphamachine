@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 426 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 434 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -715,6 +715,22 @@ unrecoverable` in 64 s, in-flight rows 28 → 0.
 Also worth knowing: `refine`'s opening query (un-refined survivors, ranked by
 |Sharpe|, over ~80k candidates) is silent and CPU-bound for about five minutes on
 the 2 GB database before its first log line. That is not a hang.
+
+**A full-slots `429 CONCURRENT_SIMULATION_LIMIT_EXCEEDED` is capacity, not a verdict on the
+candidate.** `POST /simulations` answers it when every slot on the account is busy —
+including slots held by another session or machine. `request()` handled it as an
+ordinary rate limit (backoff 2/4/8/16/32 s, then give up), `simulate()` then raised
+`SimulationFailed`, and the Executor **recorded the whole bundle as ERROR for good** —
+and `cmd_scan`'s `on_result` counted each one as a failed trial against its bandit arm.
+Found 2026-09-21 when restarting at 13 slots: **21,074 of the database's 22,470 errors
+(94%, since 2026-08-30) were exactly this** — 6,778 scan candidates and 14,296 refine
+variants that were never simulated. `simulate()` now waits for a slot (polling every 20 s
+for up to 20 min) and only then raises `SlotsBusy`, which the Executor **defers**: no
+`sims` row is written, the candidate stays pending, `stats["deferred"]` counts it, and
+`on_result` is never called. A genuine failure (HTTP 400, an invalid field) is still a
+plain `SimulationFailed` and still recorded. The 21k historical rows and the arm counters
+they inflated are **not repaired by this change**; see the repair note in the commit
+history. Throughput at 13 slots: ~1,500–1,800 alphas/hour, against ~127 at 3.
 
 ### Where the quality actually comes from
 

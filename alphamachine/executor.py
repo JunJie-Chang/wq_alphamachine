@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
 from .client import (BiometricRequired, BrainClient, BrainError,
-                     SimulationFailed)
+                     SimulationFailed, SlotsBusy)
 from .config import RunConfig
 from .metrics import extract
 
@@ -74,7 +74,7 @@ class Executor:
     # ------------------------------------------------------------------ run
     def run(self, candidate_ids: list[str],
             on_result: Callable[[str, dict], None] | None = None) -> dict:
-        stats = {"ok": 0, "error": 0, "skipped": 0}
+        stats = {"ok": 0, "error": 0, "skipped": 0, "deferred": 0}
         if not candidate_ids:
             return stats
         self._halt.clear()
@@ -106,6 +106,9 @@ class Executor:
                         st = rec.get("status")
                         if st == "HALTED":
                             stats["skipped"] += 1
+                            continue
+                        if st == "DEFERRED":            # never simulated: no verdict, no trial
+                            stats["deferred"] += 1
                             continue
                         stats["ok" if st == "OK" else "error"] += 1
                         if on_result:
@@ -164,6 +167,11 @@ class Executor:
         except BiometricRequired:
             self._halt.set()
             return {cid: {"status": "HALTED"} for cid in cids}
+        except SlotsBusy as e:
+            # Nothing was simulated, so there is nothing to record: writing an ERROR
+            # here is what poisoned 21k candidates. They stay pending for the next run.
+            log.warning("deferring %d candidate(s): %s", len(live), e)
+            return {**missing, **{cid: {"status": "DEFERRED"} for cid, _ in live}}
         except SimulationFailed as e:
             out = dict(missing)
             for cid, _r in live:
