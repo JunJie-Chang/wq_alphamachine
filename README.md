@@ -10,7 +10,7 @@ the way BRAIN actually scores consultants rather than around raw backtest huntin
 | Path | What it is |
 |---|---|
 | `alphamachine/` | the pipeline: `catalog` → `generator` (+ `bandit`, `templates`, `priors`) → `executor` → `refine` → `metrics` → `correlate` → `submit`, on top of `client` (HTTP), `store` (SQLite) and `config` (every threshold). `audit` checks the live database; `cli` wires it together. |
-| `scripts/` | unattended operation (`autoloop.py`, `night_check.sh`, `status.sh`, `progress.sh`), persona auth (`auth_wait.py`), the offline test (`smoke_test.py`), and the **Power Pool** track (`check_powerpool.py`, `dedup_powerpool.py`, `corr_powerpool.py`, `tag_powerpool.py`, `submit_powerpool.py` — see Part 6). |
+| `scripts/` | unattended operation (`autoloop.py`, `night_check.sh`, `status.sh`, `progress.sh`), persona auth (`auth_wait.py`), the offline test (`smoke_test.py`), and the **Power Pool** track (`check_powerpool.py`, `dedup_powerpool.py`, `corr_powerpool.py`, `tag_powerpool.py`, `submit_powerpool.py` — see Part 6; `sync_submissions.py` — see Part 4). |
 | `docs/` | rule references, in Traditional Chinese. `BRAIN_RULES.md` is the authority for every number; `新手指南.md` is a from-scratch walkthrough; `docs/README.md` explains the priority order. |
 | `data/` | runtime state — **entirely gitignored** (`machine.db`, session cookie, caches, logs). It is per-machine: a `git pull` on another computer brings the code, never this state. |
 
@@ -448,16 +448,16 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 390 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 413 offline checks, no network, no quota
 
-python3 -m alphamachine --concurrency 3 catalog
+python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
-python3 -m alphamachine --concurrency 3 scan   --budget 300
-python3 -m alphamachine --concurrency 3 refine --top 25
+python3 -m alphamachine --concurrency 13 scan   --budget 300
+python3 -m alphamachine --concurrency 13 refine --top 25
 python3 -m alphamachine gatelog --passing                     # what can I submit?
-python3 -m alphamachine --concurrency 3 select --n 10
-python3 -m alphamachine --concurrency 3 submit --n 3          # dry run
-python3 -m alphamachine --concurrency 3 submit --n 3 --live   # for real
+python3 -m alphamachine --concurrency 13 select --n 10
+python3 -m alphamachine --concurrency 13 submit --n 3          # dry run
+python3 -m alphamachine --concurrency 13 submit --n 3 --live   # for real
 python3 -m alphamachine report --corr                         # observed prod-corr (by row AND by lineage)
 python3 -m alphamachine report --pyramid                      # payout multiplier earned vs available
 python3 -m alphamachine report --neutralization               # PROD_CORRELATION survival by neutralization
@@ -520,10 +520,39 @@ results.
 process has died outright. It never touches submission, and never tries to solve
 a biometric block; it just records the wait.
 
-`--concurrency` **must equal your real slot count** — confirmed **3** for this
-account, which is already the default. `submit` is a dry run unless you pass
-`--live`, and is capped at `max_submits_per_day` (default **4**, matching the
-counted-alpha rule above).
+`--concurrency` **should equal your real slot count** — **13** for this account as of
+2026-09-21 (it was 3), which is now the default. The platform exposes no number for
+it (`/users/self` is profile only), so it is configuration, not something the code
+can read; above the real count you only build a server-side queue. `submit` is a dry
+run unless you pass `--live`, and is capped at `max_submits_per_day` (default **4**,
+matching the counted-alpha rule above) — **read from the platform**, see below.
+
+**Read what the platform knows; do not keep a shadow counter.** The daily cap (4/day)
+and the quarterly submission-day count (≥ 20 distinct days gates quarterly payment)
+used to be counted from a local `submissions` table that only this pipeline wrote,
+so an alpha sent from the web UI was invisible: `status.sh` showed *submitted: 1*
+while 22 were ACTIVE on BRAIN. Both now come straight from the platform — your
+ACTIVE alphas' `dateSubmitted` (`Submitter._active`, `count_submitted_today`,
+`submission_days`) — and `submit` / `submit_powerpool.py` **refuse to submit** if
+they cannot read it, rather than guess. At the moment of submitting, the live
+`/check`'s own `REGULAR_SUBMISSION` (value / limit) remains the final authority.
+The local table survives as a history ledger only (`scripts/sync_submissions.py`,
+insert-only, never overwrites or deletes): it still feeds the Genius-pyramid
+coverage report and `status.sh`'s offline fallback. `status.sh` reads the count from
+the platform when a session is alive and labels the line `[平台即時]`, else
+`[本機紀錄,可能落後]`. Similarly, `session_fresh()` now reads the session's end from
+the JWT `exp` in the cookie (the same value `_expires_at` already held) instead of
+guessing "cookie file age + 4 h".
+
+The number this made real: **3 distinct submission days so far this quarter**, against
+the ≥ 20 the code is meant to track. The old table would have said 1.
+
+Also fixed in `status.sh`: it reported the running stage as `--concurrency` (the first
+word after `alphamachine`, which is a global option) and now names the subcommand and
+autoloop separately; it read a catalog log from 2026-08-28 against a hardcoded 299 and
+now counts cached datasets; and its "best candidates" list ranked `gated` rows by
+|Sharpe| alone — one showed a turnover of 1.299 — and now marks what fails today's gates.
+(`progress.sh`, the catalog-run progress bar, still hardcodes 299.)
 
 **`gatelog --passing` is the answer to "what do I actually have that I can
 submit?"** It recomputes every verdict on the spot against whatever `Gates` are
@@ -571,8 +600,8 @@ instead of a hard-coded number.
 `Retry-After` and is not reset by the per-minute budget (you can be throttled
 with 4/5 requests still available). It is never retried; it raises immediately.
 
-**BRAIN allows only 25 biometric requests per day**, and this is the constraint
-that shapes the whole auth design. Two things make it easy to blow:
+**The platform allows only 25 biometric requests per day**, and two things make it
+easy to blow:
 
 * every `POST /authentication` that returns 401-persona **mints a new inquiry**,
   so a retry loop spends quota even when you were not asking for a face check;
@@ -580,20 +609,22 @@ that shapes the whole auth design. Two things make it easy to blow:
   every 10s burns the entire day in about four minutes and earns a
   `429 BIOMETRICS_THROTTLED` lockout with no `Retry-After`.
 
-So `scripts/auth_wait.py` spends **exactly 2 units per attempt**: one to raise
-the inquiry, one to finalise it. Waiting happens on a local sentinel file
-(`touch data/persona_done`), never on the network. `BrainClient` additionally
-enforces a client-side budget of **20 per rolling 24h** and raises rather than
-requesting a 21st — a hard stop, not a warning.
+So `scripts/auth_wait.py` spends **2 units per attempt**: one to raise the inquiry,
+one to finalise it. Waiting happens on a local sentinel file
+(`touch data/persona_done`), never on the network.
 
-**Open question, not a fact:** whether the *finalise* call counts against the 25
-at all. It completes an existing inquiry rather than creating one, so it may
-not. If it doesn't, the client-side 20 throttles at about half the real
-headroom — and biometric downtime was measured at 101 of 208 hours, 49% of the
-pipeline's wall-clock life. `auth_wait.py` now logs the `RateLimit-*` headers of
-the inquiry POST, the finalise POST and a known-free `GET /users/self` control
-(`data/logs/biometric_headers.log`, secrets redacted) so the next verification
-settles it. The budget stays at two units per attempt until that data is in.
+**The client does not count biometric units any more** (removed 2026-09-21). There
+used to be a budget of 20 per rolling 24h kept in `data/biometric_attempts.json`.
+It was added after an early retry loop burned the quota in minutes, and it later
+caused more downtime than it prevented — a session that expires every ~4 h ran into
+*our* number before the platform's. The platform exposes no count to read (checked:
+`/users/self` is profile only, and the only rate-limit headers on `/authentication`
+are per-minute), so it was a guess. What still protects the account: a `429
+BIOMETRICS_THROTTLED` from the platform raises immediately and is never retried, and
+`REAUTH_COOLDOWN` stops one process re-POSTing `/authentication` in a loop. One
+mistake that costs a unit each time and is worth avoiding: leaving `auth_wait.py`
+before it prints `AUTH OK` — the check is bound to the session that raised it, so a
+closed terminal strands a check you already passed.
 
 A verified session's cookie jar is persisted to `data/cookies.json` (mode 600,
 gitignored) and reused, so in normal operation you do the face check once and
@@ -615,9 +646,9 @@ market is a genuinely different alpha, and non-USA regions are far less mined.
 ### Throughput: a slot holds a *request*, not an alpha
 
 `POST /simulations` accepts a JSON **list** of up to 10 payloads, and the whole
-bundle occupies one slot. On a 3-slot account that is the difference between
-**3 alphas in flight and 30** — the single largest throughput lever available,
-and it costs nothing.
+bundle occupies one slot. On a 13-slot account that is the difference between
+**13 alphas in flight and 130** (3 and 30 when this was written) — the single largest
+throughput lever available, and it costs nothing.
 
 Bundling changes two things elsewhere in the machine. `children` come back in
 payload order, so the child index is the only thing tying a result to the
@@ -662,12 +693,28 @@ The in-flight table is the one that actually costs money to get wrong. BRAIN
 charges the slot the moment `POST /simulations` returns and finishes the job
 whether or not anyone is listening. If the progress URL only ever lived in
 memory, a crash mid-poll means the candidate still looks pending on restart and
-you **pay for the same expression twice** — which on a 3-slot account is a real
+you **pay for the same expression twice** — which on a small-slot account is a real
 tax. So the URL is persisted before the first poll, `pending()` excludes
 anything in flight, and `scan`/`refine` call `reclaim()` before dispatching
 anything new.
 
 `report` shows the in-flight count so you can see when there is unharvested work.
+
+**An in-flight marker can outlive its job, and a 404 is not "still running".**
+BRAIN stops serving a progress URL some time after the job ends (`GET` returns
+`404 {"detail": "Not found."}`; a run 261 h old was long gone). `poll()` used to
+ignore the status code: that body has no `children` / `status` / `alpha`, so it was
+read as "finished, payload not built yet" and polled to the deadline, and
+`reclaim()` saw "timeout" and kept the marker as *still running* — so 28 candidates
+were never re-simulated and every start burned ~4.5 min of dead polling. `poll()`
+now gives up after 5 consecutive 404s (one is not enough: a URL queried the instant
+after its POST can briefly not exist), with an error deliberately not worded as a
+timeout. Verified on the live database: `reclaim: 0 recovered, 0 still running, 28
+unrecoverable` in 64 s, in-flight rows 28 → 0.
+
+Also worth knowing: `refine`'s opening query (un-refined survivors, ranked by
+|Sharpe|, over ~80k candidates) is silent and CPU-bound for about five minutes on
+the 2 GB database before its first log line. That is not a hang.
 
 ### Where the quality actually comes from
 
@@ -785,14 +832,13 @@ Re-probe separately before believing a bundle-level rejection.
 **`--concurrency` above your slot count does nothing good.** It builds a
 server-side queue and costs you the ability to react to results as they land.
 
-**Biometric quota is the real operational constraint**, not simulation budget.
-The client hard-stops at 20 requests per rolling 24h against a platform cap of
-25. In steady state you complete one face check and the persisted session
-carries you; the quota only becomes visible when a session lapses mid-run --
-which happens roughly every 4h under unattended operation (`autoloop.py`),
-since each expiry needs its own re-authentication. The interval is a function of
-**consultant tier** (~4h at Gold, up to 24h at Grand Master), so tier is an
-operational variable and not only a payout one.
+**Session lifetime is the real operational constraint**, not simulation budget.
+In steady state you complete one face check and the persisted session carries you;
+it becomes visible when a session lapses mid-run -- roughly every 4h under unattended
+operation (`autoloop.py`), since each expiry needs its own face check by a human. The
+interval is a function of **consultant tier** (~4h at Gold, up to 24h at Grand
+Master), so tier is an operational variable and not only a payout one. The platform's
+daily cap of 25 biometric requests is not tracked locally.
 
 **Kill the parent, never the child.** `autoloop.py` classifies a stage
 subprocess dying as FATAL and stops the whole pipeline. Sending a signal to the
@@ -861,7 +907,7 @@ python3 scripts/tag_powerpool.py pp_deep.json --descriptions hand_written.json
 #    POWER_POOL_CORRELATION (see the note on a stuck queue, below).
 
 # 5. submit by id — dry run unless --live; re-reads the alpha and confirms ACTIVE
-python3 scripts/submit_powerpool.py ID1 ID2 ID3 ID4 --used-today 0
+python3 scripts/submit_powerpool.py ID1 ID2 ID3 ID4
 python3 scripts/submit_powerpool.py ID1 ID2 ID3 ID4 --live
 ```
 
@@ -876,13 +922,13 @@ platform before relying on it.
 
 **Things that will bite you:**
 
-* **State is per-machine.** `data/` is gitignored, so `machine.db` — and with it
-  the local submit counter — is not shared between computers, and a `git pull`
+* **State is per-machine.** `data/` is gitignored, so `machine.db` — the
+  candidates, simulations, bandit state and PnL cache — is not shared between
+  computers, and a `git pull`
   brings only the scripts. The `--json` report is likewise a plain file you must
   carry across yourself (or re-generate: `check_powerpool.py` re-fetches from
-  BRAIN). If you submit from two machines or through the web UI, pass
-  `--used-today N` to `submit_powerpool.py`; BRAIN's platform cap is the final
-  authority regardless of any local counter.
+  BRAIN). Today's submission count is not affected: it is read from the platform, so
+  a submission from another machine or the web UI is counted.
 * **"Today" is the code's assumption.** The counter uses a scoring day starting
   **03:00 America/New_York** (`submit.scoring_day_start()`), i.e. 15:00 in Taiwan
   during US daylight time and 16:00 otherwise. That boundary is the project's own;
