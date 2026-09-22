@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 445 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 463 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -732,12 +732,35 @@ plain `SimulationFailed` and still recorded. Repairing the existing rows is a se
 `scripts/repair_capacity_errors.py` (dry run by default, `--apply` to act) copies every
 matching row to a backup table, subtracts the scan-origin ones from their arms'
 `scan_trials`, deletes them in one transaction and records the counts in kv. It matches
-only this exact error and is idempotent. Then re-run the held-back work with
+only the markers in `client.TRANSIENT_ERROR_MARKERS` (below) and is idempotent. Then re-run the held-back work with
 `scan --pending --budget N` (re-dispatches existing scan candidates with no record —
 `generate()` only ever makes new ones) and `refine --redo-incomplete --top N` (re-ladders
 only ladders with an unsimulated variant; variants on file are replayed, not re-paid).
 As with `--redo`, a ladder that elects a new champion marks it `gated` without un-marking
 the old one, and its gate verdict was already taught to the bandit once per lineage. Throughput at 13 slots: ~1,500–1,800 alphas/hour, against ~127 at 3.
+
+**Capacity was one member of a class: infrastructure failures stored as verdicts.** Re-running
+the repair at 13 slots on 2026-09-22 did the same thing again, differently: the session
+expired mid-run, all 13 executor threads (one `BrainClient` each) re-authenticated at once,
+`POST /authentication` (5/min) answered `429 API rate limit exceeded` and then demanded a
+captcha, `authenticate()` raised a plain `AuthError`, and `run()`'s catch-all
+`except Exception` recorded **3,914 more candidates as ERROR in minutes**. The database also
+held ~570 network blips (`HTTPSConnectionPool … Max retries`, `RemoteDisconnected`,
+`Read timed out`), 402 `DAILY_SIMULATION_LIMIT_EXCEEDED` and ~700 poll deadlines
+(`timeout after 900s`) stored the same way. The rule now: **an infrastructure failure is
+never a candidate's result.** The Executor decides by exception type — `AuthError` (a dead
+session, including captcha / 429 on `/authentication`) halts the run; `DailyLimitReached`
+stops dispatching for the day without the word "HALTED" (autoloop reads that as "wait for a
+human"); network errors, rate-limited child fetches and poll deadlines are deferred with the
+in-flight marker kept, so a paid simulation is harvested by `reclaim()` rather than
+re-bought; only a genuine failure, or an unknown exception (so our own bug cannot loop
+forever), is recorded. `client.TRANSIENT_ERROR_MARKERS` classifies the same failures when
+all that exists is stored text, and the repair script uses that one list. And one failed
+`authenticate()` now pauses **every** client in the process for 5 minutes
+(`BrainClient._pause_auth`, class-level), so a dead session costs one attempt, not
+thirteen. Deliberately left alone: `There was an error while running the simulation. Please
+try again` (48 rows) — it may be BRAIN-side or a specific expression, and cannot be told
+apart from text alone.
 
 ### Where the quality actually comes from
 

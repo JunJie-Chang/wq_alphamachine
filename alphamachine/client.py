@@ -44,6 +44,46 @@ class SimulationFailed(BrainError):
     pass
 
 
+class DailyLimitReached(SimulationFailed):
+    """The platform's daily simulation cap (DAILY_SIMULATION_LIMIT_EXCEEDED) is spent.
+
+    Nothing about the candidate: it resets with the day. The Executor stops dispatching
+    for the rest of the run and leaves everything queued.
+    """
+
+
+# Substrings that mark an error message as INFRASTRUCTURE, not a verdict on the
+# candidate: the slots were full, the daily cap was spent, the API rate-limited us, the
+# session was dead, the network blipped. Such a message must never be stored as a
+# candidate's permanent result. Found 2026-09-21/22: ~25,000 candidates -- 21,074
+# CONCURRENT_SIMULATION_LIMIT_EXCEEDED, 3,914 from a dead session (authenticate() hit
+# its 5/min limit from 13 threads at once), ~570 network blips, 402 DAILY_SIMULATION_
+# LIMIT_EXCEEDED -- were recorded as ERROR for good and counted as failed bandit trials.
+# The Executor decides by exception TYPE where it can; this list classifies messages
+# that only exist as stored text (scripts/repair_capacity_errors.py) or arrive wrapped.
+TRANSIENT_ERROR_MARKERS = (
+    "CONCURRENT_SIMULATION_LIMIT_EXCEEDED",
+    "DAILY_SIMULATION_LIMIT_EXCEEDED",
+    "rate limited [",              # authenticate(): 429 on POST /authentication (5/min)
+    "API rate limit exceeded",
+    "auth failed [",               # incl. the captcha it demands after repeated attempts
+    "BRAIN requires a biometric",  # the session died
+    "simulate [401]",              # ... and re-authenticating inside request() gave up
+    "HTTPSConnectionPool",
+    "Connection aborted",
+    "RemoteDisconnected",
+    "Read timed out",
+    "Connection reset",
+    "NameResolutionError",
+    "timeout after",               # poll deadline: the job may still finish server-side
+)
+
+
+def is_transient_text(msg: str) -> bool:
+    """Is this stored/wrapped error message an infrastructure failure?"""
+    return any(m in (msg or "") for m in TRANSIENT_ERROR_MARKERS)
+
+
 class SlotsBusy(SimulationFailed):
     """Every simulation slot on the account stayed busy for the whole wait.
 
@@ -122,6 +162,21 @@ class BrainClient:
     # The session's end is not a thing to guess: it is the `exp` claim of the JWT in
     # the cookie, already read into _expires_at. This used to be the cookie FILE's
     # mtime plus a hardcoded 4 h, a stand-in for a value sitting in the cookie.
+    # POST /authentication is limited to 5/min and every 401-persona answer mints a
+    # new inquiry, yet each executor thread owns its own BrainClient -- so when the
+    # session died, 13 threads each re-authenticated at once: 3,760 "rate limited" and
+    # 100 "captcha required" answers in minutes. One failed attempt now pauses every
+    # client in the process (class-level), so the other threads raise immediately
+    # instead of posting again.
+    AUTH_PAUSE_SECONDS = 300.0
+    _auth_blocked_until = 0.0
+    _auth_block_reason = ""
+
+    @classmethod
+    def _pause_auth(cls, reason: str) -> None:
+        cls._auth_blocked_until = time.time() + cls.AUTH_PAUSE_SECONDS
+        cls._auth_block_reason = reason
+
     SESSION_MARGIN = 60.0          # seconds: do not trust a session in its last minute
     FALLBACK_TTL_HOURS = 4.0       # only when no expiry can be read at all
 
@@ -270,7 +325,13 @@ class BrainClient:
             log.info("reusing persisted session for %s", self._email)
             return {"reused": True}
         # Every call to this endpoint can mint a persona inquiry, so it is only
-        # reached once the session is really gone.
+        # reached once the session is really gone -- and once one attempt has failed,
+        # no other client in this process may try again for AUTH_PAUSE_SECONDS.
+        if time.time() < BrainClient._auth_blocked_until:
+            raise BiometricRequired(
+                f"authentication paused for {BrainClient._auth_blocked_until - time.time():.0f}s "
+                f"after a failed attempt ({BrainClient._auth_block_reason}); not POSTing "
+                f"/authentication again. Run scripts/auth_wait.py.")
         r = self.s.post(f"{self.api}/authentication",
                         auth=HTTPBasicAuth(self._email, self._password),
                         timeout=self.timeout)
@@ -283,6 +344,7 @@ class BrainClient:
         if r.status_code == 401:
             wa = r.headers.get("WWW-Authenticate", "")
             if "persona" in wa.lower():
+                self._pause_auth("persona check required")
                 loc = r.headers.get("Location", "")
                 url = urljoin(r.url, loc) if loc else ""
                 raise BiometricRequired(
@@ -302,12 +364,14 @@ class BrainClient:
                 detail = (r.json() or {}).get("detail", "")
             except ValueError:
                 pass
+            self._pause_auth("429 on /authentication")
             if "BIOMETRIC" in detail.upper():
                 raise BiometricRequired(
                     "BIOMETRICS_THROTTLED -- the daily biometric quota (25/day) "
                     "is spent. No Retry-After is published; the counter is "
                     "daily, so retry tomorrow. Retrying now only extends it.")
             raise AuthError(f"rate limited [{r.status_code}]: {r.text[:200]}")
+        self._pause_auth(f"HTTP {r.status_code}")
         raise AuthError(f"auth failed [{r.status_code}]: {r.text[:300]}")
 
     def _ensure_auth(self) -> None:
@@ -373,6 +437,8 @@ class BrainClient:
                     detail = (r.json() or {}).get("detail", "")
                 except ValueError:
                     pass
+                if "DAILY_SIMULATION_LIMIT" in detail.upper():
+                    return r          # the caller stops for the day (see simulate())
                 if "CONCURRENT_SIMULATION_LIMIT" in detail.upper():
                     # Capacity, not a rate limit: backing off 2/4/8/16/32 s and then
                     # giving up (what the branch below does) is the wrong shape. The
@@ -494,6 +560,9 @@ class BrainClient:
                 time.sleep(self.SLOT_POLL_SECONDS)
                 continue
             break
+        if r.status_code == 429 and "DAILY_SIMULATION_LIMIT" in (r.text or "").upper():
+            raise DailyLimitReached("DAILY_SIMULATION_LIMIT_EXCEEDED: the daily simulation "
+                                    "cap is spent; nothing was simulated")
         if r.status_code in (200, 201):
             loc = r.headers.get("Location")
             if not loc:

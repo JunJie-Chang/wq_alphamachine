@@ -2927,7 +2927,7 @@ check("repair keeps a restorable copy of every deleted row",
 check("repair subtracts scan trials per arm and never below scan_pass",
       _arms["t1::tp"] == (9, 7, 3) and _arms["t2::tp"] == (0, 1, 1), str(_arms))
 check("repair records what it did in kv",
-      json.loads(_cn44.execute("SELECT v FROM kv WHERE k='repair_capacity_errors'").fetchone()[0])["total"] == 3)
+      json.loads(_cn44.execute("SELECT v FROM kv WHERE k='repair_sims_capacity_errors_test'").fetchone()[0])["total"] == 3)
 check("repair run twice is a no-op", RC44.apply(_cn44, "sims_capacity_errors_test")["applied"] is False
       and _cn44.execute("SELECT COUNT(*) FROM sims_capacity_errors_test").fetchone()[0] == 3)
 check("after repair the poisoned scan candidates are pending again, the genuine error is not",
@@ -2954,6 +2954,151 @@ finally:
     _cli44._setup, _cli44.Executor, _cli44.generate = _saved44
 check("scan --pending dispatches exactly the pending scan candidates, never generates new ones",
       sorted(_FakeEx44.seen or []) == sorted([_s1, _s2]), str(_FakeEx44.seen))
+
+# --- infrastructure failures are never a candidate's verdict ------------------
+from alphamachine.client import (AuthError as _AE45, BiometricRequired as _BR45, DailyLimitReached as _DL45,
+                                 is_transient_text as _tr45, BrainError as _BE45, TRANSIENT_ERROR_MARKERS as _TM45)
+_transient = ['simulate [429]: {"detail":"CONCURRENT_SIMULATION_LIMIT_EXCEEDED"}',
+              'simulate [429]: {"detail":"DAILY_SIMULATION_LIMIT_EXCEEDED"}',
+              'rate limited [429]: {\n "message":"API rate limit exceeded"\n}',
+              'child fetch failed: rate limited [429]: {"message":"API rate limit exceeded"}',
+              'auth failed [400]: {"captcha":["This field is required."]}',
+              'child fetch failed: BRAIN requires a biometric/persona check. Run scripts/auth_wait.py',
+              "HTTPSConnectionPool(host='api.worldquantbrain.com', port=443): Read timed out.",
+              "('Connection aborted.', RemoteDisconnected('Remote end closed connection'))",
+              "HTTPSConnectionPool(host='x', port=443): Max retries exceeded with NameResolutionError",
+              "timeout after 900.0s: https://api.worldquantbrain.com/simulations/abc",
+              'simulate [401]: {"detail":"Incorrect authentication credentials."}']
+_genuine = ['Invalid data field fnd65_totalcap_cusip_saleeps. <linkToCommonErrorMessages>Learn more</link',
+            'Attempted to use unknown variable "attention_beta". <link',
+            "There was an error while running the simulation. Please try again or contact BRAIN",
+            "bundle returned fewer children than payloads", ""]
+check("every infrastructure error seen in the real database classifies as transient",
+      all(_tr45(m) for m in _transient), str([m[:30] for m in _transient if not _tr45(m)]))
+check("a genuine error (bad field, unknown variable, an ambiguous platform message) does not",
+      not any(_tr45(m) for m in _genuine), str([m[:30] for m in _genuine if _tr45(m)]))
+
+# ---- authenticate(): one failed attempt pauses EVERY client in the process
+class _P45:
+    status_code = 401; headers = {"WWW-Authenticate": "persona", "Location": "/authentication/persona?inquiry=i"}
+    text = ""; url = "https://api.worldquantbrain.com/authentication"
+    def json(self): return {}
+def _c45():
+    c = _BC43("a@b.c", "x", cookie_path=os.path.join(tempfile.mkdtemp(), "c.json")); c._posts = 0
+    def _post(*a, **k): c._posts += 1; return _P45()
+    c.s.post = _post; return c
+_BC43._auth_blocked_until = 0.0
+_a, _b = _c45(), _c45()
+try: _a.authenticate()
+except _BR45: pass
+_ra = None
+try: _b.authenticate()
+except _BR45 as e: _ra = str(e)
+check("after one failed authenticate(), another client raises at once and does NOT post again",
+      _a._posts == 1 and _b._posts == 0 and "paused" in (_ra or ""), f"posts a={_a._posts} b={_b._posts}")
+_BC43._auth_blocked_until = 0.0
+try: _b.authenticate()
+except _BR45: pass
+check("...and once the pause has run out it tries again", _b._posts == 1)
+_BC43._auth_blocked_until = 0.0; _BC43._auth_block_reason = ""
+
+# ---- client: the daily cap
+_c, _calls = _cl43([_r43(429, {"detail": "DAILY_SIMULATION_LIMIT_EXCEEDED"})] * 5)
+_dl = None
+try: _c.simulate({"type": "REGULAR"})
+except _DL45 as e: _dl = e
+check("a daily-cap 429 raises DailyLimitReached after ONE call (no backoff loop)",
+      _dl is not None and len(_calls) == 1, f"{len(_calls)} call(s)")
+
+# ---- executor: which failures are stored, which are not
+_st45 = Store(os.path.join(tempfile.mkdtemp(), "inf.db"))
+def _cand45(n):
+    return _st45.add_candidate(expr=f"rank(inf{n})", settings=SimSettings().payload(), theme="t", template="tt", field=f"inf{n}")
+class _FC45:
+    def __init__(self, **kw): self.__dict__.update(kw)
+    def refresh_if_stale(self): pass
+def _ex45(**kw):
+    e = _Ex43(RunConfig(), _st45); e.client = lambda: _FC45(**kw); return e
+def _rows45(cid): return _st45.conn().execute("SELECT COUNT(*) FROM sims WHERE candidate_id=?", (cid,)).fetchone()[0]
+def _infl45(cid): return _st45.conn().execute("SELECT COUNT(*) FROM inflight WHERE candidate_id=?", (cid,)).fetchone()[0]
+def _raise(e): 
+    def f(*a, **k): raise e
+    return f
+
+_i1 = _cand45(1); _e = _ex45(simulate=_raise(_AE45("auth failed [400]: captcha")))
+_r = _e._bundle([_i1])
+check("a dead session (AuthError) halts the run and records nothing",
+      _r == {_i1: {"status": "HALTED"}} and _e._halt.is_set() and _rows45(_i1) == 0)
+
+_i2, _i3 = _cand45(2), _cand45(3); _e = _ex45(simulate=_raise(_DL45("daily")))
+_r1 = _e._bundle([_i2]); _r2 = _e._bundle([_i3])
+check("the daily cap defers, sets the daily flag, and the NEXT bundle is not even attempted",
+      _r1 == {_i2: {"status": "DEFERRED"}} and _e.daily_limit_reached() and _r2 == {_i3: {"status": "DEFERRED"}}
+      and _rows45(_i2) == 0 and _rows45(_i3) == 0 and not _e._halt.is_set())
+
+import requests as _rq45
+_i4 = _cand45(4); _e = _ex45(simulate=_raise(_rq45.ConnectionError("Max retries exceeded")))
+check("a network error before dispatch defers and records nothing",
+      _e._bundle([_i4]) == {_i4: {"status": "DEFERRED"}} and _rows45(_i4) == 0)
+
+_i5 = _cand45(5)
+def _sim_ok(payload): return "https://x/sim/9"
+_e = _ex45(simulate=_sim_ok, poll=_raise(_SF43("timeout after 900.0s: https://x/sim/9")))
+_r = _e._bundle([_i5])
+check("a poll timeout defers, records nothing, and KEEPS the in-flight marker so the paid sim can be harvested",
+      _r == {_i5: {"status": "DEFERRED"}} and _rows45(_i5) == 0 and _infl45(_i5) == 1)
+
+_i6 = _cand45(6); _e = _ex45(simulate=_sim_ok, poll=_raise(_SF43("simulate failed: Invalid data field foo")))
+_e._bundle([_i6])
+check("regression guard: a genuine poll-time failure is STILL recorded as ERROR",
+      _rows45(_i6) == 1 and _infl45(_i6) == 0)
+
+# harvest
+_i7 = _cand45(7); _st45.mark_dispatched(_i7, "https://x/sim/h", 0)
+_e = _ex45(); _row = _st45.candidate(_i7)
+_o = _e._harvest(_FC45(child_result=_raise(_BE45("rate limited [429]: API rate limit exceeded"))), {"children": ["/c/1"]}, [(_i7, _row)])
+check("a rate-limited child fetch defers, records nothing, keeps the marker (the sim is paid for)",
+      _o == {_i7: {"status": "DEFERRED"}} and _rows45(_i7) == 0 and _infl45(_i7) == 1)
+_i8 = _cand45(8); _st45.mark_dispatched(_i8, "https://x/sim/h2", 0)
+_e = _ex45(); _row = _st45.candidate(_i8)
+_o = _e._harvest(_FC45(child_result=_raise(_BR45("BRAIN requires a biometric check"))), {"children": ["/c/1"]}, [(_i8, _row)])
+check("a session that dies mid-harvest halts the run, records nothing, keeps the marker",
+      _o == {_i8: {"status": "HALTED"}} and _e._halt.is_set() and _rows45(_i8) == 0 and _infl45(_i8) == 1)
+_i9 = _cand45(9); _st45.mark_dispatched(_i9, "https://x/sim/h3", 0); _e = _ex45(); _row = _st45.candidate(_i9)
+_e._harvest(_FC45(child_result=_raise(_SF43('Attempted to use unknown variable "zzz"'))), {"children": ["/c/1"]}, [(_i9, _row)])
+check("regression guard: a genuine child failure is STILL recorded as ERROR",
+      _rows45(_i9) == 1)
+
+# run(): the crash path
+class _Boom45(_Ex43):
+    def _bundle(self, cids): raise self.exc
+def _run45(exc, cid):
+    e = _Boom45(RunConfig(), _st45); e.exc = exc; return e.run([cid])
+_j1, _j2, _j3 = _cand45(11), _cand45(12), _cand45(13)
+_s1 = _run45(RuntimeError("rate limited [429]: API rate limit exceeded"), _j1)
+_s2 = _run45(_AE45("bad"), _j2)
+_s3 = _run45(RuntimeError("boom: a bug in our own code"), _j3)
+check("run(): a crashed bundle with a transient message is deferred, not stored",
+      _s1["deferred"] == 1 and _s1["error"] == 0 and _rows45(_j1) == 0, str(_s1))
+check("run(): a crashed bundle with an AuthError is skipped (halt), not stored",
+      _s2["skipped"] == 1 and _s2["error"] == 0 and _rows45(_j2) == 0, str(_s2))
+check("run(): an unknown exception (our own bug) is still recorded, so it cannot loop forever",
+      _s3["error"] == 1 and _rows45(_j3) == 1, str(_s3))
+
+# repair covers every class and only those
+import sqlite3 as _sq45
+_dbp = os.path.join(tempfile.mkdtemp(), "rep2.db"); _st = Store(_dbp)
+_ids = []
+for _n, _msg in enumerate(_transient + _genuine[:4]):
+    _cid = _st.add_candidate(expr=f"rank(z{_n})", settings=SimSettings().payload(), theme="t", template="tp", field=f"z{_n}")
+    _st.record_sim(_cid, {"status": "ERROR", "error": _msg}); _ids.append(_cid)
+_cn = _sq45.connect(_dbp, isolation_level=None)
+_p = RC44.plan(_cn)
+check("repair removes every transient class and keeps the genuine / ambiguous ones",
+      _p["total"] == len(_transient), f"{_p['total']} of {len(_transient)}")
+RC44.apply(_cn, "sims_transient_test")
+check("...leaving exactly the genuine rows behind",
+      _cn.execute("SELECT COUNT(*) FROM sims").fetchone()[0] == 4 and RC44.plan(_cn)["total"] == 0)
 
 import io as _io41, contextlib as _cx41
 from alphamachine import cli as _cli41

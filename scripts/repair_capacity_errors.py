@@ -1,34 +1,48 @@
-"""Undo the damage of simulations wrongly recorded as ERROR when the slots were full.
+"""Undo the damage of simulations recorded as ERROR for reasons that were not the candidate.
 
     python3 scripts/repair_capacity_errors.py            # dry run: what would change
     python3 scripts/repair_capacity_errors.py --apply    # do it
 
-Until 2026-09-21 a `429 CONCURRENT_SIMULATION_LIMIT_EXCEEDED` from POST /simulations
-(every slot busy) made the Executor record the whole bundle as ERROR for good, and
-`scan` taught each one to its bandit arm as a failed trial. Those candidates were never
-simulated. This returns them to the queue:
+Until 2026-09-22 the Executor stored ANY failure as the candidate's permanent result, and
+`scan` taught each one to its bandit arm as a failed trial. The ones this repairs are
+infrastructure failures -- see client.TRANSIENT_ERROR_MARKERS: slots full
+(CONCURRENT_SIMULATION_LIMIT_EXCEEDED, 21,074 rows), a dead session (authenticate()
+rate-limited or demanding a captcha, 3,914), network blips, the daily simulation cap, a
+poll deadline. Those candidates were never simulated (or their result was never fetched).
+This returns them to the queue:
 
   1. copies every matching `sims` row into `sims_capacity_errors_<date>` (restorable);
   2. subtracts, per arm, the scan-origin rows (parent_id IS NULL) from
      `arms.scan_trials` (floored at scan_pass) and `arms.trials` -- refine variants
      never taught the bandit per row, so nothing is subtracted for them;
   3. deletes those `sims` rows, so the candidates are pending again;
-  4. records the counts in kv `repair_capacity_errors`.
+  4. records the counts in kv `repair_<backup table name>`.
 
-All in one transaction. Matches ONLY that exact error; every other ERROR stays. Running
-it again finds nothing. Stop autoloop first. Then re-run the work:
+All in one transaction. Matches ONLY those markers; a genuine error ("Invalid data field",
+"unknown variable") stays. Running it again finds nothing. Stop autoloop first. Then re-run the work:
 `scan --pending --budget N` and `refine --redo-incomplete --top N`.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import time
 
-WHERE = ("s.status='ERROR' AND s.error LIKE 'simulate [429]%' "
-         "AND s.error LIKE '%CONCURRENT_SIMULATION_LIMIT_EXCEEDED%'")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from alphamachine.client import TRANSIENT_ERROR_MARKERS
+
+
+def _like(marker: str) -> str:
+    esc = marker.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("'", "''")
+    return f"s.error LIKE '%{esc}%' ESCAPE '\\'"
+
+
+# One list, shared with the Executor: what it now refuses to store is exactly what this removes.
+WHERE = "s.status='ERROR' AND (" + " OR ".join(_like(m) for m in TRANSIENT_ERROR_MARKERS) + ")"
 
 
 def plan(conn: sqlite3.Connection) -> dict:
@@ -60,10 +74,10 @@ def apply(conn: sqlite3.Connection, backup_table: str) -> dict:
                          "trials=MAX(trials-?, 0) WHERE arm=?", (n, n, arm))
         conn.execute(f"DELETE FROM sims WHERE candidate_id IN "
                      f"(SELECT s.candidate_id FROM sims s WHERE {WHERE})")
-        conn.execute("INSERT OR REPLACE INTO kv VALUES ('repair_capacity_errors', ?)",
-                     (json.dumps({"at": time.time(), "backup_table": backup_table,
+        conn.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)",
+                     (f"repair_{backup_table}", json.dumps({"at": time.time(), "backup_table": backup_table,
                                   "total": p["total"], "by_stage": p["by_stage"],
-                                  "per_arm": p["per_arm"]}),))
+                                  "per_arm": p["per_arm"]})))
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")

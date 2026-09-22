@@ -30,8 +30,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
-from .client import (BiometricRequired, BrainClient, BrainError,
-                     SimulationFailed, SlotsBusy)
+import requests
+
+from .client import (AuthError, BiometricRequired, BrainClient, BrainError,
+                     DailyLimitReached, SimulationFailed, SlotsBusy,
+                     is_transient_text)
 from .config import RunConfig
 from .metrics import extract
 
@@ -52,7 +55,15 @@ class Executor:
         # stop dispatching and leave the queue intact -- NOT to keep going and
         # record hundreds of bogus ERROR rows that permanently block retries.
         self._halt = threading.Event()
+        # The platform's daily simulation cap is spent: nothing more can run today.
+        # Distinct from _halt (a dead session) so autoloop, which reads the word
+        # "HALTED" as "wait for a human to re-authenticate", is not sent to wait.
+        self._daily = threading.Event()
         self._open_bundles: set[str] = set()
+
+    def daily_limit_reached(self) -> bool:
+        """Did the platform's daily simulation cap stop the last run?"""
+        return self._daily.is_set()
 
     def halted(self) -> bool:
         """Did BRAIN demand a persona check during the last run?
@@ -96,6 +107,13 @@ class Executor:
                         recs = fut.result()
                     except Exception as e:
                         log.warning("bundle crashed: %s", e)
+                        if isinstance(e, AuthError):
+                            self._halt.set()              # the session is dead
+                            stats["skipped"] += len(batch)
+                            continue
+                        if isinstance(e, requests.RequestException) or is_transient_text(str(e)):
+                            stats["deferred"] += len(batch)   # network / rate limit: no verdict
+                            continue
                         for cid in batch:
                             self.store.record_sim(
                                 cid, {"status": "ERROR", "error": str(e)[:400]})
@@ -128,6 +146,9 @@ class Executor:
                              stats["ok"], stats["error"])
         finally:
             self._release_open_bundles()
+        if self._daily.is_set():
+            log.error("DAILY_SIMULATION_LIMIT_EXCEEDED: the platform's daily cap is spent. "
+                      "Remaining candidates stay queued; try again after the daily reset.")
         return stats
 
     # -------------------------------------------------------------- bundle
@@ -135,6 +156,8 @@ class Executor:
         """Simulate one bundle of candidates. Returns {candidate_id: record}."""
         if self._halt.is_set():
             return {cid: {"status": "HALTED"} for cid in cids}
+        if self._daily.is_set():
+            return {cid: {"status": "DEFERRED"} for cid in cids}
 
         rows = [self.store.candidate(cid) for cid in cids]
         live = [(cid, r) for cid, r in zip(cids, rows) if r is not None]
@@ -153,7 +176,7 @@ class Executor:
             # Refresh between units of work, while the session is still valid.
             # Waiting for a 401 mid-poll means losing an in-flight bundle.
             c.refresh_if_stale()
-        except BiometricRequired:
+        except AuthError:                                   # BiometricRequired is one
             self._halt.set()
             return {**missing, **{cid: {"status": "HALTED"} for cid, _ in live}}
 
@@ -164,9 +187,16 @@ class Executor:
 
         try:
             loc = c.simulate(payloads[0] if single else payloads)
-        except BiometricRequired:
+        except AuthError:
             self._halt.set()
             return {cid: {"status": "HALTED"} for cid in cids}
+        except DailyLimitReached as e:
+            self._daily.set()                               # stop dispatching for the day
+            log.warning("deferring %d candidate(s): %s", len(live), e)
+            return {**missing, **{cid: {"status": "DEFERRED"} for cid, _ in live}}
+        except requests.RequestException as e:
+            log.warning("deferring %d candidate(s): network error before dispatch: %s", len(live), e)
+            return {**missing, **{cid: {"status": "DEFERRED"} for cid, _ in live}}
         except SlotsBusy as e:
             # Nothing was simulated, so there is nothing to record: writing an ERROR
             # here is what poisoned 21k candidates. They stay pending for the next run.
@@ -190,10 +220,17 @@ class Executor:
         try:
             body = c.poll(loc, interval=self.cfg.poll_interval,
                           timeout=self.cfg.sim_timeout)
-        except BiometricRequired:
-            self._halt.set()
+        except AuthError:
+            self._halt.set()             # dispatched: the in-flight marker stays, reclaim() finds it
             return {cid: {"status": "HALTED"} for cid in cids}
         except SimulationFailed as e:
+            if is_transient_text(str(e)):
+                # e.g. the poll deadline: the job may still finish server-side, and it is
+                # NOT a verdict on the candidate. Leave the in-flight marker (reclaim()
+                # harvests or clears it next run) and keep the bundle in _open_bundles so
+                # the end of the run hands its slot back.
+                log.warning("deferring %d candidate(s): %s", len(live), e)
+                return {**missing, **{cid: {"status": "DEFERRED"} for cid, _ in live}}
             out = dict(missing)
             for cid, _r in live:
                 rec = {"status": "ERROR", "error": str(e)[:400]}
@@ -226,11 +263,21 @@ class Executor:
                 try:
                     child = c.child_result(str(children[idx]).rsplit("/", 1)[-1])
                 except SimulationFailed as e:
+                    if is_transient_text(str(e)):
+                        out[cid] = {"status": "DEFERRED"}   # marker stays: the sim is paid for
+                        continue
                     # This is the useful message: the child's own reason, e.g.
                     # a FASTEXPR parse error naming the offending character.
                     out[cid] = self._fail(cid, str(e))
                     continue
+                except AuthError:
+                    self._halt.set()                        # session died mid-harvest
+                    out[cid] = {"status": "HALTED"}         # marker stays: reclaim() retries
+                    continue
                 except BrainError as e:
+                    if is_transient_text(str(e)):
+                        out[cid] = {"status": "DEFERRED"}
+                        continue
                     out[cid] = self._fail(cid, f"child fetch failed: {e}")
                     continue
                 if (child.get("status") in ("ERROR", "FAIL")

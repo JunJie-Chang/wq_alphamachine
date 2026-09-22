@@ -307,6 +307,10 @@ def cmd_refine(args):
             if s.done:
                 ref.finalize(s)
                 finished.append(s)
+        if ex.daily_limit_reached():
+            print("\nDAILY_SIMULATION_LIMIT_EXCEEDED: the platform's daily cap is spent. "
+                  "Nothing else can run today; re-run after the daily reset.")
+            break
         if ex.halted():
             print("\nHALTED mid-wave. Every simulation already run is stored, "
                   "so re-running this command replays the ladders from the "
