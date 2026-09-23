@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 469 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 475 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -775,6 +775,20 @@ that check is now `client.is_persona_challenge()`, shared by both. A bad-credent
 challenge is unaffected. **If you see this: `.env`'s `WQ_PASSWORD` no longer matches
 the account** (e.g. changed on the site) — fix `.env`, don't retry blindly, since
 repeated failed credentials risk BRAIN flagging the account.
+
+**`reclaim()` had no overall time budget, so a few backend-degraded bundles could block
+dispatch of everything else.** Confirmed live 2026-09-24: after an interrupted run left
+bundles from ~12h earlier in-flight, several of their children hit `child_result`'s own
+300s timeout back to back (BRAIN's backend answering some specific, stale simulation
+records very slowly or not at all) while `reclaim()` processed bundles strictly
+sequentially with no cap on total time — blocking `scan`/`refine`'s dispatch of
+thousands of unrelated, perfectly healthy pending candidates for **well over an hour**
+before the cause was found. `reclaim()` now takes `budget_seconds`
+(`config.reclaim_budget_seconds`, 300s), checked before starting each new bundle: one a
+bundle has not reached by the deadline is left completely untouched (marker kept, tried
+again next run) rather than skipped mid-poll, so the budget is a floor on
+responsiveness, not a hard cutoff. `scan --pending` and `refine` both pass it and report
+how many candidates were left for next time.
 
 ### Where the quality actually comes from
 
