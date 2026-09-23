@@ -44,6 +44,20 @@ class SimulationFailed(BrainError):
     pass
 
 
+def is_persona_challenge(headers) -> bool:
+    """Is this 401's WWW-Authenticate a persona (biometric) challenge?
+
+    BRAIN answers 401 for two different reasons that must not be confused: a
+    persona check (WWW-Authenticate carries "persona") and plain bad credentials
+    (WWW-Authenticate is just the auth scheme, e.g. "Bearer", no Location header).
+    Treating the second as the first prints an EMPTY link -- confirmed live
+    2026-09-23, when a stale WQ_PASSWORD answered 401 INVALID_CREDENTIALS with
+    WWW-Authenticate: Bearer and no Location, and the un-fixed script waited on a
+    sentinel for a URL that was never going to appear.
+    """
+    return "persona" in (headers.get("WWW-Authenticate", "") or "").lower()
+
+
 class DailyLimitReached(SimulationFailed):
     """The platform's daily simulation cap (DAILY_SIMULATION_LIMIT_EXCEEDED) is spent.
 
@@ -342,8 +356,7 @@ class BrainClient:
             log.info("authenticated as %s", self._email)
             return body
         if r.status_code == 401:
-            wa = r.headers.get("WWW-Authenticate", "")
-            if "persona" in wa.lower():
+            if is_persona_challenge(r.headers):
                 self._pause_auth("persona check required")
                 loc = r.headers.get("Location", "")
                 url = urljoin(r.url, loc) if loc else ""

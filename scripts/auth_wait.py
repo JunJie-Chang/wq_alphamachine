@@ -30,6 +30,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 from alphamachine.cli import _load_env
+from alphamachine.client import is_persona_challenge
 
 API = "https://api.worldquantbrain.com"
 COOKIE_FILE = "data/cookies.json"
@@ -116,7 +117,23 @@ def main() -> int:
         print(f"unexpected [{r.status_code}]: {r.text[:200]}")
         return 1
 
+    # A 401 here is not necessarily a persona challenge -- BRAIN also answers 401
+    # INVALID_CREDENTIALS with no Location header (a wrong/rotated WQ_PASSWORD).
+    # That used to fall through to the Location-extraction below, printing an EMPTY
+    # link: the sentinel would then wait on nothing, and finalise() would POST to "".
+    if not is_persona_challenge(r.headers):
+        print(f"AUTH FAILED (not a persona challenge): [{r.status_code}] {r.text[:200]}\n"
+              f"WWW-Authenticate: {r.headers.get('WWW-Authenticate', '')!r}\n"
+              f"WQ_EMAIL / WQ_PASSWORD in .env are being rejected by BRAIN -- check "
+              f"they still match your account (a password change on the site would "
+              f"do this) and fix .env before retrying. Not retrying automatically: "
+              f"repeated failed attempts risk BRAIN flagging or locking the account.")
+        return 1
+
     loc = r.headers.get("Location", "")
+    if not loc:
+        print(f"persona challenge with no Location header: {dict(r.headers)}")
+        return 1
     url = f"{API}{loc}" if loc.startswith("/") else loc
     os.makedirs("data", exist_ok=True)
     open(URL_FILE, "w").write(url + "\n")

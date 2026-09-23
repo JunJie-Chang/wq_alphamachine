@@ -3100,7 +3100,62 @@ RC44.apply(_cn, "sims_transient_test")
 check("...leaving exactly the genuine rows behind",
       _cn.execute("SELECT COUNT(*) FROM sims").fetchone()[0] == 4 and RC44.plan(_cn)["total"] == 0)
 
+# --- is_persona_challenge: tell a real persona check apart from bad credentials --
 import io as _io41, contextlib as _cx41
+from alphamachine.client import is_persona_challenge as _ipc46
+check("a genuine persona challenge is recognised (case-insensitive)",
+      _ipc46({"WWW-Authenticate": "Persona realm=\"brain\""}))
+check("plain bad credentials (Bearer, no persona) is NOT a persona challenge -- "
+      "confirmed live 2026-09-23: 401 INVALID_CREDENTIALS answered WWW-Authenticate: Bearer",
+      not _ipc46({"WWW-Authenticate": "Bearer"}))
+check("no WWW-Authenticate header at all is not a persona challenge",
+      not _ipc46({}))
+
+# auth_wait.main(), scripted against exactly the two response shapes seen live
+import importlib
+import auth_wait as _AW46  # scripts/ is on sys.path via smoke_test's own insert
+class _R46:
+    def __init__(self, code, headers, text="", loc=None):
+        self.status_code, self.headers, self.text = code, dict(headers), text
+        if loc is not None:
+            self.headers["Location"] = loc
+def _fresh_auth_wait(email="a@b.c", pw="x", responses=()):
+    """A real requests.Session (so .cookies / .headers behave normally), with
+    .get/.post patched: no persisted session, then the scripted responses in order."""
+    d = tempfile.mkdtemp()
+    importlib.reload(_AW46)
+    _AW46.COOKIE_FILE = os.path.join(d, "cookies.json")
+    _AW46.SENTINEL = os.path.join(d, "persona_done")
+    _AW46.URL_FILE = os.path.join(d, "persona_url.txt")
+    _AW46._load_env = lambda: None
+    os.environ["WQ_EMAIL"], os.environ["WQ_PASSWORD"] = email, pw
+    it = iter(responses)
+    import requests as _rq46
+    real = _rq46.Session()
+    real.get = lambda *a, **k: _R46(404, {})              # no persisted session
+    real.post = lambda *a, **k: next(it)
+    _AW46.requests.Session = lambda: real
+    return _AW46, d
+
+_aw, _d = _fresh_auth_wait(responses=[_R46(401, {"WWW-Authenticate": "Bearer"},
+                                           '{"detail":"INVALID_CREDENTIALS"}')])
+_out46 = _io41.StringIO()
+with _cx41.redirect_stdout(_out46):
+    _rc46 = _aw.main()
+check("bad credentials: auth_wait exits non-zero with a clear message, no empty link printed",
+      _rc46 == 1 and "not a persona challenge" in _out46.getvalue()
+      and "1. Open this in a browser" not in _out46.getvalue(), _out46.getvalue()[:200])
+check("bad credentials: no persona_url.txt is written (nothing to wait on)",
+      not os.path.exists(_aw.URL_FILE))
+
+_aw, _d = _fresh_auth_wait(responses=[_R46(401, {"WWW-Authenticate": "Persona"}, loc="/authentication/persona?inquiry=i")])
+_out46b = _io41.StringIO()
+_aw.WAIT_MINUTES = 0.001
+with _cx41.redirect_stdout(_out46b):
+    _rc46b = _aw.main()
+check("a genuine persona challenge still prints the real link and times out waiting (not stuck on step 1)",
+      "1. Open this in a browser" in _out46b.getvalue()
+      and "authentication/persona?inquiry=i" in _out46b.getvalue() and _rc46b == 1)
 from alphamachine import cli as _cli41
 # (an earlier section replaces subprocess.Popen with a fake, so drive argparse directly)
 _buf41 = _io41.StringIO()

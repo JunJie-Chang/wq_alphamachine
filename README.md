@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 463 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 469 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -761,6 +761,20 @@ all that exists is stored text, and the repair script uses that one list. And on
 thirteen. Deliberately left alone: `There was an error while running the simulation. Please
 try again` (48 rows) — it may be BRAIN-side or a specific expression, and cannot be told
 apart from text alone.
+
+**A 401 on `/authentication` is not always a persona challenge — check `WWW-Authenticate`
+before reading `Location`.** Confirmed live 2026-09-23: BRAIN answered a stale
+`WQ_PASSWORD` with `401 INVALID_CREDENTIALS`, `WWW-Authenticate: Bearer`, and no
+`Location` header. `scripts/auth_wait.py` treated every 401 as a persona check and
+extracted `Location` unconditionally, so it printed an **empty link** and then waited
+30 minutes on a sentinel for a browser step that had nothing to complete — the
+finalise POST would have gone to `""`. `client.py`'s `authenticate()` already
+distinguished the two by checking whether `WWW-Authenticate` mentions "persona";
+that check is now `client.is_persona_challenge()`, shared by both. A bad-credentials
+401 now prints the real reason and exits instead of waiting; a genuine persona
+challenge is unaffected. **If you see this: `.env`'s `WQ_PASSWORD` no longer matches
+the account** (e.g. changed on the site) — fix `.env`, don't retry blindly, since
+repeated failed credentials risk BRAIN flagging the account.
 
 ### Where the quality actually comes from
 
