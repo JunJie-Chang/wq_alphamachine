@@ -246,16 +246,29 @@ class Executor:
         return {**missing, **self._harvest(c, body, live)}
 
     def _harvest(self, c: BrainClient, body: dict,
-                 live: list[tuple[str, object]]) -> dict[str, dict]:
+                 live: list[tuple[str, object]],
+                 deadline: float | None = None) -> dict[str, dict]:
         """Turn a resolved progress payload into per-candidate records.
 
         `children` come back in payload order, which is the only thing tying a
         child result to the expression that produced it.
+
+        `deadline`: children are fetched ONE AT A TIME (`child_result`'s own
+        timeout is 300s), so a single bundle with several backend-degraded
+        children can itself run well past any budget the caller enforces only
+        between bundles -- confirmed live 2026-09-24, one 7-child bundle alone
+        cost 20+ minutes this way. Checked before EACH child (not just once per
+        bundle): a child not yet started when the deadline passes is left
+        completely alone (no entry in the returned dict, so its marker and any
+        earlier candidates' results in this same bundle are untouched) rather
+        than skipped after being counted as a failure.
         """
         out: dict[str, dict] = {}
         children = body.get("children")
         if children:
             for idx, (cid, _r) in enumerate(live):
+                if deadline is not None and time.time() >= deadline:
+                    break
                 if idx >= len(children):
                     out[cid] = self._fail(cid, "bundle returned fewer children "
                                                "than payloads")
@@ -383,9 +396,14 @@ class Executor:
                     self.store.clear_dispatched(cid)
                 out["lost"] += len(live)
                 continue
-            recs = self._harvest(c, body, live)
+            recs = self._harvest(c, body, live, deadline=deadline)
+            out["deferred_by_budget"] += len(live) - len(recs)
             for rec in recs.values():
-                out["reclaimed" if rec.get("status") == "OK" else "lost"] += 1
+                status = rec.get("status")
+                if status == "DEFERRED":
+                    out["still_running"] += 1
+                else:
+                    out["reclaimed" if status == "OK" else "lost"] += 1
         if out["deferred_by_budget"]:
             log.info("reclaim: time budget spent -- %d candidate(s) across the "
                      "remaining bundle(s) left untouched, retried next time",

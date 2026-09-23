@@ -3178,6 +3178,52 @@ try:
 finally:
     _exmod47.time.time = _saved_time47
 
+# --- the SAME check, one level down: a single bundle with several slow children ---
+# must not itself blow the whole budget, uninterrupted, just because it already started.
+class _MultiChildClient50:
+    """poll() resolves fast with N children; child_result() costs fake-clock time each."""
+    def __init__(self, clock, n_children, child_cost):
+        self.clock, self.n, self.cost = clock, n_children, child_cost
+        self.child_calls = []
+    def poll(self, url, **kw):
+        return {"children": [f"c{i}" for i in range(self.n)]}
+    def child_result(self, cid, **kw):
+        self.child_calls.append(cid)
+        self.clock.advance(self.cost)
+        return {"alpha": f"https://api/alphas/A{cid}"}
+    def alpha(self, aid):
+        return {"id": aid, "is": {"sharpe": 1.0}, "status": "UNSUBMITTED",
+                "settings": {}, "regular": {}}
+
+_st50 = Store(os.path.join(tempfile.mkdtemp(), "budget4.db"))
+_cids50 = []
+for i in range(5):
+    cid = _st50.add_candidate(expr=f"rank(bud4_{i})", settings=SimSettings().payload(),
+                              theme="t", template="tp", field=f"bud4_{i}")
+    _st50.mark_dispatched(cid, "https://x/sim/onebundle", i)
+    _cids50.append(cid)
+
+_clock50 = _FakeClock47()
+_exmod47.time.time = _clock50.time
+try:
+    _ex50 = _Ex47(RunConfig(), _st50)
+    _fc50 = _MultiChildClient50(_clock50, n_children=5, child_cost=50.0)
+    _ex50.client = lambda: _fc50
+    _rc50 = _ex50.reclaim(budget_seconds=105.0)   # room for ~2 of 5 children, not all
+    check("a single bundle with several slow children is cut off mid-bundle, not let run to completion",
+          0 < len(_fc50.child_calls) < 5, str(_fc50.child_calls))
+    check("children fetched before the deadline are properly recorded (real OK sims rows)",
+          all(_st50.conn().execute("SELECT status FROM sims WHERE candidate_id=?", (_cids50[i],)).fetchone()[0] == "OK"
+              for i in range(len(_fc50.child_calls))))
+    check("children never reached (deadline passed mid-bundle) are left completely alone",
+          all(_st50.conn().execute("SELECT COUNT(*) FROM sims WHERE candidate_id=?", (_cids50[i],)).fetchone()[0] == 0
+              and _st50.conn().execute("SELECT COUNT(*) FROM inflight WHERE candidate_id=?", (_cids50[i],)).fetchone()[0] == 1
+              for i in range(len(_fc50.child_calls), 5)))
+    check("reclaim() counts the mid-bundle-skipped candidates as deferred_by_budget",
+          _rc50["deferred_by_budget"] == 5 - len(_fc50.child_calls), str(_rc50))
+finally:
+    _exmod47.time.time = _saved_time47
+
 _st49 = Store(os.path.join(tempfile.mkdtemp(), "budget3.db"))
 _cid49 = _st49.add_candidate(expr="rank(bud3)", settings=SimSettings().payload(),
                              theme="t", template="tp", field="bud3")

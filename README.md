@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 475 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 479 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -789,6 +789,16 @@ bundle has not reached by the deadline is left completely untouched (marker kept
 again next run) rather than skipped mid-poll, so the budget is a floor on
 responsiveness, not a hard cutoff. `scan --pending` and `refine` both pass it and report
 how many candidates were left for next time.
+
+**The first fix was not enough on its own — checked only *between* bundles, not
+between children.** `child_result` is fetched one at a time within a bundle, and each
+carries its *own* 300s timeout, so a single multi-child bundle sitting on
+backend-degraded records can itself run well past the whole budget: confirmed live
+2026-09-24, one 7-child bundle alone cost 20+ minutes once it had already started,
+because the between-bundle check never got a chance to fire on it. `_harvest()` now
+takes the same `deadline` and checks it before *each* child, not once per bundle — a
+child not yet reached is left exactly as untouched as a whole skipped bundle is, and
+counts the same way (`deferred_by_budget`).
 
 ### Where the quality actually comes from
 
