@@ -2938,7 +2938,8 @@ check("after repair the ladder missing its variant is found by incomplete_lineag
 class _FakeEx44:
     seen = None
     def __init__(self, cfg, store): pass
-    def reclaim(self): return {"reclaimed": 0, "still_running": 0, "lost": 0}
+    def reclaim(self, budget_seconds=None):
+        return {"reclaimed": 0, "still_running": 0, "lost": 0, "deferred_by_budget": 0}
     def run(self, ids, on_result=None):
         _FakeEx44.seen = list(ids); return {"ok": 0, "error": 0, "skipped": 0, "deferred": 0}
 _saved44 = (_cli44._setup, _cli44.Executor, _cli44.generate)
@@ -3101,6 +3102,98 @@ check("...leaving exactly the genuine rows behind",
       _cn.execute("SELECT COUNT(*) FROM sims").fetchone()[0] == 4 and RC44.plan(_cn)["total"] == 0)
 
 # --- is_persona_challenge: tell a real persona check apart from bad credentials --
+# --- reclaim(): a time budget must not let a few stuck bundles block everything -
+from alphamachine.executor import Executor as _Ex47
+import alphamachine.executor as _exmod47
+
+_st47 = Store(os.path.join(tempfile.mkdtemp(), "budget.db"))
+def _cand47(n):
+    return _st47.add_candidate(expr=f"rank(bud{n})", settings=SimSettings().payload(),
+                               theme="t", template="tp", field=f"bud{n}")
+_ids47 = {}
+for i, url in enumerate(["u1", "u2", "u3"]):
+    cid = _cand47(i)
+    _st47.mark_dispatched(cid, f"https://x/sim/{url}", 0)
+    _ids47[url] = cid
+
+class _FakeClock47:
+    def __init__(self, start=1000.0): self.t = start
+    def time(self): return self.t
+    def advance(self, dt): self.t += dt
+
+class _PollTrack47:
+    """.poll(url) -> a resolved body with one alpha; records call order and
+    advances the fake clock to simulate the real wall-clock cost of polling."""
+    def __init__(self, clock, cost=1.0):
+        self.clock, self.cost, self.calls = clock, cost, []
+    def poll(self, url, **kw):
+        self.calls.append(url)
+        self.clock.advance(self.cost)
+        return {"alpha": "https://api/alphas/A" + url[-1]}
+    def alpha(self, aid):
+        return {"id": aid, "is": {"sharpe": 1.0}, "status": "UNSUBMITTED",
+                "settings": {}, "regular": {}}
+
+_clock47 = _FakeClock47()
+_saved_time47 = _exmod47.time.time
+_exmod47.time.time = _clock47.time
+try:
+    _ex47 = _Ex47(RunConfig(), _st47)
+    _fc47 = _PollTrack47(_clock47, cost=1.0)
+    _ex47.client = lambda: _fc47
+    _rc47 = _ex47.reclaim(budget_seconds=None)
+    check("reclaim() with no budget processes every bundle",
+          len(_fc47.calls) == 3 and _rc47["reclaimed"] == 3, str(_rc47))
+finally:
+    _exmod47.time.time = _saved_time47
+
+_st48 = Store(os.path.join(tempfile.mkdtemp(), "budget2.db"))
+_ids48 = {}
+for i, url in enumerate(["u1", "u2", "u3"]):
+    cid = _st48.add_candidate(expr=f"rank(bud2_{i})", settings=SimSettings().payload(),
+                              theme="t", template="tp", field=f"bud2_{i}")
+    _st48.mark_dispatched(cid, f"https://x/sim/{url}", 0)
+    _ids48[url] = cid
+
+_clock48 = _FakeClock47()
+_exmod47.time.time = _clock48.time
+try:
+    _ex48 = _Ex47(RunConfig(), _st48)
+    _fc48 = _PollTrack47(_clock48, cost=10.0)   # each poll costs 10s of fake wall-clock
+    _ex48.client = lambda: _fc48
+    _rc48 = _ex48.reclaim(budget_seconds=15.0)  # room for ~1 bundle, not all 3
+    check("a tight budget processes what fits and stops, not everything",
+          0 < len(_fc48.calls) < 3, str(_fc48.calls))
+    check("reclaim() reports how many were left untouched by the budget",
+          _rc48["deferred_by_budget"] == 3 - len(_fc48.calls), str(_rc48))
+    _untouched48 = set(_ids48.values()) - {_ids48[u.rsplit("/", 1)[-1]] for u in _fc48.calls}
+    check("a bundle the budget skipped is left completely alone -- marker untouched, no sim written",
+          all(_st48.conn().execute("SELECT COUNT(*) FROM inflight WHERE candidate_id=?", (cid,)).fetchone()[0] == 1
+              and _st48.conn().execute("SELECT COUNT(*) FROM sims WHERE candidate_id=?", (cid,)).fetchone()[0] == 0
+              for cid in _untouched48), str(_untouched48))
+    check("a bundle ALREADY started before the deadline is allowed to finish, not cut mid-poll",
+          all(_st48.conn().execute("SELECT COUNT(*) FROM sims WHERE candidate_id=?",
+                                   (_ids48[u.rsplit('/', 1)[-1]],)).fetchone()[0] == 1
+              for u in _fc48.calls))
+finally:
+    _exmod47.time.time = _saved_time47
+
+_st49 = Store(os.path.join(tempfile.mkdtemp(), "budget3.db"))
+_cid49 = _st49.add_candidate(expr="rank(bud3)", settings=SimSettings().payload(),
+                             theme="t", template="tp", field="bud3")
+_st49.mark_dispatched(_cid49, "https://x/sim/u9", 0)
+_clock49 = _FakeClock47()
+_exmod47.time.time = _clock49.time
+try:
+    _ex49 = _Ex47(RunConfig(), _st49)
+    _fc49 = _PollTrack47(_clock49, cost=1.0)
+    _ex49.client = lambda: _fc49
+    _rc49 = _ex49.reclaim(budget_seconds=0.0)
+    check("budget_seconds=0 defers every bundle without polling any",
+          _fc49.calls == [] and _rc49["deferred_by_budget"] == 1, str(_rc49))
+finally:
+    _exmod47.time.time = _saved_time47
+
 import io as _io41, contextlib as _cx41
 from alphamachine.client import is_persona_challenge as _ipc46
 check("a genuine persona challenge is recognised (case-insensitive)",

@@ -329,21 +329,36 @@ class Executor:
                 log.info("released slot: %s", u)
 
     # ---------------------------------------------------------- reclaiming
-    def reclaim(self) -> dict:
+    def reclaim(self, budget_seconds: float | None = None) -> dict:
         """Harvest simulations BRAIN ran while we were not listening.
 
         A crash mid-poll leaves the slot already paid for; BRAIN finishes the
         job regardless. Polling the stored progress URL turns that sunk cost
         back into a result instead of paying for the same expression twice.
+
+        `budget_seconds` caps total WALL-CLOCK time, not bundle count: each bundle
+        can itself cost up to ~90s (its own poll) plus, per child, up to
+        `child_result`'s 300s timeout if BRAIN's backend is slow to answer that
+        specific record. With no cap, a handful of backend-degraded bundles left
+        over from an interrupted run can block dispatch of thousands of unrelated,
+        perfectly healthy pending candidates for over an hour -- confirmed live
+        2026-09-24. A bundle not yet STARTED when the budget runs out is left
+        completely alone (its marker untouched, tried again on the next reclaim);
+        one already being polled is allowed to finish rather than cut off mid-poll,
+        so the budget is a floor on responsiveness, not a hard deadline.
         """
         bundles = self.store.inflight_bundles()
-        out = {"reclaimed": 0, "still_running": 0, "lost": 0}
+        out = {"reclaimed": 0, "still_running": 0, "lost": 0, "deferred_by_budget": 0}
         if not bundles:
             return out
         log.info("reclaiming %d in-flight bundle(s) from a previous run",
                  len(bundles))
         c = self.client()
+        deadline = None if budget_seconds is None else time.time() + budget_seconds
         for url, rows in bundles.items():
+            if deadline is not None and time.time() >= deadline:
+                out["deferred_by_budget"] += len(rows)
+                continue
             live = []
             for r in rows:
                 cand = self.store.candidate(r["candidate_id"])
@@ -371,6 +386,10 @@ class Executor:
             recs = self._harvest(c, body, live)
             for rec in recs.values():
                 out["reclaimed" if rec.get("status") == "OK" else "lost"] += 1
+        if out["deferred_by_budget"]:
+            log.info("reclaim: time budget spent -- %d candidate(s) across the "
+                     "remaining bundle(s) left untouched, retried next time",
+                     out["deferred_by_budget"])
         log.info("reclaim: %d recovered, %d still running, %d unrecoverable",
                  out["reclaimed"], out["still_running"], out["lost"])
         return out

@@ -109,10 +109,14 @@ def cmd_scan(args):
         return
 
     ex = Executor(cfg, store)
-    rc = ex.reclaim()          # harvest anything a previous crash left in flight
-    if rc["reclaimed"] or rc["still_running"]:
-        print(f"reclaimed {rc['reclaimed']} in-flight sims "
-              f"({rc['still_running']} still running, {rc['lost']} lost)")
+    rc = ex.reclaim(budget_seconds=cfg.reclaim_budget_seconds)
+    if rc["reclaimed"] or rc["still_running"] or rc.get("deferred_by_budget"):
+        msg = (f"reclaimed {rc['reclaimed']} in-flight sims "
+               f"({rc['still_running']} still running, {rc['lost']} lost)")
+        if rc.get("deferred_by_budget"):
+            msg += (f"; {rc['deferred_by_budget']} left untouched (reclaim time "
+                    f"budget spent, will retry next run)")
+        print(msg)
     bandit = Bandit(store, [], seed=args.seed)
     g = cfg.gates
 
@@ -252,9 +256,13 @@ def cmd_refine(args):
               "to re-ladder ones already done")
         return
     ex = Executor(cfg, store)
-    rc = ex.reclaim()
-    if rc["reclaimed"]:
-        print(f"reclaimed {rc['reclaimed']} in-flight sims from a previous run")
+    rc = ex.reclaim(budget_seconds=cfg.reclaim_budget_seconds)
+    if rc["reclaimed"] or rc.get("deferred_by_budget"):
+        msg = f"reclaimed {rc['reclaimed']} in-flight sims from a previous run"
+        if rc.get("deferred_by_budget"):
+            msg += (f"; {rc['deferred_by_budget']} left untouched (reclaim time "
+                    f"budget spent, will retry next run)")
+        print(msg)
     ref = Refiner(store, ex, g)
     bandit = Bandit(store, [], seed=args.seed)
     sub = Submitter(cfg, store, client)
