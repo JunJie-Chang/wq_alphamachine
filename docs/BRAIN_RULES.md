@@ -101,3 +101,30 @@ turnover < 30% 時，PASS 門檻乘以 **0.85**（FAIL_THRESHOLD 不乘）。
 | 小 universe 加分 | 顧問制是 **大 universe 較佳** | 方向相反 |
 | D0 比 D1 值錢 | **2023 起等值** | 不需為了 delay 調整策略 |
 | 提交總數重要 | **提交天數更重要**（<20 天/季 → Value Factor 最低） | 排程策略完全不同 |
+
+## 8. 本專案實測擬合（既非官方、也非已推翻）
+
+前面每一節都是從官方文件轉錄的，第 7 節是查證後推翻的。這一節是**第三類**：
+本專案自己對平台行為做實測後擬合出來的數字。官方文件沒有寫，我們也沒有推翻它，
+它只是「目前為止最能重現平台回報數值的解釋」。
+
+> **這類數字不得被當成官方規範引用。** 兩層信任模型（官方文件 vs 社群逆向）
+> 原本沒有涵蓋它，導致同一個常數在專案裡被兩種方式對待——這一節就是為了讓它有地方可放。
+
+| 數字 | 內容 | 證據強度 | 目前用途 |
+|---|---|---|---|
+| `correlate.BRAIN_CORR_YEARS = 4` | SELF_CORRELATION 與 Power Pool 相關性是用**最後四個日曆年**的每日 PnL 變化計算，非全歷史 | commit `b8580e3`（2026-09-20）對上 11 個平台回報值到小數點後四位，**另有 1 個對不上**（SELF 回報 0.2271、算出 0.1791，至今無解釋）。全歷史視窗在每一個樣本上都低讀 0.03–0.05 | 僅 `scripts/corr_powerpool.py` 使用，且額外加 `SAFETY = 0.10` 緩衝。主 pipeline 的 `CorrelationBook` **尚未採用**，待 `scripts/verify_corr_window.py` 在當前帳本上重驗後再決定 |
+
+**明確不適用於 `PROD_CORRELATION`。** 上述 11 個重現值全部是 SELF 或 POWER_POOL，
+沒有任何一個是 PROD。PROD 是對比全平台已提交的 alpha，那些 alpha 的 PnL 根本抓不到，
+所以把四年視窗套到 PROD 是沒有證據的外推。
+
+重驗方式（離線、不花配額）：
+
+```bash
+python3 scripts/verify_corr_window.py --windows 2,3,4,5,6
+```
+
+它從 `deep_checks`（已存的 `/check` payload）讀平台自己回報的 SELF_CORRELATION，
+從 `pnl` 讀序列，逐一比較各視窗的重現誤差。判定規則寫在該腳本的 docstring 裡，
+是**事前**聲明的。
