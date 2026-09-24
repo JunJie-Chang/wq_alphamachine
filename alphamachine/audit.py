@@ -378,6 +378,48 @@ def check_stuck_inflight(conn: sqlite3.Connection, *,
     return out
 
 
+def check_theme_arm_consistency(conn: sqlite3.Connection) -> list[Finding]:
+    """An arm name is `theme::template`, and nothing enforces that it still
+    describes a candidate that exists.
+
+    Two ways it silently stops being true. A theme re-derivation (the regex
+    behind infer_theme has been wrong twice) renames the arm a candidate
+    belongs to, stranding the old row with the evidence still on it while the
+    corrected one restarts at the pessimistic prior. And a child inherits its
+    parent's theme by assignment in refine.py, so if the two ever disagree the
+    bandit is being taught under two names for what is one idea.
+
+    Both are invisible to every other check here: the counters stay internally
+    consistent, they are just attributed to a name nothing points at any more.
+    """
+    out = []
+    live = {f"{r['theme']}::{r['template']}" for r in conn.execute(
+        "SELECT DISTINCT theme, template FROM candidates "
+        "WHERE theme IS NOT NULL AND template IS NOT NULL")}
+    for table in ("arms", "bandit_taught"):
+        col = "arm"
+        rows = conn.execute(
+            f"SELECT DISTINCT {col} a FROM {table} WHERE {col} IS NOT NULL").fetchall()
+        stranded = sorted({r["a"] for r in rows} - live)
+        if stranded:
+            out.append(Finding(
+                "theme_arm_stranded", "warning", table,
+                f"{len(stranded)} arm name(s) in {table} match no candidate's "
+                f"(theme, template) -- evidence attributed to a name nothing "
+                f"points at, which is what a theme re-derivation leaves behind",
+                {"examples": ", ".join(stranded[:8]), "count": len(stranded)}))
+    mismatched = conn.execute(
+        "SELECT COUNT(*) n FROM candidates c JOIN candidates pa "
+        "ON pa.id = c.parent_id WHERE c.theme IS NOT pa.theme").fetchone()["n"]
+    if mismatched:
+        out.append(Finding(
+            "lineage_theme_mismatch", "critical", "candidates",
+            "a refine child's theme differs from its parent's, so one lineage "
+            "teaches two different bandit arms",
+            {"rows": mismatched}))
+    return out
+
+
 CHECKS = [
     check_gate_history_ok0_with_deep,
     check_deep_checks_poisoned,
@@ -390,6 +432,7 @@ CHECKS = [
     check_field2_shape,
     check_orphan_references,
     check_stuck_inflight,
+    check_theme_arm_consistency,
 ]
 
 

@@ -656,6 +656,94 @@ class Store:
                   "WHERE scan_trials=0 AND refine_trials=0")
         c.commit()
 
+    def rebuild_arms_from_evidence(self) -> dict:
+        """Recompute every arm counter from the rows that justify it.
+
+        Written for the case where a field's inferred theme changes, which
+        renames its arm -- `arm` is the text `theme::template` and nothing else.
+        Renaming the rows in place cannot work: two old arms can collapse into
+        one (sum the counters) while a third splits across two, and a split
+        cannot be apportioned because the arm row does not record which
+        candidate contributed which trial. Deriving instead of renaming makes
+        both cases the same GROUP BY, and drops stranded arms for free.
+
+        Reads `candidates.theme`, so update that FIRST.
+
+        Not one transaction: the two reused backfills commit for themselves.
+        What holds instead is idempotency -- every counter is an absolute value
+        recomputed from primary evidence, so an interrupted run is repaired by
+        running it again, not by unwinding it.
+        """
+        from .config import Gates
+        floor = Gates().scan_abs_sharpe
+        c = self.conn()
+        before = c.execute("SELECT COUNT(*) FROM arms").fetchone()[0]
+        c.execute("DELETE FROM arms")
+
+        # Scan stage: parent_id IS NULL identifies a scan-generated candidate
+        # exactly (generator never sets a parent, Refiner._queue always does).
+        for r in c.execute(
+                "SELECT c.theme, c.template, COUNT(*) n,"
+                "       SUM(CASE WHEN s.status='OK' AND ABS(s.sharpe) >= ?"
+                "                THEN 1 ELSE 0 END) passed,"
+                "       SUM(CASE WHEN s.status='OK' THEN ABS(s.sharpe) ELSE 0 END) ss"
+                "  FROM sims s JOIN candidates c ON c.id = s.candidate_id"
+                " WHERE c.parent_id IS NULL AND c.theme IS NOT NULL"
+                " GROUP BY c.theme, c.template", (floor,)).fetchall():
+            c.execute("INSERT OR IGNORE INTO arms(arm,updated) VALUES (?,?)",
+                      (f"{r['theme']}::{r['template']}", time.time()))
+            c.execute("UPDATE arms SET scan_trials=?, scan_pass=?, sum_sharpe=?"
+                      " WHERE arm=?",
+                      (r["n"], r["passed"] or 0, r["ss"] or 0.0,
+                       f"{r['theme']}::{r['template']}"))
+
+        # Gate stage, per lineage root, last verdict wins -- the same rule
+        # _rebuild_deep_trials applies, because a re-check reflects the book as
+        # it stands now rather than as it stood the first time.
+        by_root: dict[str, tuple[str, int]] = {}
+        for r in c.execute(
+                "SELECT g.candidate_id, g.ok, cn.theme, cn.template"
+                "  FROM gate_history g JOIN candidates cn ON cn.id = g.candidate_id"
+                " WHERE g.ok IS NOT NULL ORDER BY g.ts").fetchall():
+            by_root[self.lineage_root(r["candidate_id"])] = (
+                f"{r['theme']}::{r['template']}", int(bool(r["ok"])))
+        for root, (arm, ok) in by_root.items():
+            c.execute("INSERT OR IGNORE INTO arms(arm,updated) VALUES (?,?)",
+                      (arm, time.time()))
+            c.execute("UPDATE arms SET refine_trials=refine_trials+1,"
+                      " gate_pass=gate_pass+? WHERE arm=?", (ok, arm))
+            c.execute("UPDATE bandit_taught SET arm=? WHERE stage='gate' AND key=?",
+                      (arm, root))
+
+        for r in c.execute(
+                "SELECT cd.theme, cd.template, COUNT(*) n FROM submissions sb"
+                "  JOIN sims s ON s.alpha_id = sb.alpha_id"
+                "  JOIN candidates cd ON cd.id = s.candidate_id"
+                " WHERE cd.theme IS NOT NULL GROUP BY cd.theme, cd.template").fetchall():
+            c.execute("INSERT OR IGNORE INTO arms(arm,updated) VALUES (?,?)",
+                      (f"{r['theme']}::{r['template']}", time.time()))
+            c.execute("UPDATE arms SET submitted=? WHERE arm=?",
+                      (r["n"], f"{r['theme']}::{r['template']}"))
+        c.commit()
+
+        # Both read candidates.theme at run time and write absolute values, so
+        # they emit the NEW arm names unchanged. _backfill_arm_stages is
+        # deliberately not reused: its `MAX(trials - ?, gate_pass)` arithmetic
+        # assumes the legacy pooled `trials` column this method recomputes.
+        self._backfill_corr_arms()
+        self._rebuild_deep_trials()
+
+        # `trials` is the cross-stage total, for reporting only (Bandit.update
+        # bumps it alongside each stage; a submission is an outcome of an
+        # existing trial, not a new one).
+        c.execute("UPDATE arms SET trials = scan_trials + refine_trials"
+                  " + corr_trials + deep_trials")
+        c.commit()
+        after = c.execute("SELECT COUNT(*) FROM arms").fetchone()[0]
+        log.info("rebuilt arms from evidence: %d -> %d row(s)", before, after)
+        return {"arms_before": before, "arms_after": after,
+                "gate_lineages": len(by_root)}
+
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "conn", None)
         if c is None:

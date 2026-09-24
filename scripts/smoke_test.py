@@ -1,11 +1,11 @@
 """Offline smoke test -- exercises every pure-logic path with no network."""
-import os, sys, json, tempfile, hashlib
+import os, sys, json, tempfile, hashlib, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 from alphamachine import templates as T
 from alphamachine.bandit import Bandit, arm_name
-from alphamachine.catalog import Catalog, infer_theme
+from alphamachine.catalog import Catalog, infer_theme, retheme
 from alphamachine.config import Gates, SimSettings, fitness, FITNESS_TURNOVER_KNEE
 from alphamachine.correlate import CorrelationBook, aligned_corr, daily_returns, greedy_select
 from alphamachine.generator import generate
@@ -56,6 +56,43 @@ cases = [({"id":"est_eps_median"},"analyst"), ({"id":"nws12_sent"},"news"),
          ({"id":"oth429_iv_skew","description":"implied volatility"},"option")]
 for f, want in cases:
     check(f"{f['id']} -> {want}", infer_theme(f) == want, f"got {infer_theme(f)}")
+
+# `rate` used to be unanchored, so every one of these read as `macro` -- and
+# because macro was ordered above risk/model/pv/fundamental, each false
+# positive also stole a field from one of those four.
+for word in ("corporate", "accurate", "generated", "separate", "strategy", "rated"):
+    f = {"id": "f1", "description": f"a {word} measure"}
+    check(f"'{word}' is not macro", infer_theme(f) != "macro", f"got {infer_theme(f)}")
+
+check("interest rate is still macro",
+      infer_theme({"id": "f1", "description": "us interest rate curve"}) == "macro")
+check("gdp is still macro", infer_theme({"id": "gdp_yoy"}) == "macro")
+
+# The pattern list did not contain the word it is named after, so a dataset
+# whose text says only "Fundamental" fell through to `other`.
+check("dataset named Fundamental -> fundamental",
+      infer_theme({"id": "x1", "dataset": {"name": "Company Fundamental Data for Equity"},
+                   "category": {"name": "Fundamental"}}) == "fundamental",
+      f'got {infer_theme({"id": "x1", "dataset": {"name": "Company Fundamental Data for Equity"}, "category": {"name": "Fundamental"}})}')
+check("imbalance has a theme of its own",
+      infer_theme({"id": "x2", "category": {"name": "Imbalance"}}) == "imbalance")
+check("a PV field whose text says 'corporate' stays pv",
+      infer_theme({"id": "volume", "description": "corporate trading volume"}) == "pv")
+
+# `_` is a word character, so \b does not separate `gdp` from `gdp_yoy`.
+# Field ids are underscore-separated, so the macro tokens anchor on letters.
+for fid, want in (("gdp_yoy", "macro"), ("cpi_core", "macro"),
+                  ("fx_spot_usd", "macro")):
+    check(f"{fid} -> {want}", infer_theme({"id": fid}) == want,
+          f"got {infer_theme({'id': fid})}")
+check("'prefix' does not trip the fx token",
+      infer_theme({"id": "f1", "description": "a prefix of the series"}) != "macro")
+
+# _theme is derived on load, not frozen into the cache: a stale value from an
+# older pattern set must be overwritten, or a regex fix stays inert.
+_stale = [{"id": "gdp_yoy", "_theme": "sentiment"}]
+check("retheme overwrites a stale cached _theme",
+      retheme(_stale)[0]["_theme"] == "macro", f"got {_stale[0]['_theme']}")
 
 print("\n[4] decay targeting aims at the knee")
 d = suggest_decay(0.50, 0)
@@ -3338,6 +3375,115 @@ finally:
     os.environ.clear(); os.environ.update(_saved40[2])
 check("--from-file --top N deepens the first N of the FILE, not the top-N Sharpes",
       _FakeClient40.checked == ["lo", "mid"], str(_FakeClient40.checked))
+
+print("\n[41] theme migration rebuilds the bandit instead of renaming it")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import migrate_themes as MT41
+from alphamachine import audit as A41
+
+_d41 = tempfile.mkdtemp()
+_cache41 = os.path.join(_d41, "cache"); os.makedirs(_cache41)
+# Three fields that the OLD patterns all filed under `macro`: an unanchored
+# `rate` matched "corporate", and `fundamental` did not match its own name.
+# Two move and one stays, so this is a split and a survivor at once.
+_f41 = [{"id": "fnd_corp_rev", "description": "corporate revenue of the entity",
+         "dataset": {"name": "Company Fundamental Data for Equity"},
+         "category": {"name": "Fundamental"}},
+        {"id": "px_vol_corp", "description": "corporate trading volume",
+         "dataset": {"name": "Price Volume Data"}, "category": {"name": "Price Volume"}},
+        {"id": "gdp_yoy", "description": "gdp growth",
+         "dataset": {"name": "Macro Indicators"}, "category": {"name": "Macro"}}]
+json.dump(_f41, open(os.path.join(_cache41, "fields_USA_TOP3000_d1.json"), "w"))
+check("the three fixture fields re-theme as intended",
+      [infer_theme(f) for f in _f41] == ["fundamental", "pv", "macro"],
+      str([infer_theme(f) for f in _f41]))
+
+_s41 = Store(os.path.join(_d41, "m.db"))
+for _i41, _fid41 in enumerate(["fnd_corp_rev", "px_vol_corp", "gdp_yoy"]):
+    for _cid41, _par41 in ((f"root{_i41}", None), (f"kid{_i41}", f"root{_i41}")):
+        with _s41.conn() as _c41:
+            _c41.execute(
+                "INSERT INTO candidates(id,expr,settings,theme,template,field,"
+                "stage,parent_id,created) VALUES (?,?,?,?,?,?,?,?,?)",
+                (_cid41, f"e_{_cid41}", "{}", "macro", "change", _fid41,
+                 "refine" if _par41 else "scan", _par41, time.time()))
+            _c41.execute("INSERT INTO sims(candidate_id,alpha_id,status,sharpe)"
+                         " VALUES (?,?,?,?)", (_cid41, f"A{_cid41}", "OK", 2.0))
+    with _s41.conn() as _c41:
+        _c41.execute("INSERT INTO gate_history(ts,candidate_id,alpha_id,ok,deep_ok)"
+                     " VALUES (?,?,?,?,?)", (time.time(), f"kid{_i41}", f"B{_i41}", 1, 1))
+    _s41.claim_bandit_trial("gate", f"root{_i41}", "macro::change")
+_s41.bump_arm("macro::change", trial=6, scan_trials=3, scan_pass=3,
+              refine_trials=3, gate_pass=3)
+_s41.bump_arm("stale::ghost", trial=99, scan_trials=99)
+
+_p41 = MT41.plan(_s41, MT41.load_field_records(_cache41)[0])
+check("dry run finds the rows that move", len(_p41["changed_ids"]) == 4,
+      str(len(_p41["changed_ids"])))
+_st41 = MT41.apply(_s41, _p41)
+_a41 = {r["arm"]: r for r in _s41.arms()}
+
+check("an arm nothing points at is dropped, not carried forward",
+      "stale::ghost" not in _a41, str(sorted(_a41)))
+check("one old arm splits into the three its fields now belong to",
+      {"fundamental::change", "pv::change", "macro::change"} <= set(_a41),
+      str(sorted(_a41)))
+check("scan evidence is conserved across the split",
+      sum(a["scan_trials"] for a in _a41.values()) == 3,
+      str({k: v["scan_trials"] for k, v in _a41.items()}))
+check("gate evidence is conserved across the split",
+      (sum(a["refine_trials"] for a in _a41.values()),
+       sum(a["gate_pass"] for a in _a41.values())) == (3, 3))
+check("trials stays the cross-stage total",
+      all(a["trials"] == a["scan_trials"] + a["refine_trials"] + a["corr_trials"]
+          + a["deep_trials"] for a in _a41.values()))
+check("bandit_taught.arm follows the candidate, so a lineage cannot be re-taught",
+      {r["key"]: r["arm"] for r in _s41.conn().execute(
+          "SELECT * FROM bandit_taught WHERE stage='gate'")}.get("root0")
+      == "fundamental::change")
+check("a child's theme still matches its parent's",
+      _st41["lineage_theme_mismatches"] == 0)
+check("re-running finds nothing to change",
+      len(MT41.plan(_s41, MT41.load_field_records(_cache41)[0])["changed_ids"]) == 0)
+
+_b41 = {r["arm"]: dict(r) for r in _s41.arms()}
+_s41.rebuild_arms_from_evidence()
+_cols41 = ("trials", "scan_trials", "scan_pass", "refine_trials", "gate_pass")
+check("the rebuild is idempotent",
+      {k: [v[c] for c in _cols41] for k, v in _b41.items()}
+      == {k: [dict(v)[c] for c in _cols41] for k, v in
+          {r["arm"]: r for r in _s41.arms()}.items()})
+
+# A field id in no cache keeps whatever theme it has: re-inferring from a bare
+# id drops the description and dataset name, which would file it under `other`.
+with _s41.conn() as _c41:
+    _c41.execute("INSERT INTO candidates(id,expr,settings,theme,template,field,"
+                 "stage,created) VALUES (?,?,?,?,?,?,?,?)",
+                 ("orph", "e", "{}", "macro", "change", "gone_field", "scan", time.time()))
+_p41b = MT41.plan(_s41, MT41.load_field_records(_cache41)[0])
+check("an unresolvable field id is left alone, not re-inferred from its id",
+      all(c != "orph" for c, _ in _p41b["changed_ids"])
+      and "gone_field" in _p41b["unresolved"])
+
+_conn41 = A41.open_ro(os.path.join(_d41, "m.db"))
+try:
+    _f41b = [f.check for f in A41.check_theme_arm_consistency(_conn41)]
+finally:
+    _conn41.close()
+check("audit reports a clean bandit after the migration", _f41b == [], str(_f41b))
+
+# And it must actually fire -- a check that only ever passes proves nothing.
+_s41.bump_arm("ghost_theme::change", trial=5, scan_trials=5)
+with _s41.conn() as _c41:
+    _c41.execute("UPDATE candidates SET theme='pv' WHERE id='kid0'")   # parent is fundamental
+_conn41 = A41.open_ro(os.path.join(_d41, "m.db"))
+try:
+    _f41c = {f.check for f in A41.check_theme_arm_consistency(_conn41)}
+finally:
+    _conn41.close()
+check("audit catches an arm nothing points at", "theme_arm_stranded" in _f41c, str(_f41c))
+check("audit catches a child whose theme left its parent's",
+      "lineage_theme_mismatch" in _f41c, str(_f41c))
 
 os.remove(db)
 print(f"\n{'ALL CHECKS PASSED' if not fail else str(fail)+' CHECK(S) FAILED'}\n")

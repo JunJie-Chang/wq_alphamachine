@@ -23,6 +23,18 @@ from typing import Any, Iterable
 log = logging.getLogger("alphamachine.catalog")
 
 # Theme inference from dataset category / field id. Order matters: first hit wins.
+#
+# Two rules learned the hard way, both visible in `macro` below:
+#   * anchor every token that is also a common English substring. Bare `rate`
+#     matched inside corporate / accurate / generated / separate / strategy,
+#     and `rate` on its own is not a macro concept anyway -- `interest rate` is.
+#   * order broad patterns AFTER narrow ones. `macro` used to sit above
+#     risk/model/pv/fundamental, so each of its false positives was also a
+#     field stolen from one of those four.
+# Measured on the 293-dataset USA/TOP3000 cache before the fix: of 31 Price
+# Volume datasets 14 were read as macro, and of 22 Fundamental datasets only 2
+# reached `fundamental` -- the rest split between macro and `other`, because
+# this pattern list did not contain the word "fundamental" itself.
 THEME_PATTERNS: tuple[tuple[str, str], ...] = (
     ("analyst",       r"\b(est|analyst|rec|target|eps_est|consensus|rev(ision)?)\b|^anl|^est"),
     ("news",          r"\bnews\b|^nws"),
@@ -31,13 +43,23 @@ THEME_PATTERNS: tuple[tuple[str, str], ...] = (
     ("shortinterest", r"short_interest|shortint|\bsi_\b|^si"),
     ("institutions",  r"institution|holder|ownership|13f|fund_flow"),
     ("insiders",      r"insider"),
-    ("macro",         r"macro|gdp|cpi|rate|fx|commodity|oil_"),
+    ("imbalance",     r"imbalance"),
     ("risk",          r"risk|beta|factor_|barra|specrisk"),
     ("model",         r"model|score|prediction|ml_"),
     ("pv",            r"^(open|close|high|low|volume|vwap|returns|adv|cap)$|price|volume|^pv"),
-    ("fundamental",   r"income|revenue|asset|equity|debt|cash|margin|earning|sales|"
-                      r"capex|inventory|liabilit|dividend|book|ebit|fcf|expense|tax"),
+    ("fundamental",   r"\bfundamental|income|revenue|asset|equity|debt|cash|margin|"
+                      r"earning|sales|capex|inventory|liabilit|dividend|book|ebit|"
+                      r"fcf|expense|tax"),
+    # `\b` is the wrong boundary for field ids: `_` is a word character, so
+    # `\bgdp\b` does not match `gdp_yoy`. These anchor on LETTERS instead, which
+    # treats the underscore as the separator it actually is.
+    ("macro",         r"(?<![a-z])(?:gdp|cpi|fx)(?![a-z])"
+                      r"|(?<![a-z])(?:macro|commodit|treasur|inflation)"
+                      r"|interest rate|foreign exchange|oil price|yield curve"),
 )
+
+_THEME_RE: tuple[tuple[str, Any], ...] = tuple(
+    (theme, re.compile(pat)) for theme, pat in THEME_PATTERNS)
 
 # Size denominators used by the YIELD templates -- these must exist in-region.
 DENOMINATORS = ("cap", "assets", "revenue", "equity", "sales")
@@ -50,10 +72,26 @@ def infer_theme(field: dict) -> str:
         (field.get("category") or {}).get("name", ""),
         (field.get("subcategory") or {}).get("name", ""),
     ))
-    for theme, pat in THEME_PATTERNS:
-        if re.search(pat, hay):
+    for theme, rx in _THEME_RE:
+        if rx.search(hay):
             return theme
     return "other"
+
+
+def retheme(fields: list[dict]) -> list[dict]:
+    """Stamp `_theme` on every record, overwriting whatever was there.
+
+    `_theme` is DERIVED, never authoritative. It used to be written once in
+    the fetch branch and then frozen into the per-dataset cache, which made a
+    pattern fix inert: the top-level `fields_*.json` is skipped under
+    `--refresh`, but the `parts_*/` files are resumed regardless of it, and the
+    resume branch never re-stamped. Fixing a regex therefore changed nothing
+    until ~4,000 requests at 1 req/s had been paid again. Re-deriving on every
+    load costs one regex sweep and makes the cache self-healing.
+    """
+    for f in fields:
+        f["_theme"] = infer_theme(f)
+    return fields
 
 
 class Catalog:
@@ -90,7 +128,7 @@ class Catalog:
             self.cache_dir, f"fields_{region}_{universe}_d{delay}.json")
         if os.path.exists(path) and not refresh:
             with open(path) as fh:
-                return json.load(fh)
+                return retheme(json.load(fh))
         datasets = self.c.data_sets(region=region, delay=delay, universe=universe)
         log.info("%d datasets in %s/%s d%d", len(datasets), region, universe, delay)
         # Per-dataset cache. A full USA/TOP3000 sweep is ~4,000 requests against
@@ -114,8 +152,10 @@ class Catalog:
             got = self.c.data_fields(region=region, delay=delay, universe=universe,
                                      dataset_id=dsid)
             for f in got:
+                # The dataset name is real enrichment -- the field payload does
+                # not carry it and infer_theme reads it, so it must be
+                # persisted. `_theme` itself is not: see retheme().
                 f.setdefault("dataset", {"id": dsid, "name": ds.get("name")})
-                f["_theme"] = infer_theme(f)
             with open(part, "w") as fh:
                 json.dump(got, fh)
             out.extend(got)
@@ -132,7 +172,7 @@ class Catalog:
             return out
         with open(path, "w") as fh:
             json.dump(out, fh)
-        return out
+        return retheme(out)
 
     # ------------------------------------------------------------ selection
     @staticmethod

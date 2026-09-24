@@ -435,7 +435,16 @@ TYPE_DEFAULTS: dict[str, dict[str, Any]] = {
     "macro":       {"decay": 16, "neutralization": "MARKET"},
     "pv":          {"decay": 20, "neutralization": "INDUSTRY"},
     "risk":        {"decay": 8, "neutralization": "INDUSTRY"},
+    # Order imbalance is microstructure, i.e. the same kind of fast, noisy
+    # series as price-volume, so it starts where `pv` does. No realised
+    # conversion of its own yet -- the bandit will correct this if it is wrong.
+    "imbalance":   {"decay": 20, "neutralization": "INDUSTRY"},
 }
+# `other` is deliberately absent. default_settings_for() falls through to the
+# base SimSettings (decay 0 / SUBINDUSTRY) for any theme not listed, and giving
+# `other` an entry here would change its settings key, hence every candidate id
+# built from it -- re-paying for simulations already on file. The residual
+# bucket is also much smaller now that `fundamental` matches its own name.
 
 
 @dataclass
