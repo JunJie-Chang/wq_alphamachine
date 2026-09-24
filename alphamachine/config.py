@@ -491,15 +491,15 @@ class RunConfig:
     concurrency: int = 13
     poll_interval: float = 5.0
     sim_timeout: float = 900.0
-    # reclaim() runs before EVERY dispatch and is sequential, one bundle at a time,
-    # each potentially costing up to child_result()'s own 300s timeout per child if
-    # BRAIN's backend is slow to answer. Found 2026-09-24: a batch of bundles left
-    # over from an interrupted run sat on backend-degraded records where several
-    # children in a row each cost the full 300s before deferring -- with reclaim()
-    # having no overall ceiling, this blocked dispatch of thousands of unrelated,
-    # perfectly fine pending candidates for over an hour. A bundle reclaim() has not
-    # even started by this deadline is left untouched (marker kept, tried again next
-    # run); one ALREADY being polled is allowed to finish rather than cut off mid-way.
+    # reclaim() runs before EVERY dispatch, on the same `concurrency`-worker thread
+    # pool as run() (fixed 2026-09-24 -- it was sequential, one bundle at a time,
+    # which meant a backlog of N leftover bundles cost N * ~90s of wall clock no
+    # matter the account's real slot count; confirmed live the same day with 83
+    # bundles draining at roughly one per 90s). Each bundle can still itself cost
+    # up to child_result()'s own 300s timeout per child if BRAIN's backend is slow
+    # to answer. A bundle no free worker has picked up by this deadline is left
+    # untouched (marker kept, tried again next run); one ALREADY being polled is
+    # allowed to finish rather than cut off mid-way.
     reclaim_budget_seconds: float = 300.0
     max_submits_per_day: int = 4
     gates: Gates = field(default_factory=Gates)

@@ -342,12 +342,62 @@ class Executor:
                 log.info("released slot: %s", u)
 
     # ---------------------------------------------------------- reclaiming
+    def _reclaim_bundle(self, url: str, rows: list, deadline: float | None) -> dict:
+        """One bundle's worth of `reclaim()`, callable from a worker thread."""
+        out = {"reclaimed": 0, "still_running": 0, "lost": 0, "deferred_by_budget": 0}
+        if deadline is not None and time.time() >= deadline:
+            out["deferred_by_budget"] += len(rows)
+            return out
+        live = []
+        for r in rows:
+            cand = self.store.candidate(r["candidate_id"])
+            if cand is not None:
+                live.append((r["candidate_id"], cand))
+        if not live:
+            for r in rows:
+                self.store.clear_dispatched(r["candidate_id"])
+            return out
+        c = self.client()
+        try:
+            body = c.poll(url, interval=self.cfg.poll_interval, timeout=90.0)
+        except SimulationFailed as e:
+            if "timeout" in str(e).lower():
+                out["still_running"] += len(live)   # keep the marker
+                return out
+            for cid, _ in live:
+                self.store.clear_dispatched(cid)
+            out["lost"] += len(live)
+            return out
+        except BrainError:
+            for cid, _ in live:
+                self.store.clear_dispatched(cid)
+            out["lost"] += len(live)
+            return out
+        recs = self._harvest(c, body, live, deadline=deadline)
+        out["deferred_by_budget"] += len(live) - len(recs)
+        for rec in recs.values():
+            status = rec.get("status")
+            if status == "DEFERRED":
+                out["still_running"] += 1
+            else:
+                out["reclaimed" if status == "OK" else "lost"] += 1
+        return out
+
     def reclaim(self, budget_seconds: float | None = None) -> dict:
         """Harvest simulations BRAIN ran while we were not listening.
 
         A crash mid-poll leaves the slot already paid for; BRAIN finishes the
         job regardless. Polling the stored progress URL turns that sunk cost
         back into a result instead of paying for the same expression twice.
+
+        Bundles are polled on the SAME thread pool `run()` uses for dispatch
+        (`cfg.concurrency` workers), not one at a time. A single-threaded loop
+        here means a backlog of N bundles each costing up to the ~90s poll
+        timeout takes N * 90s of WALL CLOCK no matter how many simulation
+        slots the account actually has -- confirmed live 2026-09-24: 83
+        leftover bundles, mostly genuinely still running, drained at roughly
+        one every 90s and the budget below was too small to ever reach most
+        of them. Concurrency turns that into ceil(N / concurrency) * 90s.
 
         `budget_seconds` caps total WALL-CLOCK time, not bundle count: each bundle
         can itself cost up to ~90s (its own poll) plus, per child, up to
@@ -358,7 +408,9 @@ class Executor:
         2026-09-24. A bundle not yet STARTED when the budget runs out is left
         completely alone (its marker untouched, tried again on the next reclaim);
         one already being polled is allowed to finish rather than cut off mid-poll,
-        so the budget is a floor on responsiveness, not a hard deadline.
+        so the budget is a floor on responsiveness, not a hard deadline. Under
+        concurrency this is enforced per-worker: a bundle a free worker has not
+        yet picked up when the deadline passes is deferred without ever polling.
         """
         bundles = self.store.inflight_bundles()
         out = {"reclaimed": 0, "still_running": 0, "lost": 0, "deferred_by_budget": 0}
@@ -366,44 +418,14 @@ class Executor:
             return out
         log.info("reclaiming %d in-flight bundle(s) from a previous run",
                  len(bundles))
-        c = self.client()
         deadline = None if budget_seconds is None else time.time() + budget_seconds
-        for url, rows in bundles.items():
-            if deadline is not None and time.time() >= deadline:
-                out["deferred_by_budget"] += len(rows)
-                continue
-            live = []
-            for r in rows:
-                cand = self.store.candidate(r["candidate_id"])
-                if cand is not None:
-                    live.append((r["candidate_id"], cand))
-            if not live:
-                for r in rows:
-                    self.store.clear_dispatched(r["candidate_id"])
-                continue
-            try:
-                body = c.poll(url, interval=self.cfg.poll_interval, timeout=90.0)
-            except SimulationFailed as e:
-                if "timeout" in str(e).lower():
-                    out["still_running"] += len(live)   # keep the marker
-                    continue
-                for cid, _ in live:
-                    self.store.clear_dispatched(cid)
-                out["lost"] += len(live)
-                continue
-            except BrainError:
-                for cid, _ in live:
-                    self.store.clear_dispatched(cid)
-                out["lost"] += len(live)
-                continue
-            recs = self._harvest(c, body, live, deadline=deadline)
-            out["deferred_by_budget"] += len(live) - len(recs)
-            for rec in recs.values():
-                status = rec.get("status")
-                if status == "DEFERRED":
-                    out["still_running"] += 1
-                else:
-                    out["reclaimed" if status == "OK" else "lost"] += 1
+        with ThreadPoolExecutor(max_workers=self.cfg.concurrency) as pool:
+            futures = [pool.submit(self._reclaim_bundle, url, rows, deadline)
+                       for url, rows in bundles.items()]
+            for fut in as_completed(futures):
+                counts = fut.result()
+                for k, v in counts.items():
+                    out[k] += v
         if out["deferred_by_budget"]:
             log.info("reclaim: time budget spent -- %d candidate(s) across the "
                      "remaining bundle(s) left untouched, retried next time",

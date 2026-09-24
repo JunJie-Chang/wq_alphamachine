@@ -3175,7 +3175,11 @@ _clock47 = _FakeClock47()
 _saved_time47 = _exmod47.time.time
 _exmod47.time.time = _clock47.time
 try:
-    _ex47 = _Ex47(RunConfig(), _st47)
+    # concurrency=1: reclaim() now polls bundles on a thread pool (see the
+    # parallel test below), so these budget-cutoff assertions -- which assume
+    # bundles are checked one at a time in a fixed order -- pin it to a single
+    # worker, which is exactly the old sequential behavior.
+    _ex47 = _Ex47(RunConfig(concurrency=1), _st47)
     _fc47 = _PollTrack47(_clock47, cost=1.0)
     _ex47.client = lambda: _fc47
     _rc47 = _ex47.reclaim(budget_seconds=None)
@@ -3195,7 +3199,7 @@ for i, url in enumerate(["u1", "u2", "u3"]):
 _clock48 = _FakeClock47()
 _exmod47.time.time = _clock48.time
 try:
-    _ex48 = _Ex47(RunConfig(), _st48)
+    _ex48 = _Ex47(RunConfig(concurrency=1), _st48)
     _fc48 = _PollTrack47(_clock48, cost=10.0)   # each poll costs 10s of fake wall-clock
     _ex48.client = lambda: _fc48
     _rc48 = _ex48.reclaim(budget_seconds=15.0)  # room for ~1 bundle, not all 3
@@ -3243,7 +3247,7 @@ for i in range(5):
 _clock50 = _FakeClock47()
 _exmod47.time.time = _clock50.time
 try:
-    _ex50 = _Ex47(RunConfig(), _st50)
+    _ex50 = _Ex47(RunConfig(concurrency=1), _st50)
     _fc50 = _MultiChildClient50(_clock50, n_children=5, child_cost=50.0)
     _ex50.client = lambda: _fc50
     _rc50 = _ex50.reclaim(budget_seconds=105.0)   # room for ~2 of 5 children, not all
@@ -3268,7 +3272,7 @@ _st49.mark_dispatched(_cid49, "https://x/sim/u9", 0)
 _clock49 = _FakeClock47()
 _exmod47.time.time = _clock49.time
 try:
-    _ex49 = _Ex47(RunConfig(), _st49)
+    _ex49 = _Ex47(RunConfig(concurrency=1), _st49)
     _fc49 = _PollTrack47(_clock49, cost=1.0)
     _ex49.client = lambda: _fc49
     _rc49 = _ex49.reclaim(budget_seconds=0.0)
@@ -3276,6 +3280,47 @@ try:
           _fc49.calls == [] and _rc49["deferred_by_budget"] == 1, str(_rc49))
 finally:
     _exmod47.time.time = _saved_time47
+
+# --- reclaim() actually runs bundles concurrently, not one at a time --------
+# The budget tests above pin concurrency=1 to keep their sequential-order
+# assertions meaningful; this one checks the thing that motivated the change:
+# real wall-clock time, with the REAL clock (no monkeypatch), for a backlog
+# that a single-threaded loop could not have drained this fast. Confirmed
+# live 2026-09-24: 83 leftover bundles drained at roughly one per 90s.
+import threading as _th51, time as _time51
+_st51 = Store(os.path.join(tempfile.mkdtemp(), "parallel.db"))
+_N51 = 6
+for _i in range(_N51):
+    _cid = _st51.add_candidate(expr=f"rank(par{_i})", settings=SimSettings().payload(),
+                               theme="t", template="tp", field=f"par{_i}")
+    _st51.mark_dispatched(_cid, f"https://x/sim/u{_i}", 0)
+
+class _SlowPollClient51:
+    """poll() costs REAL wall-clock time, so overlap is only possible if the
+    caller actually runs bundles on separate threads."""
+    def __init__(self, cost):
+        self.cost, self.lock, self.calls = cost, _th51.Lock(), []
+    def poll(self, url, **kw):
+        _time51.sleep(self.cost)
+        with self.lock:
+            self.calls.append(url)
+        return {"alpha": "https://api/alphas/A" + url[-1]}
+    def alpha(self, aid):
+        return {"id": aid, "is": {"sharpe": 1.0}, "status": "UNSUBMITTED",
+                "settings": {}, "regular": {}}
+
+_ex51 = _Ex47(RunConfig(concurrency=_N51), _st51)
+_fc51 = _SlowPollClient51(cost=0.15)
+_ex51.client = lambda: _fc51
+_t0_51 = _time51.perf_counter()
+_rc51 = _ex51.reclaim(budget_seconds=None)
+_elapsed51 = _time51.perf_counter() - _t0_51
+check("reclaim() polls bundles concurrently -- "
+      f"{_N51} bundles costing {_fc51.cost}s each finished in {_elapsed51:.2f}s; "
+      f"one at a time would need >= {_N51 * _fc51.cost:.2f}s",
+      _elapsed51 < _N51 * _fc51.cost * 0.6, f"{_elapsed51:.2f}s")
+check("...and every bundle is still correctly reclaimed",
+      _rc51["reclaimed"] == _N51 and len(_fc51.calls) == _N51, str(_rc51))
 
 import io as _io41, contextlib as _cx41
 from alphamachine.client import is_persona_challenge as _ipc46
