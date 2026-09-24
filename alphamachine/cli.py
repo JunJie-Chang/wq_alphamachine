@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from collections import Counter
@@ -35,6 +36,7 @@ from . import priors as P
 from .metrics import (Verdict, corr_profile, headroom, pnl_series,
                       quality_verdict)
 from .refine import Refiner
+from . import templates as T
 from .store import Store
 from .submit import Submitter, sync_active_submissions
 
@@ -954,6 +956,99 @@ def cmd_audit(args):
     return 1 if counts.get("critical") else 0
 
 
+_CALL_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def _operators_in_use() -> dict[str, list[str]]:
+    """Every operator the pipeline can emit, mapped to what emits it.
+
+    Two sources, because the refinement ladder introduces operators no template
+    string contains: it wraps a champion's expression (ts_backfill, winsorize,
+    zscore, hump, trade_when, group_neutralize). Probing the wrappers rather
+    than hardcoding their names keeps this honest if one of them changes.
+    """
+    used: dict[str, list[str]] = {}
+    for t in T.LIBRARY:
+        for op in _CALL_RE.findall(t.expr):
+            used.setdefault(op, []).append(t.name)
+    probe = "group_rank(f1, subindustry)"
+    for label, expr in (
+        ("ladder:robustness", T.wrap_backfill(probe, "f1")),
+        ("ladder:robustness", T.wrap_winsorize(probe)),
+        ("ladder:robustness", T.wrap_zscore(probe)),
+        ("ladder:turnover", T.wrap_hump(probe)),
+        ("ladder:turnover", T.wrap_trade_when(probe)),
+        ("ladder:turnover", T.turnover_gate(probe, "f1")),
+        ("ladder:neutralize", T.wrap_group_neutralize(probe)),
+    ):
+        for op in _CALL_RE.findall(expr):
+            if label not in used.setdefault(op, []):
+                used[op].append(label)
+    return used
+
+
+def cmd_operators(args):
+    """Reconnaissance on BRAIN's operator catalogue. Reads nothing, changes nothing.
+
+    Exists because `Catalog.operators()` had no call site anywhere in the
+    package -- so the library grew to use 23 of the platform's 85 operators
+    without anyone ever checking which of those 23 this account's tier actually
+    unlocks. An operator the tier does not grant is not a transient failure:
+    executor.py records it as a permanent ERROR and the bandit counts it as a
+    failed trial for that arm. So the question this answers first is not "what
+    could we add" but "are we already burning slots on something gated".
+    """
+    cfg, store, client = _setup(args)
+    cat = Catalog(client, cfg.cache_dir)
+    ops = cat.operators(refresh=args.refresh)
+    if not ops:
+        print("\n/operators returned nothing -- cannot report.\n")
+        return 1
+
+    by_name = {o.get("name"): o for o in ops if o.get("name")}
+    levels = Counter(str(o.get("level")) for o in ops)
+    print(f"\n{len(ops)} operators returned  "
+          f"(cached at {os.path.join(cfg.cache_dir, 'operators.json')})\n")
+    print("  by level:")
+    for lvl, n in levels.most_common():
+        print(f"    {lvl:<14} {n:>4}")
+    cats = Counter(str((o.get("category") or "?")) for o in ops)
+    print("\n  by category:")
+    for c, n in cats.most_common():
+        print(f"    {c:<14} {n:>4}")
+
+    used = _operators_in_use()
+    unknown = sorted(set(used) - set(by_name))
+    print(f"\n  the pipeline can emit {len(used)} distinct operators")
+    if unknown:
+        # The headline result. Anything here is either a typo or tier-gated,
+        # and either way every candidate built from it is a wasted slot
+        # recorded as that arm's failure.
+        print(f"\n  *** {len(unknown)} NOT IN THE ACCOUNT'S CATALOGUE ***")
+        for op in unknown:
+            print(f"    {op:<24} emitted by: {', '.join(used[op][:6])}")
+    else:
+        print("  all of them are present in this account's catalogue")
+
+    gated = [(n, by_name[n]) for n in sorted(used) if n in by_name
+             and str(by_name[n].get("level")) not in ("ALL", "None", "")]
+    if gated:
+        print(f"\n  {len(gated)} emitted operator(s) carry a non-ALL level:")
+        for n, o in gated:
+            print(f"    {n:<24} level={o.get('level')}  "
+                  f"category={o.get('category')}")
+
+    unused = sorted(set(by_name) - set(used))
+    print(f"\n  {len(unused)} catalogued operator(s) the pipeline never emits:")
+    by_cat: dict[str, list[str]] = {}
+    for n in unused:
+        by_cat.setdefault(str(by_name[n].get("category") or "?"), []).append(n)
+    for c, names in sorted(by_cat.items(), key=lambda kv: -len(kv[1])):
+        print(f"    {c:<14} {len(names):>3}  {', '.join(names)}")
+    print()
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser("alphamachine")
     p.add_argument("--db", default="data/machine.db")
@@ -1045,6 +1140,13 @@ def main(argv=None):
                             "cache, without needing to already suspect a "
                             "specific candidate")
     s.set_defaults(fn=cmd_audit)
+
+    s = sub.add_parser("operators",
+                       help="what BRAIN's operator catalogue holds, what this "
+                            "account's tier unlocks, and whether the template "
+                            "library already emits anything it cannot use")
+    s.add_argument("--refresh", action="store_true")
+    s.set_defaults(fn=cmd_operators)
 
     s = sub.add_parser("run")
     s.add_argument("--budget", type=int, default=200)
