@@ -3322,6 +3322,60 @@ check("reclaim() polls bundles concurrently -- "
 check("...and every bundle is still correctly reclaimed",
       _rc51["reclaimed"] == _N51 and len(_fc51.calls) == _N51, str(_rc51))
 
+# --- reclaim() must not crash when a worker thread hits a dead session ------
+# Confirmed live 2026-09-24, right after the parallelization above shipped:
+# several worker threads each lazily authenticate for the first time, one
+# hits a real persona challenge, the rest see the process-wide auth pause and
+# raise AuthError too -- and that raise was not caught anywhere in reclaim(),
+# so the whole call (and the unattended process running it) crashed instead
+# of leaving the markers alone for the next attempt.
+class _DeadSessionClient52:
+    def poll(self, url, **kw):
+        raise AssertionError("poll() must not be reached: client() already failed")
+
+_st52 = Store(os.path.join(tempfile.mkdtemp(), "authdead.db"))
+_cid52 = _st52.add_candidate(expr="rank(auth1)", settings=SimSettings().payload(),
+                             theme="t", template="tp", field="auth1")
+_st52.mark_dispatched(_cid52, "https://x/sim/uauth1", 0)
+_ex52 = _Ex47(RunConfig(concurrency=1), _st52)
+_ex52.client = lambda: (_ for _ in ()).throw(_AE45("biometric check required"))
+_rc52 = _ex52.reclaim(budget_seconds=None)
+check("client() raising AuthError does not crash reclaim()",
+      _rc52["still_running"] == 1, str(_rc52))
+check("...halts (so run() and the next dispatch wait for a human)",
+      _ex52._halt.is_set())
+check("...and leaves the marker alone -- a dead session is not evidence the job is lost",
+      _st52.conn().execute("SELECT COUNT(*) FROM inflight WHERE candidate_id=?",
+                           (_cid52,)).fetchone()[0] == 1
+      and _st52.conn().execute("SELECT COUNT(*) FROM sims WHERE candidate_id=?",
+                               (_cid52,)).fetchone()[0] == 0)
+
+_st53 = Store(os.path.join(tempfile.mkdtemp(), "authdead2.db"))
+_cid53 = _st53.add_candidate(expr="rank(auth2)", settings=SimSettings().payload(),
+                             theme="t", template="tp", field="auth2")
+_st53.mark_dispatched(_cid53, "https://x/sim/uauth2", 0)
+class _PollDiesClient52:
+    def client(self): return self
+    def poll(self, url, **kw): raise _AE45("session died mid-poll")
+_ex53 = _Ex47(RunConfig(concurrency=1), _st53)
+_ex53.client = lambda: _PollDiesClient52()
+_rc53 = _ex53.reclaim(budget_seconds=None)
+check("poll() raising AuthError mid-bundle also does not crash reclaim(), and halts",
+      _rc53["still_running"] == 1 and _ex53._halt.is_set(), str(_rc53))
+
+# The generic safety net: even a bug we did not anticipate must not crash the
+# whole call, matching run()'s own crash path.
+_st54 = Store(os.path.join(tempfile.mkdtemp(), "bundlebug.db"))
+_cid54 = _st54.add_candidate(expr="rank(bug1)", settings=SimSettings().payload(),
+                             theme="t", template="tp", field="bug1")
+_st54.mark_dispatched(_cid54, "https://x/sim/ubug1", 0)
+_ex54 = _Ex47(RunConfig(concurrency=1), _st54)
+def _boom54(*a, **k): raise ValueError("an unanticipated bug in our own code")
+_ex54._reclaim_bundle = _boom54
+_rc54 = _ex54.reclaim(budget_seconds=None)
+check("an unexpected exception from a bundle is caught, not raised out of reclaim()",
+      _rc54["deferred_by_budget"] == 1, str(_rc54))
+
 import io as _io41, contextlib as _cx41
 from alphamachine.client import is_persona_challenge as _ipc46
 check("a genuine persona challenge is recognised (case-insensitive)",

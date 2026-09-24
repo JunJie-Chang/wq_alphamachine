@@ -357,9 +357,23 @@ class Executor:
             for r in rows:
                 self.store.clear_dispatched(r["candidate_id"])
             return out
-        c = self.client()
+        try:
+            c = self.client()
+        except AuthError:
+            # Confirmed live 2026-09-24: with several worker threads each
+            # lazily authenticating for the first time, one hits a real
+            # persona challenge and the rest see the process-wide auth pause
+            # and raise here too. A dead session is not evidence the job is
+            # lost -- keep the marker for the next reclaim(), same as _bundle().
+            self._halt.set()
+            out["still_running"] += len(live)
+            return out
         try:
             body = c.poll(url, interval=self.cfg.poll_interval, timeout=90.0)
+        except AuthError:
+            self._halt.set()
+            out["still_running"] += len(live)
+            return out
         except SimulationFailed as e:
             if "timeout" in str(e).lower():
                 out["still_running"] += len(live)   # keep the marker
@@ -420,10 +434,19 @@ class Executor:
                  len(bundles))
         deadline = None if budget_seconds is None else time.time() + budget_seconds
         with ThreadPoolExecutor(max_workers=self.cfg.concurrency) as pool:
-            futures = [pool.submit(self._reclaim_bundle, url, rows, deadline)
-                       for url, rows in bundles.items()]
+            futures = {pool.submit(self._reclaim_bundle, url, rows, deadline): rows
+                       for url, rows in bundles.items()}
             for fut in as_completed(futures):
-                counts = fut.result()
+                try:
+                    counts = fut.result()
+                except Exception as e:
+                    # _reclaim_bundle already turns every anticipated failure (auth,
+                    # transient, genuine) into a return value, never a raise -- this
+                    # is a safety net against a bug in ours, same spirit as run()'s
+                    # crash path. Leave the marker; the next reclaim() retries it.
+                    log.warning("reclaim: bundle crashed: %s", e)
+                    out["deferred_by_budget"] += len(futures[fut])
+                    continue
                 for k, v in counts.items():
                     out[k] += v
         if out["deferred_by_budget"]:
