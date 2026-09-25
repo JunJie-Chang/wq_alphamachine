@@ -75,6 +75,12 @@ SERVER_GATES = ("LOW_TURNOVER", "HIGH_TURNOVER", "LOW_SUB_UNIVERSE_SHARPE",
 # submit_powerpool.py). Anything else -- a check name never seen before
 # included -- blocks.
 PP_EXEMPT_FAILS = frozenset({"LOW_FITNESS", "PROD_CORRELATION", "LOW_2Y_SHARPE"})
+# Checks about the ACCOUNT's state, not the alpha. REGULAR_SUBMISSION FAILs on
+# every alpha once the day's submission cap is spent (seen 2026-09-25 right
+# after 4/4); reading it as a verdict marked the whole pool ineligible and then
+# persisted that into saved reports. submit_powerpool.py still enforces the cap:
+# it reads today's count from the platform and its live check sees the FAIL.
+ACCOUNT_STATE_CHECKS = frozenset({"REGULAR_SUBMISSION"})
 # Confirmed live (2026-09-19): these two exist as WARNING, not FAIL, so they
 # never block submission -- but per docs/Power_Pool_Alpha_規則.md #5, an
 # alpha without a compliant 100+ char Idea/Rationale description in
@@ -191,7 +197,8 @@ def blocking_fails(pairs) -> list[str]:
 
     `pairs` is (name, result), the shape of a report's `all_checks`."""
     return [n for n, res in pairs
-            if res in ("FAIL", "ERROR") and n not in PP_EXEMPT_FAILS]
+            if res in ("FAIL", "ERROR")
+            and n not in PP_EXEMPT_FAILS and n not in ACCOUNT_STATE_CHECKS]
 
 
 def apply_server_fails(r: dict, pairs) -> dict:

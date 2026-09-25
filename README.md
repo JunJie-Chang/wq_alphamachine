@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 527 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 530 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -1155,8 +1155,11 @@ platform before relying on it.
   failing record wasted a pick, could be tagged, and held a slot under dedup's
   per-field caps. Now any FAIL or ERROR blocks, except `PP_EXEMPT_FAILS`
   (`LOW_FITNESS`, `PROD_CORRELATION`, `LOW_2Y_SHARPE` -- the ones BRAIN itself
-  stops enforcing once an alpha is tagged); an unfamiliar check name blocks by
-  default. `dedup_powerpool.py`, `tag_powerpool.py` and `check_powerpool.py
+  stops enforcing once an alpha is tagged) and `ACCOUNT_STATE_CHECKS`
+  (`REGULAR_SUBMISSION`, which FAILs on every alpha once the day's cap is spent
+  -- a fact about the account-day, not the alpha); an unfamiliar check name
+  blocks by default. A side benefit: `DATA_SET_AUTHORIZATION FAIL` (the
+  `KPOEwzQN` kind, previously excluded by memory) is now caught automatically. `dedup_powerpool.py`, `tag_powerpool.py` and `check_powerpool.py
   --from-file` re-judge saved reports from `all_checks` on load, so an old file
   cannot carry a stale verdict and nothing needs re-fetching.
 * **Description phrasing is hand-authored, and the template is narrow.**

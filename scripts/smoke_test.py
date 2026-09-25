@@ -3493,6 +3493,13 @@ check("an ERROR result blocks, same as the submit path's failed_checks",
       not _pp42([("CONCENTRATED_WEIGHT", "ERROR")])["eligible"])
 check("checks BRAIN stops enforcing once tagged (LOW_FITNESS, PROD_CORRELATION, LOW_2Y_SHARPE) do not block",
       _pp42([("LOW_FITNESS", "FAIL"), ("PROD_CORRELATION", "FAIL"), ("LOW_2Y_SHARPE", "FAIL")])["eligible"])
+check("REGULAR_SUBMISSION FAIL (today's cap spent) is account state, not a verdict on the alpha",
+      _pp42([("REGULAR_SUBMISSION", "FAIL")])["eligible"])
+check("...and a saved report deep-checked on a capped day is not ineligible the next day",
+      CP40.rejudge([{"alpha_id": "c", "reasons": ["REGULAR_SUBMISSION FAIL"],
+                     "all_checks": [["REGULAR_SUBMISSION", "FAIL"]]}])[0]["eligible"])
+check("a DATA_SET_AUTHORIZATION FAIL blocks (the KPOEwzQN / E5l2LGRJ kind)",
+      not _pp42([("DATA_SET_AUTHORIZATION", "FAIL")])["eligible"])
 check("the reason names the check, so a report shows WHY it was dropped",
       _pp42([("LOW_ROBUST_UNIVERSE_RETURNS", "FAIL")])["reasons"] == ["LOW_ROBUST_UNIVERSE_RETURNS FAIL"])
 
