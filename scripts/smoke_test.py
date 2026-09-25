@@ -3527,6 +3527,54 @@ check("deepen: a fresh /check where the check now passes clears the old FAIL",
       _r42["eligible"] is True and _r42["all_checks"] == [("LOW_ROBUST_UNIVERSE_RETURNS", "PASS")],
       str(_r42))
 
+print("\n[43] autoloop rotates regions, and refine stays inside the one it is given")
+import autoloop as _al43
+check("parse_regions reads REGION:UNIVERSE:DELAY lists, normalising case",
+      _al43.parse_regions("eur:top2500:1, GLB:TOP3000:0")
+      == [("EUR", "TOP2500", 1), ("GLB", "TOP3000", 0)])
+check("parse_regions rejects a delay that is not 0 or 1",
+      _raises(lambda: _al43.parse_regions("EUR:TOP2500:2"), ValueError))
+check("the default rotation is USA/TOP3000/d1 alone (old behaviour unchanged)",
+      _al43.parse_regions("USA:TOP3000:1") == [("USA", "TOP3000", 1)])
+_cmds43 = []
+class _Pop43:
+    def __init__(self, cmd, **kw):
+        _cmds43.append(cmd); self.returncode = 0; self.stdout = iter(["ok\n"])
+    def wait(self): pass
+_saved43 = _al43.subprocess.Popen
+_al43.subprocess.Popen = _Pop43
+try:
+    _al43.run_stage(13, "scan", ["--budget", "5"], _al43.scope_args(("EUR", "TOP2500", 1)))
+finally:
+    _al43.subprocess.Popen = _saved43
+check("region flags go BEFORE the stage name (they are the top-level parser's)",
+      _cmds43 and _cmds43[0][:9] == ["python3", "-m", "alphamachine", "--concurrency", "13",
+                                     "--region", "EUR", "--universe", "TOP2500"]
+      and _cmds43[0][9:] == ["--delay", "1", "scan", "--budget", "5"], str(_cmds43))
+
+from alphamachine import cli as _cli43
+import argparse as _ap43
+_st43 = Store(os.path.join(tempfile.mkdtemp(), "scope.db"))
+for _reg, _uni, _sh in (("USA", "TOP3000", 3.0), ("EUR", "TOP2500", 1.2), ("EUR", "TOP2500", 0.9)):
+    _c = _st43.add_candidate(expr=f"rank({_reg}{_sh})",
+                             settings=SimSettings(region=_reg, universe=_uni, delay=1).payload(),
+                             theme="t", template="tp", field=f"f{_reg}{_sh}")
+    _st43.record_sim(_c, {"status": "OK", "sharpe": _sh, "alpha_id": f"A{_reg}{_sh}"})
+_q43 = lambda ns: [r["alpha_id"] for r in _st43.sims_where(
+    "s.status='OK' AND c.stage='scan'" + _cli43._scope_sql(ns)[0] + " ORDER BY abs(s.sharpe) DESC",
+    _cli43._scope_sql(ns)[1])]
+check("refine's query for EUR returns only EUR, even with a stronger USA candidate on file",
+      _q43(_ap43.Namespace(region="EUR", universe="TOP2500", delay=1)) == ["AEUR1.2", "AEUR0.9"],
+      str(_q43(_ap43.Namespace(region="EUR", universe="TOP2500", delay=1))))
+check("...and the default scope (USA/TOP3000/d1) returns only USA",
+      _q43(_ap43.Namespace(region="USA", universe="TOP3000", delay=1)) == ["AUSA3.0"])
+check("a scope with no candidates returns nothing rather than falling back to all regions",
+      _q43(_ap43.Namespace(region="GBR", universe="TOP700", delay=1)) == [])
+import inspect as _in43
+_src43 = _in43.getsource(_cli43.cmd_refine)
+check("cmd_refine applies the scope on BOTH paths (fresh survivors and --redo-incomplete)",
+      _src43.count("+ scope") == 2 and _src43.count("*scope_args") == 2)
+
 print("\n[41] theme migration rebuilds the bandit instead of renaming it")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import migrate_themes as MT41

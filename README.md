@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 530 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 538 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -493,6 +493,18 @@ specific candidate; checks 2 and 3 are those two bugs' exact shapes.
 nohup python3 scripts/autoloop.py --scan-budget 300 --refine-top 25 \
       --select-n 10 --submit-n 4 >> data/logs/autoloop.log 2>&1 &
 ```
+
+`--regions REGION:UNIVERSE:DELAY,...` rotates `scan` and `refine` through one
+scope per cycle (default `USA:TOP3000:1`, the old behaviour); `gatelog`, `select`
+and `submit` always see every region. The universe is given explicitly because it
+differs by region and a wrong one returns zero datasets rather than an error --
+probed live 2026-09-25: EUR `TOP2500`, ASI `MINVOL1M`, CHN `TOP2000U`, GBR `TOP700`,
+DEU/IND `TOP500`, USA/GLB `TOP3000`. KOR/TWN/HKG (Grand Master) and JPN/AMR
+(Master) are outside a Gold consultant's research regions. `refine` now honours
+`--region/--universe/--delay` like `scan` does; before, it took its `--top` by
+|Sharpe| across every region, and with 81k USA candidates against ~1.4k elsewhere
+a refine "for EUR" refined USA. Its not-yet-laddered test also gained an index on
+`candidates.parent_id`: the query took ~300 s at 82k rows, now ~0.1 s.
 
 `autoloop.py` sequences `scan → refine → gatelog → select → submit` forever, each
 stage as a fresh `python3 -m alphamachine <stage>` subprocess. It reimplements

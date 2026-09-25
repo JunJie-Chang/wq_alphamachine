@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS candidates (
     created       REAL
 );
 CREATE INDEX IF NOT EXISTS idx_cand_stage ON candidates(stage);
+-- refine's "not laddered yet" test is NOT EXISTS (... WHERE k.parent_id=c.id):
+-- without this it scanned every candidate per row, ~5 minutes at 82k rows.
+CREATE INDEX IF NOT EXISTS idx_cand_parent ON candidates(parent_id);
 
 CREATE TABLE IF NOT EXISTS sims (
     candidate_id  TEXT PRIMARY KEY,

@@ -227,9 +227,23 @@ def _corr_passed(store, alpha_id: str | None) -> bool | None:
     return None
 
 
+def _scope_sql(args) -> tuple[str, tuple]:
+    """Restrict a candidates query to the --region/--universe/--delay in force.
+
+    scan always honoured these; refine did not, and picked its --top by |Sharpe|
+    across every region. With 81k USA candidates against ~1.4k elsewhere
+    (2026-09-25), a refine run "for EUR" refined USA."""
+    return (" AND json_extract(c.settings,'$.region')=?"
+            " AND json_extract(c.settings,'$.universe')=?"
+            " AND json_extract(c.settings,'$.delay')=?",
+            (getattr(args, "region", "USA"), getattr(args, "universe", "TOP3000"),
+             int(getattr(args, "delay", 1))))
+
+
 def cmd_refine(args):
     cfg, store, client = _setup(args)
     g = cfg.gates
+    scope, scope_args = _scope_sql(args)
     # By default only roots that have never been laddered. ladder() marks the
     # CHAMPION gated, not the root, so a refined root keeps stage='scan' and
     # would otherwise be re-picked by every later run -- costing no simulation
@@ -245,14 +259,16 @@ def cmd_refine(args):
         for i in range(0, len(roots), 500):
             chunk = roots[i:i + 500]
             rows += store.sims_where(
-                f"s.status='OK' AND c.id IN ({','.join('?' * len(chunk))})", chunk)
+                f"s.status='OK' AND c.id IN ({','.join('?' * len(chunk))})" + scope,
+                (*chunk, *scope_args))
         rows = sorted(rows, key=lambda r: -abs(r["sharpe"] or 0))[:args.top]
     else:
         fresh = ("" if getattr(args, "redo", False) else
                  " AND NOT EXISTS (SELECT 1 FROM candidates k WHERE k.parent_id=c.id)")
         rows = store.sims_where(
-            "s.status='OK' AND abs(s.sharpe) >= ? AND c.stage='scan'" + fresh +
-            " ORDER BY abs(s.sharpe) DESC LIMIT ?", (g.scan_abs_sharpe, args.top))
+            "s.status='OK' AND abs(s.sharpe) >= ? AND c.stage='scan'" + fresh + scope +
+            " ORDER BY abs(s.sharpe) DESC LIMIT ?",
+            (g.scan_abs_sharpe, *scope_args, args.top))
     if not rows:
         print("no un-refined scan survivors -- run `scan`, or pass --redo "
               "to re-ladder ones already done")

@@ -129,7 +129,30 @@ def wait_for_session() -> None:
     log("RESUMED: session valid again")
 
 
-def run_stage(concurrency: int, name: str, args: list[str]) -> None:
+def parse_regions(spec: str) -> list[tuple[str, str, int]]:
+    """'EUR:TOP2500:1,GLB:TOP3000:1' -> [('EUR', 'TOP2500', 1), ...].
+
+    The universe name differs by region (EUR has no TOP3000, ASI's is MINVOL1M)
+    and a wrong one returns zero datasets rather than an error, so it is given
+    explicitly rather than guessed."""
+    out = []
+    for part in spec.split(","):
+        region, universe, delay = part.strip().split(":")
+        if delay not in ("0", "1"):
+            raise ValueError(f"delay must be 0 or 1, got {delay!r} in {part!r}")
+        out.append((region.upper(), universe.upper(), int(delay)))
+    if not out:
+        raise ValueError("empty --regions")
+    return out
+
+
+def scope_args(scope: tuple[str, str, int]) -> list[str]:
+    region, universe, delay = scope
+    return ["--region", region, "--universe", universe, "--delay", str(delay)]
+
+
+def run_stage(concurrency: int, name: str, args: list[str],
+              scope: list[str] = ()) -> None:
     """Run one CLI stage; retry indefinitely across auth blocks.
 
     Streams the child's output line by line (rather than waiting for it to
@@ -143,7 +166,7 @@ def run_stage(concurrency: int, name: str, args: list[str]) -> None:
     transient_tries = 0
     while True:
         cmd = ["python3", "-m", "alphamachine",
-               "--concurrency", str(concurrency), name, *args]
+               "--concurrency", str(concurrency), *scope, name, *args]
         log(f"[{name}] {' '.join(args)}")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -199,19 +222,27 @@ def main() -> int:
     p.add_argument("--submit-n", type=int, default=4)
     p.add_argument("--cycles", type=int, default=0,
                    help="stop after N cycles (0 = forever)")
+    p.add_argument("--regions", default="USA:TOP3000:1",
+                   help="REGION:UNIVERSE:DELAY,... rotated one per cycle for scan "
+                        "and refine; gatelog/select/submit always see every region")
     args = p.parse_args()
+    regions = parse_regions(args.regions)
 
     _load_env()
     log(f"autoloop starting: scan --budget {args.scan_budget}, "
         f"refine --top {args.refine_top}, select --n {args.select_n}, "
-        f"submit --n {args.submit_n} (dry run only)")
+        f"submit --n {args.submit_n} (dry run only); regions "
+        + ", ".join(f"{r}/{u}/d{d}" for r, u, d in regions))
 
     cycle = 0
     while args.cycles == 0 or cycle < args.cycles:
         cycle += 1
-        log(f"===== cycle {cycle} =====")
-        run_stage(args.concurrency, "scan", ["--budget", str(args.scan_budget)])
-        run_stage(args.concurrency, "refine", ["--top", str(args.refine_top)])
+        scope = regions[(cycle - 1) % len(regions)]
+        log(f"===== cycle {cycle}: {scope[0]}/{scope[1]}/d{scope[2]} =====")
+        run_stage(args.concurrency, "scan", ["--budget", str(args.scan_budget)],
+                  scope_args(scope))
+        run_stage(args.concurrency, "refine", ["--top", str(args.refine_top)],
+                  scope_args(scope))
         run_stage(args.concurrency, "gatelog", ["--passing", "--limit", "20"])
         run_stage(args.concurrency, "select", ["--n", str(args.select_n)])
         # NEVER --live. This is the only line in the file that invokes submit,
