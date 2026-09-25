@@ -311,8 +311,9 @@ def main() -> int:
                     help="rows of the kept list to print (default 15)")
     args = ap.parse_args()
 
+    from check_powerpool import rejudge
     with open(args.report) as fh:
-        results = json.load(fh)
+        results = rejudge(json.load(fh))
 
     field_datasets: dict[str, str] = {}
     if args.max_per_dataset is not None:

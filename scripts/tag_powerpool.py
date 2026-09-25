@@ -164,7 +164,8 @@ def main() -> int:
         print(f"authentication failed: {e}", file=sys.stderr)
         return 1
 
-    data = json.load(open(args.report))
+    from check_powerpool import rejudge
+    data = rejudge(json.load(open(args.report)))
     candidates = select_candidates(data, args.include_unverified)
     unverified = [r["alpha_id"] for r in candidates if not r.get("verified")]
     if unverified:

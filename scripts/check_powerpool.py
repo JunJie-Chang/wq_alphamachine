@@ -60,9 +60,21 @@ GROUP_FIELDS = {"country", "industry", "subindustry", "currency", "market",
 EXCLUDED_OPERATORS = {"ts_backfill", "group_backfill"}
 KEYWORDS = {"if", "else", "then", "and", "or", "not", "true", "false", "nan"}
 
-# The IS checks that map directly onto Power Pool's own eligibility rules.
+# The IS checks that map directly onto Power Pool's own eligibility rules. Used
+# for the per-gate display and for what counts as still PENDING -- NOT as the
+# list of what can fail. See PP_EXEMPT_FAILS.
 SERVER_GATES = ("LOW_TURNOVER", "HIGH_TURNOVER", "LOW_SUB_UNIVERSE_SHARPE",
                 "POWER_POOL_CORRELATION")
+# Eligibility blocks on EVERY failed server check except these. A fixed list of
+# gates cannot keep up: docs/Power_Pool_Alpha_規則.md §1 also requires the
+# Robust-universe test, and BRAIN adds region-specific sub-universe checks
+# (LOW_ASI_JPN_SHARPE, ...). Measured 2026-09-25: 28 of 18,493 alphas the old
+# 4-gate rule called eligible carried such a FAIL, and 2 of that day's top 4
+# picks were among them. Exempt only what BRAIN itself stops enforcing once an
+# alpha is tagged PowerPoolSelected (confirmed live 2026-09-19, see
+# submit_powerpool.py). Anything else -- a check name never seen before
+# included -- blocks.
+PP_EXEMPT_FAILS = frozenset({"LOW_FITNESS", "PROD_CORRELATION", "LOW_2Y_SHARPE"})
 # Confirmed live (2026-09-19): these two exist as WARNING, not FAIL, so they
 # never block submission -- but per docs/Power_Pool_Alpha_規則.md #5, an
 # alpha without a compliant 100+ char Idea/Rationale description in
@@ -174,6 +186,34 @@ def gate_status(checks: list[dict]) -> dict:
     return {name: check_result(checks, name) for name in SERVER_GATES}
 
 
+def blocking_fails(pairs) -> list[str]:
+    """Names of failed checks that keep an alpha out of Power Pool.
+
+    `pairs` is (name, result), the shape of a report's `all_checks`."""
+    return [n for n, res in pairs
+            if res in ("FAIL", "ERROR") and n not in PP_EXEMPT_FAILS]
+
+
+def apply_server_fails(r: dict, pairs) -> dict:
+    """Recompute a report record's server-side FAIL reasons and `eligible`.
+
+    The local reasons (Sharpe, operator and field counts) are kept; only the
+    "<CHECK> FAIL" ones are replaced. Also how a saved report is re-judged on
+    load, so a file written under an older rule cannot carry a stale verdict."""
+    r["reasons"] = [x for x in r.get("reasons") or [] if not x.endswith(" FAIL")] + \
+        [f"{n} FAIL" for n in blocking_fails(pairs)]
+    r["eligible"] = not r["reasons"]
+    return r
+
+
+def rejudge(results: list[dict]) -> list[dict]:
+    """Re-apply the current eligibility rule to records loaded from a file."""
+    for r in results:
+        if "all_checks" in r:
+            apply_server_fails(r, r["all_checks"])
+    return results
+
+
 def recency(checks: list[dict]) -> dict:
     """Has the signal held up lately? BRAIN's own evidence, judged on the VALUE.
 
@@ -209,7 +249,7 @@ def evaluate(alpha: dict, operator_names: set[str]) -> dict:
 
     gates = gate_status(checks)
     pp_corr = check_value(checks, "POWER_POOL_CORRELATION")
-    failed_gates = [k for k, v in gates.items() if v == "FAIL"]
+    all_checks = [(c.get("name"), c.get("result")) for c in checks]
     pending_gates = [k for k, v in gates.items() if v in (None, "PENDING")]
     description_needs_work = [name for name in DESCRIPTION_CHECKS
                               if check_result(checks, name) == "WARNING"]
@@ -221,8 +261,7 @@ def evaluate(alpha: dict, operator_names: set[str]) -> dict:
         reasons.append(f"{len(operators)} distinct operators > 8: {sorted(operators)}")
     if not field_ok:
         reasons.append(f"{len(fields)} distinct fields > 3: {sorted(fields)}")
-    for g in failed_gates:
-        reasons.append(f"{g} FAIL")
+    reasons += [f"{n} FAIL" for n in blocking_fails(all_checks)]
 
     settings = alpha.get("settings") or {}
     return {
@@ -242,7 +281,7 @@ def evaluate(alpha: dict, operator_names: set[str]) -> dict:
         "gates": gates,
         "pending_gates": pending_gates,
         "description_needs_work": description_needs_work,
-        "all_checks": [(c.get("name"), c.get("result")) for c in checks],
+        "all_checks": all_checks,
         "eligible": not reasons,
         "verified": not pending_gates,
         "reasons": reasons,
@@ -281,11 +320,11 @@ def deepen(client: BrainClient, r: dict) -> dict:
     r["verified"] = not r["pending_gates"]
     r["description_needs_work"] = [name for name in DESCRIPTION_CHECKS
                                    if check_result(checks, name) == "WARNING"]
-    failed_gates = [k for k, v in gates.items() if v == "FAIL"]
-    r["reasons"] = [x for x in r["reasons"] if not x.endswith("FAIL")] + \
-        [f"{g} FAIL" for g in failed_gates]
-    r["eligible"] = not r["reasons"]
-    return r
+    # An empty /check body is BRAIN still computing, not "nothing failed": keep
+    # the screen-time checks rather than let it wipe a FAIL already seen.
+    if checks:
+        r["all_checks"] = [(c.get("name"), c.get("result")) for c in checks]
+    return apply_server_fails(r, r.get("all_checks") or [])
 
 
 def main() -> int:
@@ -325,7 +364,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.from_file:
-        results = json.load(open(args.from_file))
+        results = rejudge(json.load(open(args.from_file)))
         # Keep the FILE's order. dedup_powerpool.py writes it deliberately
         # interleaved across pyramids so that `--top N` is a spread; re-sorting
         # by Sharpe here would silently undo that and spend the whole slice on

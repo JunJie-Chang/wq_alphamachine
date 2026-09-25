@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 479 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 527 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -1145,8 +1145,20 @@ platform before relying on it.
 * **Operator/field counts are parsed heuristically** from the expression against
   the live `/operators` list. Usually right, not a substitute for the counts on
   the alpha's own page.
-* **No robust-universe check by name.** No check in the live payload obviously
-  maps to it; every check an alpha carries is in the JSON under `all_checks`.
+* **Eligibility blocks on every failed check, not a fixed list of gates.** The
+  robust-universe test does exist by name (`LOW_ROBUST_UNIVERSE_SHARPE.WITH_RATIO`,
+  `LOW_ROBUST_UNIVERSE_RETURNS`), and regions add their own sub-universe checks
+  (`LOW_ASI_JPN_SHARPE`). The screen used to judge only four named gates, so on
+  2026-09-25 it called 28 of 18,493 alphas eligible that carried one of these
+  FAILs -- and 2 of that day's top 4 `--pick` results were among them. The
+  submit path was never fooled (`submit_powerpool.py` rejects any FAIL), but a
+  failing record wasted a pick, could be tagged, and held a slot under dedup's
+  per-field caps. Now any FAIL or ERROR blocks, except `PP_EXEMPT_FAILS`
+  (`LOW_FITNESS`, `PROD_CORRELATION`, `LOW_2Y_SHARPE` -- the ones BRAIN itself
+  stops enforcing once an alpha is tagged); an unfamiliar check name blocks by
+  default. `dedup_powerpool.py`, `tag_powerpool.py` and `check_powerpool.py
+  --from-file` re-judge saved reports from `all_checks` on load, so an old file
+  cannot carry a stale verdict and nothing needs re-fetching.
 * **Description phrasing is hand-authored, and the template is narrow.**
   `tag_powerpool.py`'s `FIELD_CHANNEL` maps each field to a sentence about what
   it measures; a field it doesn't know gets a vaguer description and a warning.

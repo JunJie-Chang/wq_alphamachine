@@ -3475,6 +3475,51 @@ finally:
 check("--from-file --top N deepens the first N of the FILE, not the top-N Sharpes",
       _FakeClient40.checked == ["lo", "mid"], str(_FakeClient40.checked))
 
+# --- Power Pool eligibility blocks on EVERY failed check, not 4 named gates ---
+# 2026-09-25: MPa6Onv6 and pwRaAbGx read eligible=True while failing the
+# Robust-universe test that docs/Power_Pool_Alpha_規則.md §1 requires.
+_pp42 = lambda checks, sharpe=1.5: CP40.evaluate(
+    {"id": "x", "status": "UNSUBMITTED", "settings": {"region": "ASI", "delay": 1},
+     "regular": {"code": "group_rank(ts_zscore(f, 66), industry)"},
+     "is": {"sharpe": sharpe, "checks": [{"name": n, "result": r} for n, r in checks]}},
+    {"group_rank", "ts_zscore"})
+check("a Robust-universe FAIL makes an alpha ineligible (the 4-gate rule missed it)",
+      not _pp42([("LOW_TURNOVER", "PASS"), ("LOW_ROBUST_UNIVERSE_SHARPE.WITH_RATIO", "FAIL")])["eligible"])
+check("a region sub-universe FAIL (LOW_ASI_JPN_SHARPE) makes an alpha ineligible",
+      not _pp42([("LOW_ASI_JPN_SHARPE", "FAIL")])["eligible"])
+check("a FAIL under a check name never seen before blocks by default",
+      not _pp42([("LOW_SOME_NEW_CHECK", "FAIL")])["eligible"])
+check("an ERROR result blocks, same as the submit path's failed_checks",
+      not _pp42([("CONCENTRATED_WEIGHT", "ERROR")])["eligible"])
+check("checks BRAIN stops enforcing once tagged (LOW_FITNESS, PROD_CORRELATION, LOW_2Y_SHARPE) do not block",
+      _pp42([("LOW_FITNESS", "FAIL"), ("PROD_CORRELATION", "FAIL"), ("LOW_2Y_SHARPE", "FAIL")])["eligible"])
+check("the reason names the check, so a report shows WHY it was dropped",
+      _pp42([("LOW_ROBUST_UNIVERSE_RETURNS", "FAIL")])["reasons"] == ["LOW_ROBUST_UNIVERSE_RETURNS FAIL"])
+
+_stale42 = {"alpha_id": "s", "eligible": True, "reasons": ["Sharpe 0.9 < 1.0", "OLD_GATE FAIL"],
+            "all_checks": [["LOW_ROBUST_UNIVERSE_RETURNS", "FAIL"]]}
+CP40.rejudge([_stale42])
+check("rejudge: a record saved under the old rule is re-judged from its all_checks on load",
+      _stale42["eligible"] is False
+      and _stale42["reasons"] == ["Sharpe 0.9 < 1.0", "LOW_ROBUST_UNIVERSE_RETURNS FAIL"],
+      str(_stale42["reasons"]))
+_noall42 = {"alpha_id": "n", "eligible": True, "reasons": []}
+CP40.rejudge([_noall42])
+check("rejudge: a record with no all_checks (older format) keeps its saved verdict",
+      _noall42["eligible"] is True)
+
+class _Check42:
+    def __init__(self, checks): self.checks = checks
+    def alpha_check(self, aid): return {"is": {"checks": self.checks}}
+_r42 = {"alpha_id": "d", "reasons": [], "all_checks": [["LOW_ROBUST_UNIVERSE_RETURNS", "FAIL"]]}
+CP40.deepen(_Check42([]), _r42)
+check("deepen: an empty /check body (BRAIN still computing) does not wipe a FAIL already seen",
+      _r42["eligible"] is False, str(_r42["reasons"]))
+CP40.deepen(_Check42([{"name": "LOW_ROBUST_UNIVERSE_RETURNS", "result": "PASS"}]), _r42)
+check("deepen: a fresh /check where the check now passes clears the old FAIL",
+      _r42["eligible"] is True and _r42["all_checks"] == [("LOW_ROBUST_UNIVERSE_RETURNS", "PASS")],
+      str(_r42))
+
 print("\n[41] theme migration rebuilds the bandit instead of renaming it")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import migrate_themes as MT41
