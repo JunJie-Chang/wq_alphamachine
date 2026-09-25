@@ -490,7 +490,14 @@ class RunConfig:
     # carry one -- so this is configuration, not something the code can read.
     concurrency: int = 13
     poll_interval: float = 5.0
-    sim_timeout: float = 900.0
+    # How long a worker polls ITS OWN bundle before deferring it. Giving up does
+    # not free the slot -- BRAIN keeps running the job -- it only frees the worker
+    # to dispatch more, which then waits for a slot its own abandoned bundles hold.
+    # At 900s that is what happened on GLB/TOP3000 (2026-09-25): a 10-alpha GLB
+    # bundle ran past 15 minutes, and 50 of 200 then 110 of 150 refine variants
+    # were deferred unsimulated. GLB ran 100-870 alphas/hr against 1,500-2,000
+    # for EUR/CHN the same day.
+    sim_timeout: float = 2400.0
     # reclaim() runs before EVERY dispatch, on the same `concurrency`-worker thread
     # pool as run() (fixed 2026-09-24 -- it was sequential, one bundle at a time,
     # which meant a backlog of N leftover bundles cost N * ~90s of wall clock no

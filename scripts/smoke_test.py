@@ -3441,6 +3441,9 @@ except SystemExit:
     pass
 check("the account's simulation slot count is 13 by default (config and CLI)",
       _RC41().concurrency == 13 and "13 as of" in " ".join(_buf41.getvalue().split()))
+check("a worker polls its own bundle for 40 min, not 15 -- a 10-alpha GLB bundle outlasted 900s "
+      "and abandoned bundles kept their slots (2026-09-25)",
+      _RC41().sim_timeout == 2400.0)
 
 # --- check_powerpool --from-file must keep the FILE's order ------------------
 import io as _io40, contextlib as _cx40
