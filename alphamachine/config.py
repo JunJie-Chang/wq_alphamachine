@@ -210,12 +210,16 @@ class Gates:
 # --------------------------------------------------------------------------
 REGIONS = ("USA", "GLB", "EUR", "ASI", "CHN", "JPN", "KOR", "TWN", "HKG", "AMR")
 
+# refine's portability rung tries unis[1:3]. Every entry must be a universe BRAIN
+# accepts for that region: CHN/TOP3000 and ASI/ILLIQUID_MINVOL1M were listed and
+# are not ("Universe TOP3000 is not available for instrument type EQUITY and
+# region CHN", 2026-09-26) -- each one 400'd its whole bundle.
 UNIVERSES: dict[str, tuple[str, ...]] = {
     "USA": ("TOP3000", "TOP1000", "TOP500", "TOP200", "TOPSP500"),
     "GLB": ("TOPDIV3000", "TOP3000", "MINVOL1M"),
     "EUR": ("TOP2500", "TOP1200", "TOP800", "TOP400"),
-    "ASI": ("MINVOL1M", "ILLIQUID_MINVOL1M"),
-    "CHN": ("TOP2000U", "TOP3000"),
+    "ASI": ("MINVOL1M",),
+    "CHN": ("TOP2000U",),
     "JPN": ("TOP1600", "TOP1200"),
     "KOR": ("TOP600",),
     "TWN": ("TOP500",),

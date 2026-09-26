@@ -3238,6 +3238,57 @@ _scan47 = _in47.getsource(_cli47.cmd_scan)
 check("cmd_scan excludes known-dead fields and passes the scope's field ids to generate()",
       "dead_fields(" in _scan47 and "available=" in _scan47)
 
+# --- a bundle 400'd for ONE bad member must not write off the valid ones ------
+# 2026-09-26: refine asked for CHN/TOP3000 (not a CHN universe); BRAIN rejected
+# the bundle with [{}, {}, {"settings": ...}, ...] and every member was stored ERROR.
+from alphamachine.client import BundleRejected as _BRj48
+_bc48 = _BC40("a@b.c", "x", cookie_path=os.path.join(tempfile.mkdtemp(), "c.json"))
+_err48 = {"settings": {"universe": ["Universe TOP3000 is not available for instrument type EQUITY and region CHN"]}}
+_bc48.post = lambda path, **kw: _Resp40(400, [{}, _err48, {}])
+_e48 = None
+try:
+    _bc48.simulate([{"a": 1}, {"b": 2}, {"c": 3}])
+except _BRj48 as _x:
+    _e48 = _x
+check("simulate(): a 400 with a per-child array raises BundleRejected carrying each child's error",
+      _e48 is not None and _e48.child_errors == [{}, _err48, {}])
+_bc48.post = lambda path, **kw: _Resp40(400, {"detail": "bad"})
+check("...a 400 that is not a per-child array stays a plain SimulationFailed",
+      _raises(lambda: _bc48.simulate([{"a": 1}]), _SF43)
+      and not _raises(lambda: _bc48.simulate([{"a": 1}]), _BRj48))
+
+_j48 = [_cand45(80 + k) for k in range(3)]
+_e = _ex45(simulate=_raise(_BRj48("simulate [400]: ...", [{}, _err48, {}])))
+_o48 = _e._bundle(_j48)
+check("_bundle: only the member BRAIN objected to is recorded ERROR, with its own reason",
+      _o48[_j48[1]]["status"] == "ERROR" and "not available" in _o48[_j48[1]]["error"]
+      and _rows45(_j48[1]) == 1, str(_o48))
+check("_bundle: the valid members are CANCELLED (resent by run()), with nothing recorded",
+      _o48[_j48[0]] == {"status": "CANCELLED"} and _o48[_j48[2]] == {"status": "CANCELLED"}
+      and _rows45(_j48[0]) == 0 and _rows45(_j48[2]) == 0)
+
+from alphamachine.config import UNIVERSES as _U48
+from alphamachine.client import BrainClient as _BC48
+check("refine's universe table holds only universes BRAIN accepts (no CHN/TOP3000, ASI/ILLIQUID_MINVOL1M)",
+      "TOP3000" not in _U48["CHN"] and "ILLIQUID_MINVOL1M" not in _U48["ASI"])
+check("a worker waits for a slot as long as a bundle may run (2400s, = sim_timeout)",
+      _BC48.SLOT_WAIT_SECONDS == 2400.0 == RunConfig().sim_timeout)
+
+import repair_bundle_400 as _RB48
+_m48 = ('simulate [400]: [{},{"settings":{"universe":["Universe TOP3000 is not available '
+        'for instrument type EQUITY and region CHN."]}},{}]')
+check("repair: a valid bundle-mate of a rejected universe is collateral",
+      _RB48.is_collateral(_m48, {"universe": "TOP2000U", "neutralization": "INDUSTRY"}))
+check("repair: the member whose own universe was rejected is NOT (a genuine verdict)",
+      not _RB48.is_collateral(_m48, {"universe": "TOP3000", "neutralization": "INDUSTRY"}))
+check("repair: same for a rejected neutralization",
+      not _RB48.is_collateral('simulate [400]: [{},{"settings":{"neutralization":["Neutralization '
+                              'COUNTRY is not available for instrument type EQUITY and region USA."]}}]',
+                              {"universe": "TOP3000", "neutralization": "COUNTRY"}))
+check("repair: any reason it cannot attribute (an expression error) leaves the row alone",
+      not _RB48.is_collateral('simulate [400]: [{},{"regular":["Attempted to use unknown variable x"]}]',
+                              {"universe": "TOP3000", "neutralization": "INDUSTRY"}))
+
 # run(): the crash path
 class _Boom45(_Ex43):
     def _bundle(self, cids): raise self.exc

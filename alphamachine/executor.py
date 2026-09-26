@@ -33,7 +33,8 @@ from typing import Callable
 import requests
 
 from .client import (AuthError, BiometricRequired, BrainClient, BrainError,
-                     DailyLimitReached, SimulationCancelled, SimulationFailed,
+                     BundleRejected, DailyLimitReached, SimulationCancelled,
+                     SimulationFailed,
                      SlotsBusy, is_transient_text)
 from .catalog import dead_field_in, identifiers
 from .config import RunConfig
@@ -238,6 +239,15 @@ class Executor:
             # here is what poisoned 21k candidates. They stay pending for the next run.
             log.warning("deferring %d candidate(s): %s", len(live), e)
             return {**missing, **{cid: {"status": "DEFERRED"} for cid, _ in live}}
+        except BundleRejected as e:
+            # Only the members BRAIN actually objected to are a verdict. A `{}`
+            # member was valid and never simulated: CANCELLED, so run() sends it
+            # again once, the same as a sibling cancelled at run time.
+            out = dict(missing)
+            for (cid, _r), err in zip(live, e.child_errors):
+                out[cid] = (self._fail(cid, f"simulate [400]: {json.dumps(err)}") if err
+                            else {"status": "CANCELLED"})
+            return out
         except SimulationFailed as e:
             out = dict(missing)
             for cid, _r in live:

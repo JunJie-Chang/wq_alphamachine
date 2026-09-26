@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 557 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 567 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -936,7 +936,14 @@ poisoned shape.
 error body is a per-child array in which valid members appear as `{}`. Reading
 that as "everything was rejected" produces exactly the wrong conclusion — a
 neutralization probe once reported all 7 variants invalid when 5 were fine.
-Re-probe separately before believing a bundle-level rejection.
+Re-probe separately before believing a bundle-level rejection. The Executor now
+does exactly that: `simulate()` raises `BundleRejected` carrying the per-child
+array, only the members BRAIN objected to are recorded ERROR (with their own
+reason), and the `{}` members are resent once in the same run. Before this, every
+member was stored with the bundle's message -- on 2026-09-26, 18 valid CHN/USA
+candidates written off because refine asked for CHN/TOP3000 and ASI/
+ILLIQUID_MINVOL1M, which `config.UNIVERSES` listed and BRAIN does not have.
+`scripts/repair_bundle_400.py` returns such rows to the queue.
 
 **At run time, one failing child cancels its siblings.** A bundle accepted fine
 can still fail mid-run: BRAIN then marks the parent `ERROR`, the failing child

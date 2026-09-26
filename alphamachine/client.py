@@ -119,6 +119,21 @@ class SimulationCancelled(SimulationFailed):
     """
 
 
+class BundleRejected(SimulationFailed):
+    """POST /simulations 400'd a multi-sim bundle; `child_errors` is per child.
+
+    BRAIN refuses the WHOLE bundle if any member is malformed, and answers with an
+    array in payload order where a valid member is `{}`. Recording that one
+    message against every member marked valid candidates ERROR for good -- seen
+    2026-09-26 when refine asked for CHN/TOP3000, which does not exist, and its
+    CHN/TOP2000U bundle-mates were written off with it.
+    """
+
+    def __init__(self, msg: str, child_errors: list):
+        super().__init__(msg)
+        self.child_errors = child_errors
+
+
 class BrainClient:
     """One instance per thread. `requests.Session` cookie jars are not
     thread-safe under concurrent use, and BRAIN auth lives in a cookie."""
@@ -561,7 +576,11 @@ class BrainClient:
     # that were never simulated, marked failed for good, and counted as failed trials
     # against their bandit arms. Wait for a slot instead; only if none frees up for
     # SLOT_WAIT_SECONDS raise SlotsBusy, which the Executor DEFERS (no record written).
-    SLOT_WAIT_SECONDS = 1200.0
+    # 2400s, matching RunConfig.sim_timeout: a GLB bundle routinely runs past 20
+    # minutes, so at 1200s the queued workers gave up on slots about to free
+    # (2026-09-26: 20 of 190 GLB scan candidates and ~50 refine variants deferred,
+    # and a deferred scan candidate is never picked up again by plain `scan`).
+    SLOT_WAIT_SECONDS = 2400.0
     SLOT_POLL_SECONDS = 20.0
 
     def simulate(self, payload: dict | list[dict]) -> str:
@@ -593,6 +612,13 @@ class BrainClient:
             if not loc:
                 raise SimulationFailed(f"no Location header: {r.text[:300]}")
             return loc
+        if r.status_code == 400 and isinstance(payload, list):
+            try:
+                per_child = r.json()
+            except ValueError:
+                per_child = None
+            if isinstance(per_child, list) and len(per_child) == len(payload):
+                raise BundleRejected(f"simulate [400]: {r.text[:500]}", per_child)
         raise SimulationFailed(f"simulate [{r.status_code}]: {r.text[:500]}")
 
     # BRAIN stops serving a progress URL some time after the job ends. A 404 body
