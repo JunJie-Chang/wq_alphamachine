@@ -3179,6 +3179,65 @@ check("reclaim: a bundle whose children were cancelled is let go (lost), not 'st
       _rr46["lost"] == 2 and _rr46["still_running"] == 0
       and all(_infl45(c) == 0 and _rows45(c) == 0 for c in _ir46), str(_rr46))
 
+# --- fields BRAIN calls unknown are learned, and never dispatched again ------
+# 137 unknown-field errors in 3 days (2026-09-26), the same few fields over and
+# over, each one taking its whole bundle down with it.
+from alphamachine.catalog import dead_field_in as _dfi47
+from alphamachine import templates as _T47
+check("dead_field_in reads both of BRAIN's wordings, and nothing else",
+      _dfi47('Attempted to use unknown variable "attention_beta". <link>') == "attention_beta"
+      and _dfi47("Invalid data field fnd65_totalcap_cusip_saleeps. <link>") == "fnd65_totalcap_cusip_saleeps"
+      and _dfi47("timeout after 900.0s") is None and _dfi47("") is None)
+check("a template's literal fields are the ones it names outright (YIELD denominators, returns)",
+      _T47.BY_NAME["yield_assets"].literal_fields == {"assets"}
+      and _T47.BY_NAME["resid_vs_returns"].literal_fields == {"returns"}
+      and _T47.BY_NAME["event_volume"].literal_fields == {"volume", "adv20"})
+
+_scope47 = json.loads(SimSettings().payload() if isinstance(SimSettings().payload(), str)
+                      else json.dumps(SimSettings().payload()))
+_r47, _u47, _d47 = _scope47["region"], _scope47["universe"], _scope47["delay"]
+_il = _cand45(70); _e = _ex45()
+_e._fail(_il, 'Attempted to use unknown variable "ghost47". <linkToCommonErrorMessages>')
+check("an unknown-variable ERROR teaches the scope's dead-field list",
+      "ghost47" in _st45.dead_fields(_r47, _u47, _d47))
+check("...scoped: the same field is not dead in another region",
+      "ghost47" not in _st45.dead_fields("EUR", "TOP2500", 1))
+
+_idead = _st45.add_candidate(expr="rank(ghost47)", settings=SimSettings().payload(),
+                             theme="t", template="tt", field="ghost47")
+_iok = _cand45(71)
+_sent47 = []
+def _sim47(payload):
+    _sent47.append(payload); return "https://x/sim/g47"
+_e = _ex45(simulate=_sim47, poll=lambda url, **kw: {"alpha": "https://api/alphas/G47"},
+           alpha=lambda aid: {"id": aid, "is": {"sharpe": 1.0}, "status": "UNSUBMITTED",
+                              "settings": {}, "regular": {}})
+_rb47 = _e._bundle([_idead, _iok])
+check("a candidate on a known-dead field is recorded ERROR without being dispatched",
+      _rb47[_idead]["status"] == "ERROR" and "known dead" in _rb47[_idead]["error"]
+      and _rows45(_idead) == 1)
+check("...and its bundle-mate still goes out alone, so it cannot be cancelled with it",
+      _rb47[_iok]["status"] == "OK" and len(_sent47) == 1
+      and not any("ghost47" in json.dumps(p) for p in _sent47), str(_sent47))
+
+_st47 = Store(os.path.join(tempfile.mkdtemp(), "g47.db"))
+_f47 = [{"id": f"fnd_x{i}", "_theme": "fundamental", "coverage": 0.9,
+         "dataset": {"id": "fundamental6"}, "alphaCount": i} for i in range(40)]
+_ids47 = generate(_st47, _f47, budget=80, base=SimSettings(), seed=5,
+                  available={f["id"] for f in _f47} | {"cap", "returns", "volume", "adv20"})
+_tp47 = {_st47.candidate(i)["template"] for i in _ids47}
+check("generate() drops a template whose literal field the scope lacks (no `assets` -> no yield_assets)",
+      "yield_assets" not in _tp47 and len(_ids47) > 0, str(sorted(_tp47)))
+_ids47b = generate(Store(os.path.join(tempfile.mkdtemp(), "g47b.db")), _f47, budget=80,
+                   base=SimSettings(), seed=5)
+check("...and with no `available` given, generation is unchanged (yield_assets still possible)",
+      len(_ids47b) > 0)
+import inspect as _in47
+from alphamachine import cli as _cli47
+_scan47 = _in47.getsource(_cli47.cmd_scan)
+check("cmd_scan excludes known-dead fields and passes the scope's field ids to generate()",
+      "dead_fields(" in _scan47 and "available=" in _scan47)
+
 # run(): the crash path
 class _Boom45(_Ex43):
     def _bundle(self, cids): raise self.exc

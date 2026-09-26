@@ -48,14 +48,20 @@ def _partner_pool(fields: list[dict], theme: str
 
 def generate(store, fields: list[dict], *, budget: int,
              base: SimSettings, seed: int = 0,
-             templates: Iterable[T.Template] = T.LIBRARY) -> list[str]:
+             templates: Iterable[T.Template] = T.LIBRARY,
+             available: set[str] | None = None) -> list[str]:
     """Produce up to `budget` fresh scan candidates and persist them.
 
     Returns the candidate ids actually queued (already-simulated combinations
     are silently skipped, so the caller may get fewer than `budget`).
+
+    `available`: every field id the scope actually has. A template naming a
+    field outside it (yield_assets where there is no `assets`) is dropped
+    before the bandit allocates, so no budget goes to a certain failure.
     """
     rng = random.Random(seed or None)
-    tmpls = list(templates)
+    tmpls = [t for t in templates
+             if available is None or t.literal_fields <= available]
     by_theme = Catalog.by_theme(fields)
     exhausted = set(store.get("exhausted_fields", []))
 

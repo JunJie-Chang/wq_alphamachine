@@ -99,13 +99,16 @@ def cmd_scan(args):
         print(f"re-dispatching {len(ids)} pending scan candidate(s)")
     else:
         cat = Catalog(client, cfg.cache_dir)
-        fields = cat.usable(cat.fields(region=args.region, delay=args.delay,
-                                       universe=args.universe))
+        every = cat.fields(region=args.region, delay=args.delay, universe=args.universe)
+        dead = store.dead_fields(args.region, args.universe, args.delay)
+        fields = [f for f in cat.usable(every) if f.get("id") not in dead]
         fields = cat.stratified_sample(fields, per_dataset=args.per_dataset)
         print(f"sampling from {len(fields)} fields across "
-              f"{len(cat.by_dataset(fields))} datasets")
+              f"{len(cat.by_dataset(fields))} datasets"
+              + (f" ({len(dead)} known-dead field(s) excluded)" if dead else ""))
         ids = generate(store, fields, budget=args.budget,
-                       base=_base_settings(args), seed=args.seed)
+                       base=_base_settings(args), seed=args.seed,
+                       available={f.get("id") for f in every} - dead)
     if not ids:
         print("nothing new to scan (everything already simulated)")
         return

@@ -62,7 +62,23 @@ _THEME_RE: tuple[tuple[str, Any], ...] = tuple(
     (theme, re.compile(pat)) for theme, pat in THEME_PATTERNS)
 
 # Size denominators used by the YIELD templates -- these must exist in-region.
+# GLB, GBR, DEU, IND and CHN/d0 carry cap but none of the other four (checked
+# against each catalog 2026-09-26); generate() skips a template that names a
+# field its scope does not have.
 DENOMINATORS = ("cap", "assets", "revenue", "equity", "sales")
+
+_DEAD_FIELD_RE = re.compile(r'unknown variable "([A-Za-z0-9_]+)"'
+                            r"|Invalid data field ([A-Za-z0-9_]+)")
+
+
+def dead_field_in(error: str) -> str | None:
+    """The field BRAIN says does not exist, from its error message, if any."""
+    m = _DEAD_FIELD_RE.search(error or "")
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def identifiers(expr: str) -> set[str]:
+    return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expr or ""))
 
 
 def infer_theme(field: dict) -> str:

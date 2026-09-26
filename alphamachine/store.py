@@ -177,6 +177,16 @@ CREATE TABLE IF NOT EXISTS deep_checks (
 
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 
+-- Fields BRAIN has told us do not exist in a scope ("unknown variable",
+-- "Invalid data field"). The catalog cache keeps listing them -- 137 such
+-- errors in 3 days (2026-09-26), the same few fields over and over -- and each
+-- one takes its whole bundle down: BRAIN cancels the unrun siblings.
+CREATE TABLE IF NOT EXISTS dead_fields (
+    region TEXT, universe TEXT, delay INTEGER, field TEXT,
+    error TEXT, first_seen REAL,
+    PRIMARY KEY (region, universe, delay, field)
+);
+
 -- Which bandit trials have already been counted, so a verdict teaches exactly
 -- once no matter how many times it is recomputed.
 --
@@ -1111,6 +1121,18 @@ class Store:
         without duplicating the SQL or instantiating a second Store.
         """
         return self.conn().execute(GATE_PASSING_NOW_SQL, (limit,)).fetchall()
+
+    # --------------------------------------------------------- dead fields
+    def add_dead_field(self, region: str, universe: str, delay: int,
+                       field: str, error: str = "") -> None:
+        with self.conn() as c:
+            c.execute("INSERT OR IGNORE INTO dead_fields VALUES (?,?,?,?,?,?)",
+                      (region, universe, int(delay), field, error[:200], time.time()))
+
+    def dead_fields(self, region: str, universe: str, delay: int) -> set[str]:
+        return {r["field"] for r in self.conn().execute(
+            "SELECT field FROM dead_fields WHERE region=? AND universe=? AND delay=?",
+            (region, universe, int(delay)))}
 
     # ----------------------------------------------------------------- kv
     def get(self, k: str, default=None):

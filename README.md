@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 548 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 557 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -889,9 +889,22 @@ Confirm against your own account: your slot count; whether multi-sim (a list
 payload to `/simulations`) is enabled for your tier; and the check limits for
 regions beyond non-CHN D1 (`config.CONSULTANT_CHECKS` / `CHN_CHECKS`).
 
-**Field names in `templates.py` are placeholders.** `cap`, `assets`, `returns`,
-`volume`, `adv20` exist in USA; the YIELD templates will error in regions where
-the denominators are named differently. Run `catalog` first and check.
+**A template only runs where the fields it names exist.** Some templates name a
+field outright rather than through `{f}` (`Template.literal_fields`: `cap`,
+`assets`, `returns`, `volume`, `adv20`). Checked against every catalog
+2026-09-26: `returns`, `cap`, `volume`, `adv20`, `close` exist everywhere, but
+`assets`/`revenue`/`equity`/`sales` are absent from GLB, GBR, DEU, IND and
+CHN/d0. `scan` passes the scope's field ids to `generate()`, which drops such a
+template before the bandit allocates.
+
+**Fields BRAIN calls unknown are learned per scope.** The catalog cache goes
+stale -- `atm_call_option_volatility`, the `attention_*` family and others kept
+being picked long after BRAIN stopped recognising them: 137 "unknown variable" /
+"Invalid data field" errors in 3 days (2026-09-26), and at run time each one
+cancels its whole bundle. The Executor records every such field in `dead_fields`
+(region, universe, delay); `scan` excludes them, and a queued candidate that
+still names one is recorded ERROR before dispatch instead of taking nine
+siblings down with it.
 
 **`ts_regression(..., rettype=0)`** — confirmed 2026-09-20 against BRAIN's own
 operator documentation: `0` is the Error Term, so the RESIDUAL family does compute

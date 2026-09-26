@@ -58,6 +58,7 @@ from dataclasses import dataclass
 from typing import Iterator
 
 GROUPS = ("subindustry", "industry", "sector", "market")
+_NOT_FIELDS = set(GROUPS) | {"country", "exchange", "currency", "true", "false", "nan"}
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,16 @@ class Template:
     # Does the expression name a SECOND data field? The generator has to draw a
     # partner before it can render one of these; see generator._partner_pool.
     needs_field2: bool = False
+
+    @property
+    def literal_fields(self) -> set[str]:
+        """Data fields named in the expression itself, not by a placeholder --
+        a YIELD denominator (`cap`, `assets`), `returns` in a regression."""
+        body = re.sub(r"\{[a-z0-9]+\}", " ", self.expr)
+        calls = set(re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", body))
+        kwargs = set(re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*=", body))
+        return {t for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", body)
+                if t not in calls and t not in kwargs and t.lower() not in _NOT_FIELDS}
 
     def render(self, field: str, *, days: int = 126, group: str = "subindustry",
                days2: int | None = None, field2: str = "") -> str:

@@ -35,6 +35,7 @@ import requests
 from .client import (AuthError, BiometricRequired, BrainClient, BrainError,
                      DailyLimitReached, SimulationCancelled, SimulationFailed,
                      SlotsBusy, is_transient_text)
+from .catalog import dead_field_in, identifiers
 from .config import RunConfig
 from .metrics import extract
 
@@ -190,6 +191,19 @@ class Executor:
         for cid, r in zip(cids, rows):
             if r is None:
                 missing[cid] = self._fail(cid, "unknown candidate id")
+        # A candidate naming a field BRAIN has already called unknown in its scope
+        # fails for certain -- and inside a bundle it would take its siblings down
+        # with it. Record that verdict here instead of dispatching it.
+        kept = []
+        for cid, r in live:
+            dead = identifiers(r["expr"]) & self._dead_fields_for(r["settings"])
+            if dead:
+                missing[cid] = self._fail(
+                    cid, f'not dispatched: field "{min(dead)}" is known dead in this '
+                         f"scope (BRAIN reported it unknown earlier)")
+            else:
+                kept.append((cid, r))
+        live = kept
         if not live:
             return missing
 
@@ -227,9 +241,7 @@ class Executor:
         except SimulationFailed as e:
             out = dict(missing)
             for cid, _r in live:
-                rec = {"status": "ERROR", "error": str(e)[:400]}
-                self.store.record_sim(cid, rec)
-                out[cid] = rec
+                out[cid] = self._fail(cid, str(e))
             return out
 
         # The slot is spent the instant simulate() returns. Persist the mapping
@@ -263,10 +275,7 @@ class Executor:
                 return {**missing, **{cid: {"status": "DEFERRED"} for cid, _ in live}}
             out = dict(missing)
             for cid, _r in live:
-                rec = {"status": "ERROR", "error": str(e)[:400]}
-                self.store.record_sim(cid, rec)
-                self.store.clear_dispatched(cid)
-                out[cid] = rec
+                out[cid] = self._fail(cid, str(e))
             with self._lock:
                 self._open_bundles.discard(loc)
             return out
@@ -356,7 +365,18 @@ class Executor:
         rec = {"status": "ERROR", "error": msg[:400]}
         self.store.record_sim(cid, rec)
         self.store.clear_dispatched(cid)
+        field = dead_field_in(msg)
+        if field:
+            row = self.store.candidate(cid)
+            if row is not None:
+                s = json.loads(row["settings"])
+                self.store.add_dead_field(s.get("region"), s.get("universe"),
+                                          s.get("delay"), field, msg)
         return rec
+
+    def _dead_fields_for(self, settings_json: str) -> set[str]:
+        s = json.loads(settings_json or "{}")
+        return self.store.dead_fields(s.get("region"), s.get("universe"), s.get("delay", 1))
 
     def _release_open_bundles(self) -> None:
         """Hand unfinished slots back rather than orphaning them."""
