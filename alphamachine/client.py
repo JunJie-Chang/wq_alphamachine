@@ -107,6 +107,18 @@ class SlotsBusy(SimulationFailed):
     """
 
 
+class SimulationCancelled(SimulationFailed):
+    """BRAIN cancelled this job: it was never simulated, so it is no verdict.
+
+    Seen live 2026-09-26: when one child of a multi-sim bundle fails at run time,
+    BRAIN marks the parent ERROR and every sibling not yet run CANCELLED. Before
+    this existed poll() read {"status": "CANCELLED"} as "not finished yet" and
+    waited out its whole timeout per child -- 9 siblings x 300s stalled a scan
+    for 44 minutes -- then deferred them with the in-flight marker kept, so every
+    later reclaim() re-polled a job that had ended hours before.
+    """
+
+
 class BrainClient:
     """One instance per thread. `requests.Session` cookie jars are not
     thread-safe under concurrent use, and BRAIN auth lives in a cookie."""
@@ -634,6 +646,8 @@ class BrainClient:
             # Hand the body back so the caller can read each child separately.
             if body.get("children"):
                 return body
+            if status == "CANCELLED":
+                raise SimulationCancelled(f"cancelled by BRAIN, never simulated: {progress_url}")
             if status in ("ERROR", "FAIL"):
                 raise SimulationFailed(body.get("message") or str(body)[:300])
             if body.get("alpha"):

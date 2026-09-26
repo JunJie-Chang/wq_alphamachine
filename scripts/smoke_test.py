@@ -3107,6 +3107,78 @@ _e._harvest(_FC45(child_result=_raise(_SF43('Attempted to use unknown variable "
 check("regression guard: a genuine child failure is STILL recorded as ERROR",
       _rows45(_i9) == 1)
 
+# --- a CANCELLED job was never simulated (2026-09-26) ------------------------
+# One child failing at run time makes BRAIN cancel its unrun siblings. poll()
+# used to read CANCELLED as "not finished", wait 300s per child, then defer with
+# the marker kept -- a 44-minute stall and a job reclaim() re-polled forever.
+from alphamachine.client import SimulationCancelled as _SC46, is_transient_text as _itt46
+_bc46 = _BC40("a@b.c", "x", cookie_path=os.path.join(tempfile.mkdtemp(), "c.json"))
+_gets46 = []
+_bc46.get = lambda url, **kw: (_gets46.append(url), _Resp40(200, {"id": "c", "status": "CANCELLED"}))[1]
+_t46 = _t40.time()
+check("poll() raises SimulationCancelled on the FIRST read of a CANCELLED job, no waiting",
+      _raises(lambda: _bc46.poll("https://x/sim/c", interval=5.0, timeout=300.0), _SC46)
+      and len(_gets46) == 1 and _t40.time() - _t46 < 2.0, f"{len(_gets46)} reads")
+check("...and its message is not read as transient (it must not be deferred-with-marker)",
+      not _itt46(str(_SC46("cancelled by BRAIN, never simulated: https://x/sim/c"))))
+
+_ia, _ib, _ic = _cand45(46), _cand45(47), _cand45(48)
+for _k, _cid in enumerate((_ia, _ib, _ic)):
+    _st45.mark_dispatched(_cid, "https://x/sim/mixed", _k)
+def _child46(child_id, **kw):
+    if child_id == "bad":
+        raise _SF43('Attempted to use unknown variable "zzz"')
+    if child_id == "sib":
+        raise _SC46("cancelled by BRAIN, never simulated")
+    return {"alpha": "https://api/alphas/AOK46"}
+_e = _ex45()
+_o46 = _e._harvest(_FC45(child_result=_child46, alpha=lambda aid: {"id": aid, "is": {"sharpe": 1.0},
+                                                                     "status": "UNSUBMITTED",
+                                                                     "settings": {}, "regular": {}}),
+                   {"children": ["bad", "sib", "ok"]},
+                   [(c, _st45.candidate(c)) for c in (_ia, _ib, _ic)])
+check("harvest: the failing child is recorded ERROR, the cancelled sibling is CANCELLED, the good one OK",
+      [_o46[c]["status"] for c in (_ia, _ib, _ic)] == ["ERROR", "CANCELLED", "OK"], str(_o46))
+check("harvest: a cancelled child writes no sims row and its marker is cleared",
+      _rows45(_ib) == 0 and _infl45(_ib) == 0)
+
+_id46 = _cand45(49)
+_e = _ex45(simulate=_sim_ok, poll=_raise(_SC46("cancelled by BRAIN, never simulated")))
+_rd46 = _e._bundle([_id46])
+check("a whole job cancelled at the parent: CANCELLED, no record, marker cleared (not ERROR)",
+      _rd46 == {_id46: {"status": "CANCELLED"}} and _rows45(_id46) == 0 and _infl45(_id46) == 0)
+
+_ie46 = [_cand45(50 + k) for k in range(3)]
+_calls46, _taught46 = [], []
+def _twice46(cids):
+    _calls46.append(list(cids))
+    return {c: ({"status": "CANCELLED"} if len(_calls46) == 1 else {"status": "OK", "sharpe": 1.0})
+            for c in cids}
+_e = _ex45(); _e._bundle = _twice46
+_s46 = _e.run(_ie46, on_result=lambda cid, rec: _taught46.append(cid))
+check("run(): cancelled candidates are re-dispatched once, in the same run",
+      len(_calls46) == 2 and sorted(_calls46[1]) == sorted(_ie46)
+      and _s46["ok"] == 3 and _s46["cancelled"] == 0, f"{_calls46} {_s46}")
+check("run(): the bandit hook sees only the real results, never the cancellation",
+      sorted(_taught46) == sorted(_ie46) and len(_taught46) == 3)
+_calls46[:] = []; _taught46[:] = []
+_e = _ex45(); _e._bundle = lambda cids: (_calls46.append(list(cids)),
+                                         {c: {"status": "CANCELLED"} for c in cids})[1]
+_s46b = _e.run(_ie46, on_result=lambda cid, rec: _taught46.append(cid))
+check("run(): cancelled again on the retry -> left pending, no third attempt, nothing taught",
+      len(_calls46) == 2 and _s46b["cancelled"] == 3 and _s46b["error"] == 0 and _taught46 == [],
+      f"{_calls46} {_s46b}")
+
+_ir46 = [_cand45(60 + k) for k in range(2)]
+for _k, _cid in enumerate(_ir46):
+    _st45.mark_dispatched(_cid, "https://x/sim/rc", _k)
+_e = _ex45(poll=lambda url, **kw: {"children": ["s1", "s2"], "status": "ERROR"},
+           child_result=_raise(_SC46("cancelled by BRAIN, never simulated")))
+_rr46 = _e._reclaim_bundle("https://x/sim/rc", _st45.inflight_bundles()["https://x/sim/rc"], None)
+check("reclaim: a bundle whose children were cancelled is let go (lost), not 'still running' forever",
+      _rr46["lost"] == 2 and _rr46["still_running"] == 0
+      and all(_infl45(c) == 0 and _rows45(c) == 0 for c in _ir46), str(_rr46))
+
 # run(): the crash path
 class _Boom45(_Ex43):
     def _bundle(self, cids): raise self.exc

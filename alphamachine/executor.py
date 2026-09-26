@@ -33,8 +33,8 @@ from typing import Callable
 import requests
 
 from .client import (AuthError, BiometricRequired, BrainClient, BrainError,
-                     DailyLimitReached, SimulationFailed, SlotsBusy,
-                     is_transient_text)
+                     DailyLimitReached, SimulationCancelled, SimulationFailed,
+                     SlotsBusy, is_transient_text)
 from .config import RunConfig
 from .metrics import extract
 
@@ -84,8 +84,10 @@ class Executor:
 
     # ------------------------------------------------------------------ run
     def run(self, candidate_ids: list[str],
-            on_result: Callable[[str, dict], None] | None = None) -> dict:
-        stats = {"ok": 0, "error": 0, "skipped": 0, "deferred": 0}
+            on_result: Callable[[str, dict], None] | None = None,
+            _retry_cancelled: bool = True) -> dict:
+        stats = {"ok": 0, "error": 0, "skipped": 0, "deferred": 0, "cancelled": 0}
+        cancelled: list[str] = []
         if not candidate_ids:
             return stats
         self._halt.clear()
@@ -128,6 +130,10 @@ class Executor:
                         if st == "DEFERRED":            # never simulated: no verdict, no trial
                             stats["deferred"] += 1
                             continue
+                        if st == "CANCELLED":           # a sibling failed; never simulated
+                            stats["cancelled"] += 1
+                            cancelled.append(cid)
+                            continue
                         stats["ok" if st == "OK" else "error"] += 1
                         if on_result:
                             try:
@@ -149,6 +155,22 @@ class Executor:
         if self._daily.is_set():
             log.error("DAILY_SIMULATION_LIMIT_EXCEEDED: the platform's daily cap is spent. "
                       "Remaining candidates stay queued; try again after the daily reset.")
+        if cancelled:
+            # They were only collateral of a failing sibling, so one more bundle of
+            # just them should run clean. Once: a second cancellation stays pending
+            # (its marker is already cleared) rather than looping.
+            if (_retry_cancelled and not self._halt.is_set()
+                    and not self._daily.is_set()):
+                log.warning("%d candidate(s) cancelled by BRAIN because a sibling in "
+                            "their bundle failed -- re-dispatching them once",
+                            len(cancelled))
+                again = self.run(cancelled, on_result, _retry_cancelled=False)
+                stats["cancelled"] = again["cancelled"]
+                for k in ("ok", "error", "skipped", "deferred"):
+                    stats[k] += again[k]
+            else:
+                log.warning("%d candidate(s) cancelled by BRAIN; left pending",
+                            len(cancelled))
         return stats
 
     # -------------------------------------------------------------- bundle
@@ -223,6 +245,14 @@ class Executor:
         except AuthError:
             self._halt.set()             # dispatched: the in-flight marker stays, reclaim() finds it
             return {cid: {"status": "HALTED"} for cid in cids}
+        except SimulationCancelled:
+            # The whole job was cancelled (a single sim, or a bundle with no
+            # children listed). Same as a cancelled child: no verdict, marker gone.
+            for cid, _r in live:
+                self.store.clear_dispatched(cid)
+            with self._lock:
+                self._open_bundles.discard(loc)
+            return {**missing, **{cid: {"status": "CANCELLED"} for cid, _ in live}}
         except SimulationFailed as e:
             if is_transient_text(str(e)):
                 # e.g. the poll deadline: the job may still finish server-side, and it is
@@ -275,6 +305,12 @@ class Executor:
                     continue
                 try:
                     child = c.child_result(str(children[idx]).rsplit("/", 1)[-1])
+                except SimulationCancelled:
+                    # Never simulated: no record, and the marker goes -- the job is
+                    # over, so keeping it would have reclaim() re-poll it forever.
+                    self.store.clear_dispatched(cid)
+                    out[cid] = {"status": "CANCELLED"}
+                    continue
                 except SimulationFailed as e:
                     if is_transient_text(str(e)):
                         out[cid] = {"status": "DEFERRED"}   # marker stays: the sim is paid for

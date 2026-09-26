@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 539 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 548 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -924,6 +924,17 @@ error body is a per-child array in which valid members appear as `{}`. Reading
 that as "everything was rejected" produces exactly the wrong conclusion — a
 neutralization probe once reported all 7 variants invalid when 5 were fine.
 Re-probe separately before believing a bundle-level rejection.
+
+**At run time, one failing child cancels its siblings.** A bundle accepted fine
+can still fail mid-run: BRAIN then marks the parent `ERROR`, the failing child
+`ERROR`, and every sibling not yet run `CANCELLED` (seen 2026-09-26: 1 error +
+9 cancelled, twice). A cancelled child was never simulated -- no verdict, no
+bandit trial. `poll()` used to read `{"status": "CANCELLED"}` as "not finished"
+and wait out its 300 s per child (a 44-minute stall at the end of one scan),
+then defer with the in-flight marker kept, so every later `reclaim()` re-polled a
+job that had long ended. Now it raises `SimulationCancelled` on the first read;
+the Executor writes nothing, clears the marker, and re-dispatches the cancelled
+ones once in the same run. The failing child is still recorded as its `ERROR`.
 
 **`--concurrency` above your slot count does nothing good.** It builds a
 server-side queue and costs you the ability to react to results as they land.
