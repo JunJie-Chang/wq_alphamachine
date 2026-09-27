@@ -204,9 +204,9 @@ class Submitter:
             return dossier
 
         resp = self.c.submit(alpha_id)
-        time.sleep(5.0)
-        final = self.c.alpha(alpha_id)
+        final = await_submission(self.c, alpha_id)
         status = final.get("status")
+        verdict = submission_verdict(status)
         dossier["submitted"] = status == "ACTIVE"
         dossier["final_status"] = status
         dossier["response"] = resp
@@ -214,10 +214,9 @@ class Submitter:
             # 201 != live. Surface the reason rather than reporting success.
             dossier["reason"] = failed_checks(
                 (final.get("is") or {}).get("checks") or []) or "unknown"
-        self.store.record_submission(
-            alpha_id, "ACCEPTED" if dossier["submitted"] else "REJECTED",
-            status or "UNKNOWN", dossier)
-        self._teach_bandit(alpha_id, dossier["submitted"])
+        self.store.record_submission(alpha_id, verdict, status or "UNKNOWN", dossier)
+        if verdict != "PENDING":            # an undecided submission teaches nothing
+            self._teach_bandit(alpha_id, dossier["submitted"])
         return dossier
 
     def _teach_bandit(self, alpha_id: str, submitted: bool) -> None:
@@ -455,6 +454,34 @@ def submission_days(alphas: list[dict], since_epoch: float | None = None) -> int
     return len(days)
 
 
+SUBMIT_WAIT_SECONDS = 120.0
+SUBMIT_POLL_SECONDS = 5.0
+
+
+def await_submission(client, alpha_id: str, *, wait: float = SUBMIT_WAIT_SECONDS,
+                     poll: float = SUBMIT_POLL_SECONDS) -> dict:
+    """Re-read the alpha until BRAIN has decided, up to `wait` seconds.
+
+    A 2xx on POST /submit is "accepted for processing". Reading the status once,
+    5 s later, reported three of four Power Pool submissions on 2026-09-27 as not
+    submitted -- all three were ACTIVE within ~45 s.
+    """
+    deadline = time.time() + wait
+    while True:
+        time.sleep(poll)
+        final = client.alpha(alpha_id)
+        if final.get("status") != "UNSUBMITTED" or time.time() >= deadline:
+            return final
+
+
+def submission_verdict(status: str | None) -> str:
+    """ACCEPTED when live; PENDING while BRAIN still shows UNSUBMITTED after the
+    wait (not a rejection -- sync_active_submissions corrects it once ACTIVE)."""
+    if status == "ACTIVE":
+        return "ACCEPTED"
+    return "PENDING" if status == "UNSUBMITTED" else "REJECTED"
+
+
 def sync_active_submissions(client, store, rows: list[dict] | None = None) -> dict:
     """Mirror the platform's ACTIVE alphas into the local `submissions` table.
 
@@ -463,11 +490,15 @@ def sync_active_submissions(client, store, rows: list[dict] | None = None) -> di
     (`Submitter._active`, `count_submitted_today`). The table still feeds the
     Genius-pyramid coverage report (joined to sims) and the status display.
 
-    Insert-only: never overwrites a row the pipeline wrote itself, never deletes.
+    Never overwrites the dossier a row the pipeline wrote itself carries, never
+    deletes. The one correction it makes: a row whose status says anything but
+    ACTIVE, for an alpha the platform lists as ACTIVE, gets its verdict/status
+    updated -- the platform is authoritative on that, and nothing else would ever
+    fix a submission recorded before BRAIN had finished deciding.
     """
     import datetime as _dt
     rows = client.my_alphas(status="ACTIVE", limit=100) if rows is None else rows
-    added = already = power_pool = 0
+    added = already = power_pool = corrected = 0
     for a in rows:
         cls = [c.get("name") if isinstance(c, dict) else c
                for c in a.get("classifications") or []]
@@ -484,8 +515,9 @@ def sync_active_submissions(client, store, rows: list[dict] | None = None) -> di
             added += 1
         else:
             already += 1
+            corrected += store.mark_submission_active(a["id"])
     out = {"platform_active": len(rows), "power_pool": power_pool,
-           "added": added, "already_recorded": already,
+           "added": added, "already_recorded": already, "corrected": corrected,
            "submitted_today": count_submitted_today(rows)}
     store.put("submissions_synced", {"at": time.time(), **out})
     return out

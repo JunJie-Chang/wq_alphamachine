@@ -904,6 +904,14 @@ class Store:
                       (alpha_id, time.time(), verdict, final_status,
                        json.dumps(detail)))
 
+    def mark_submission_active(self, alpha_id: str) -> bool:
+        """The platform lists this alpha ACTIVE: correct a row that says otherwise.
+        Verdict and status only -- the dossier the pipeline recorded is kept."""
+        with self.conn() as c:
+            return c.execute(
+                "UPDATE submissions SET verdict='ACCEPTED', final_status='ACTIVE' "
+                "WHERE alpha_id=? AND final_status IS NOT 'ACTIVE'", (alpha_id,)).rowcount > 0
+
     def import_submission(self, alpha_id: str, submitted_at: float,
                           detail: dict) -> bool:
         """Record a submission made OUTSIDE this pipeline (the web UI, another

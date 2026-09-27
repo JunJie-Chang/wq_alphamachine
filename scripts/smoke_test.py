@@ -2744,6 +2744,45 @@ check("the submitted_at of a synced row is the platform's timestamp, not 'now'",
       abs(_st41.conn().execute("SELECT submitted_at FROM submissions WHERE alpha_id='UI_REG'").fetchone()[0]
           - _dt41.datetime.fromisoformat(_iso_old).timestamp()) < 1)
 check("sync is idempotent", _sync41(_Fake41(_rows41), _st41)["added"] == 0)
+
+# --- a submission recorded before BRAIN finished deciding (2026-09-27) --------
+# The status was read once, 5 s after POST /submit: three of four Power Pool
+# submissions were recorded REJECTED/UNSUBMITTED and were ACTIVE within ~45 s.
+from alphamachine import submit as _sm49
+_st49s = Store(os.path.join(tempfile.mkdtemp(), "late.db"))
+_st49s.record_submission("LATE1", "REJECTED", "UNSUBMITTED", {"dossier": "kept"})
+_r49 = _sync41(_Fake41([{"id": "LATE1", "dateSubmitted": _iso_old, "classifications": [], "tags": []}]), _st49s)
+_row49 = _st49s.conn().execute("SELECT verdict, final_status, detail FROM submissions WHERE alpha_id='LATE1'").fetchone()
+check("sync corrects a row the platform lists ACTIVE but the ledger does not",
+      _r49["corrected"] == 1 and _row49[0] == "ACCEPTED" and _row49[1] == "ACTIVE", str(_r49))
+check("...keeping the dossier the pipeline recorded", json.loads(_row49[2]) == {"dossier": "kept"})
+check("...and a second sync corrects nothing",
+      _sync41(_Fake41([{"id": "LATE1", "dateSubmitted": _iso_old, "classifications": [], "tags": []}]),
+              _st49s)["corrected"] == 0)
+
+class _Slow49:
+    def __init__(self, seq): self.seq, self.reads = list(seq), 0
+    def alpha(self, aid):
+        self.reads += 1
+        return {"status": self.seq.pop(0) if len(self.seq) > 1 else self.seq[0]}
+_saved49 = _sm49.time.sleep
+_sm49.time.sleep = lambda s: None
+try:
+    _c49 = _Slow49(["UNSUBMITTED", "UNSUBMITTED", "ACTIVE"])
+    check("await_submission keeps reading until BRAIN has decided",
+          _sm49.await_submission(_c49, "x")["status"] == "ACTIVE" and _c49.reads == 3)
+    _c49b = _Slow49(["UNSUBMITTED"])
+    check("...and gives up at the deadline instead of hanging",
+          _sm49.await_submission(_c49b, "x", wait=0.0)["status"] == "UNSUBMITTED" and _c49b.reads == 1)
+finally:
+    _sm49.time.sleep = _saved49
+check("a status still UNSUBMITTED after the wait is PENDING, not REJECTED",
+      _sm49.submission_verdict("ACTIVE") == "ACCEPTED" and _sm49.submission_verdict("UNSUBMITTED") == "PENDING"
+      and _sm49.submission_verdict("DECOMMISSIONED") == "REJECTED")
+import inspect as _in49
+check("the regular submit path waits the same way and does not teach the bandit a PENDING outcome",
+      "await_submission(" in _in49.getsource(_sm49.Submitter.submit)
+      and 'verdict != "PENDING"' in _in49.getsource(_sm49.Submitter.submit))
 check("the sync reports today's count FROM THE PLATFORM's dateSubmitted, not from local rows",
       _r41["submitted_today"] == 1, str(_r41))
 from alphamachine.submit import count_submitted_today as _cst41, submission_days as _sd41, Submitter as _Sub41

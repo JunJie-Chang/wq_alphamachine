@@ -448,7 +448,7 @@ asymmetry is deliberate, because nothing downstream reviews the decision.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env          # add WQ_EMAIL / WQ_PASSWORD
-python3 scripts/smoke_test.py # 567 offline checks, no network, no quota
+python3 scripts/smoke_test.py # 574 offline checks, no network, no quota
 
 python3 -m alphamachine --concurrency 13 catalog
 python3 -m alphamachine priors                                # one-off, ~$0.70
@@ -1041,6 +1041,14 @@ python3 scripts/tag_powerpool.py pp_deep.json --descriptions hand_written.json
 python3 scripts/submit_powerpool.py ID1 ID2 ID3 ID4
 python3 scripts/submit_powerpool.py ID1 ID2 ID3 ID4 --live
 ```
+
+After `POST /submit` both submit paths re-read the alpha every 5 s for up to 2 min
+(`submit.await_submission`) before recording anything. They used to read it once,
+5 s later: on 2026-09-27 that recorded three of four Power Pool submissions as
+REJECTED/UNSUBMITTED, and all three were ACTIVE within ~45 s. A status still
+UNSUBMITTED after the wait is recorded `PENDING`, not REJECTED, and the regular
+path does not teach the bandit from it. `sync_active_submissions` also corrects any
+ledger row the platform now lists ACTIVE (verdict and status only; the dossier stays).
 
 **Daily quota.** The 3-month rule in `docs/Power_Pool_Alpha_規則.md` §4: *after* a
 consultant's first submission is three months old, pure Power Pool alphas are

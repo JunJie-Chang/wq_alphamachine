@@ -28,7 +28,6 @@ import argparse
 import json
 import os
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -37,6 +36,7 @@ from alphamachine.client import AuthError, BiometricRequired, BrainClient
 from alphamachine.config import RunConfig
 from alphamachine.metrics import extract, failed_checks, platform_verdict
 from alphamachine.store import Store
+from alphamachine.submit import await_submission, submission_verdict
 
 
 def submit_as_power_pool(client: BrainClient, store: Store, alpha_id: str,
@@ -72,19 +72,18 @@ def submit_as_power_pool(client: BrainClient, store: Store, alpha_id: str,
         report["note"] = "dry run -- would have submitted"
         return report
 
-    resp = client.submit(alpha_id)
-    time.sleep(5.0)
-    final = client.alpha(alpha_id)
+    client.submit(alpha_id)
+    final = await_submission(client, alpha_id)
     status = final.get("status")
+    verdict = submission_verdict(status)
     report["submitted"] = status == "ACTIVE"
     report["final_status"] = status
+    report["verdict"] = verdict
     report["dateSubmitted"] = final.get("dateSubmitted")
     if status != "ACTIVE":
         report["reason"] = failed_checks(
             (final.get("is") or {}).get("checks") or []) or "unknown"
-    store.record_submission(
-        alpha_id, "ACCEPTED" if report["submitted"] else "REJECTED",
-        status or "UNKNOWN", report)
+    store.record_submission(alpha_id, verdict, status or "UNKNOWN", report)
     return report
 
 
