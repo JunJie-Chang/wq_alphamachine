@@ -53,7 +53,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from alphamachine.cli import _load_env
 from alphamachine.client import AuthError, BiometricRequired, BrainClient
-from alphamachine.metrics import check_limit, check_result, check_value, extract
+from alphamachine.metrics import (check_limit, check_result, check_value, extract,
+                                  stale_note)
 
 GROUP_FIELDS = {"country", "industry", "subindustry", "currency", "market",
                 "sector", "exchange"}
@@ -322,6 +323,8 @@ def deepen(client: BrainClient, r: dict) -> dict:
     gates = gate_status(checks)
     r["gates"] = gates
     r["power_pool_correlation"] = check_value(checks, "POWER_POOL_CORRELATION")
+    # BRAIN's value at this moment; it drifts as alphas join the book.
+    r["checked_at"] = time.time()
     r["pyramids"] = pyramid_names(checks)
     r["pending_gates"] = [k for k, v in gates.items() if v in (None, "PENDING")]
     r["verified"] = not r["pending_gates"]
@@ -468,7 +471,8 @@ def _process_and_report(client: BrainClient, results: list[dict],
         print(f"  [OK]  {r['alpha_id']}  sharpe={r['sharpe']:.2f}  "
               f"ops={r['n_operators']}({','.join(r['operators'])})  "
               f"fields={r['n_fields']}({','.join(r['fields'])})  "
-              f"pp_corr={r['power_pool_correlation']}  "
+              f"pp_corr={r['power_pool_correlation']} "
+              f"[{stale_note(r.get('checked_at'))}]  "
               f"pyramids={r.get('pyramids')}{desc_flag}")
     for r in provisional:
         print(f"  [??]  {r['alpha_id']}  sharpe={r['sharpe']:.2f}  "

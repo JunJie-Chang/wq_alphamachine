@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS inflight (
     dispatched    REAL
 );
 
+-- Unused since 2026-09-28: correlation is read from BRAIN, never recomputed
+-- from PnL. Kept so existing databases need no migration.
 CREATE TABLE IF NOT EXISTS pnl (
     alpha_id      TEXT PRIMARY KEY,
     dates         TEXT,                  -- json list of ISO dates
@@ -857,20 +859,6 @@ class Store:
             "SELECT c.*, s.* FROM sims s JOIN candidates c ON c.id=s.candidate_id "
             "WHERE " + sql, tuple(args)).fetchall()
 
-    # ---------------------------------------------------------------- pnl
-    def save_pnl(self, alpha_id: str, dates: list[str], values: list[float]) -> None:
-        with self.conn() as c:
-            c.execute("INSERT OR REPLACE INTO pnl VALUES (?,?,?,?)",
-                      (alpha_id, json.dumps([str(d) for d in dates]),
-                       json.dumps([float(v) for v in values]), time.time()))
-
-    def load_pnl(self, alpha_id: str) -> tuple[list[str], list[float]] | None:
-        row = self.conn().execute(
-            "SELECT dates,vals FROM pnl WHERE alpha_id=?", (alpha_id,)).fetchone()
-        if not row:
-            return None
-        return json.loads(row["dates"]), json.loads(row["vals"])
-
     # ------------------------------------------------- prod correlation shape
     def save_corr_profile(self, alpha_id: str, hist: Any, profile: dict) -> None:
         """Named columns, not positional: deep_checks' positional INSERT is
@@ -889,12 +877,6 @@ class Store:
         return self.conn().execute(
             "SELECT * FROM prod_corr_hist WHERE alpha_id=?",
             (alpha_id,)).fetchone()
-
-    def all_pnl(self) -> dict[str, tuple[list[str], list[float]]]:
-        out = {}
-        for r in self.conn().execute("SELECT alpha_id,dates,vals FROM pnl"):
-            out[r["alpha_id"]] = (json.loads(r["dates"]), json.loads(r["vals"]))
-        return out
 
     # -------------------------------------------------------- submissions
     def record_submission(self, alpha_id: str, verdict: str,
@@ -1058,7 +1040,7 @@ class Store:
                 "checks": json.loads(row["checks"] or "[]") if fresh else None,
                 "ok": bool(row["ok"]) if fresh else None,
                 "reasons": json.loads(row["reasons"] or "[]"),
-                "fresh": fresh}
+                "fresh": fresh, "fetched": row["fetched"]}
 
     # -------------------------------------------------------- gate_history
     def record_gate_check(self, candidate_id: str, alpha_id: str | None,

@@ -90,7 +90,8 @@ def select_candidates(data: list[dict], include_unverified: bool = False) -> lis
     POWER_POOL_CORRELATION. BRAIN computes that lazily and, after the pool changes
     or a burst of /check calls, can leave it PENDING for hours; tagging is
     reversible and does not consume a submission slot, so it is allowed -- but the
-    correlation must then have been measured another way (corr_powerpool.py).
+    correlation is then judged by BRAIN later: pick_powerpool.py live-checks it
+    before anything is submitted.
     Any other pending or failed gate still excludes the record.
     """
     out = []
@@ -134,7 +135,7 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--include-unverified", action="store_true",
                     help="also tag eligible records whose only unresolved gate is "
-                         "POWER_POOL_CORRELATION (measure it with corr_powerpool.py)")
+                         "POWER_POOL_CORRELATION (pick_powerpool.py checks it live)")
     ap.add_argument("--descriptions", default=None,
                     help="JSON {alpha_id: description}; used instead of the "
                          "template for those alphas")

@@ -10,7 +10,7 @@ the way BRAIN actually scores consultants rather than around raw backtest huntin
 | Path | What it is |
 |---|---|
 | `alphamachine/` | the pipeline: `catalog` → `generator` (+ `bandit`, `templates`, `priors`) → `executor` → `refine` → `metrics` → `correlate` → `submit`, on top of `client` (HTTP), `store` (SQLite) and `config` (every threshold). `audit` checks the live database; `cli` wires it together. |
-| `scripts/` | unattended operation (`autoloop.py`, `night_check.sh`, `status.sh`, `progress.sh`), persona auth (`auth_wait.py`), the offline test (`smoke_test.py`), and the **Power Pool** track (`check_powerpool.py`, `dedup_powerpool.py`, `corr_powerpool.py`, `tag_powerpool.py`, `submit_powerpool.py` — see Part 6; `sync_submissions.py` — see Part 4). |
+| `scripts/` | unattended operation (`autoloop.py`, `night_check.sh`, `status.sh`, `progress.sh`), persona auth (`auth_wait.py`), the offline test (`smoke_test.py`), and the **Power Pool** track (`check_powerpool.py`, `dedup_powerpool.py`, `pick_powerpool.py`, `tag_powerpool.py`, `submit_powerpool.py` — see Part 6; `sync_submissions.py` — see Part 4). |
 | `docs/` | rule references, in Traditional Chinese. `BRAIN_RULES.md` is the authority for every number; `新手指南.md` is a from-scratch walkthrough; `docs/README.md` explains the priority order. |
 | `data/` | runtime state — **entirely gitignored** (`machine.db`, session cookie, caches, logs). It is per-machine: a `git pull` on another computer brings the code, never this state. |
 
@@ -246,13 +246,14 @@ out of sample. A book of coin flips scores badly and cannot be un-submitted.
    │  The sim record CANNOT answer either. Unknown != pass.      │
    └────────────────────────────┬────────────────────────────────┘
                                 ▼
-   ┌─ select ── greedy max-MARGINAL-value, not top-N ────────────┐
-   │  value = quality × (1 − max_corr vs everything kept)        │
-   │  DAILY RETURNS, date-aligned. Never cumulative PnL.         │
+   ┌─ select ── rank by quality; correlation is BRAIN's ────────┐
+   │  shows the SELF_CORRELATION BRAIN last reported, with age   │
+   │  basket longer than a day's quota: the rest are backups     │
    └────────────────────────────┬────────────────────────────────┘
                                 ▼
-   ┌─ submit ───────────────────────────────────────────────────┐
-   │  local gates → /check (only source of PROD_CORRELATION)     │
+   ┌─ submit ── down the basket, in order, until the day is full ┐
+   │  local gates → live /check (SELF / PROD_CORRELATION)        │
+   │  refused → next one; undecided → stop                       │
    │  → submit → RE-READ, confirm status == ACTIVE               │
    │  → write outcome back → bandit learns → loop                │
    └─────────────────────────────────────────────────────────────┘
@@ -383,9 +384,12 @@ theme, not to tune.
 on TOP1000 is a liquidity artefact. Better to kill it than to have it pass in
 sample and lose money live.
 
-**Daily returns, always.** Every cumulative equity curve trends up, so two
-independent alphas show 0.9+ correlation on cumulative series. This one mistake
-is the most common cause of a locally-vetted basket failing `SELF_CORRELATION`.
+**Correlation is BRAIN's number, never ours.** A local reproduction from PnL
+(daily changes, last four years) matched BRAIN most of the time and was wrong
+exactly when it mattered, so there is none left. `select` shows the
+`SELF_CORRELATION` BRAIN last reported, with its age; `submit` decides on the live
+`/check` and takes the next candidate when one is refused (Part 6, "Platform
+numbers only").
 
 **BLOCK vs PREFER — the distinction this project got wrong for a long time.**
 `docs/BRAIN_RULES.md` carries two different kinds of number, and they were
@@ -549,8 +553,10 @@ ACTIVE alphas' `dateSubmitted` (`Submitter._active`, `count_submitted_today`,
 they cannot read it, rather than guess. At the moment of submitting, the live
 `/check`'s own `REGULAR_SUBMISSION` (value / limit) remains the final authority.
 The local table survives as a history ledger only (`scripts/sync_submissions.py`,
-insert-only, never overwrites or deletes): it still feeds the Genius-pyramid
-coverage report and `status.sh`'s offline fallback. `status.sh` reads the count from
+insert-only, never overwrites or deletes): it feeds `status.sh`'s offline
+fallback. It no longer feeds Genius-pyramid coverage: `report --pyramid --online`
+reads BRAIN's own tally (`client.pyramid_tally`), and offline it shows none rather
+than a local estimate (see "Platform numbers only", Part 6). `status.sh` reads the count from
 the platform when a session is alive and labels the line `[平台即時]`, else
 `[本機紀錄,可能落後]`. Similarly, `session_fresh()` now reads the session's end from
 the JWT `exp` in the cookie (the same value `_expires_at` already held) instead of
@@ -1013,16 +1019,13 @@ python3 scripts/dedup_powerpool.py pp.json --against pp_active.json \
 #    --allow-decayed keeps them. A report made before `recency` existed needs
 #    --recency-db data/machine.db to fill it in.
 
-# 2b. the gate that matters: recompute correlation from PnL against the WHOLE
-#     ACTIVE book, exactly as BRAIN does (last 4 years). Re-run right before submitting.
-#     Feed it a WIDE dedup (e.g. --max-per-field 3 --max-per-dataset 6
-#     --max-per-shape 15), not the tight one: the tight caps are a proxy for what
-#     this measures, and they threw away good candidates (see below).
-python3 scripts/corr_powerpool.py --from-file pp_dedup_wide.json --top 200 --json > corr.json
-
-# 2c. choose the next batch: greedy (each pick joins the book before the next is
-#     judged), pyramid-aware. Shows which picks still need a tag + description.
-python3 scripts/corr_powerpool.py --from-file pp_dedup_wide.json --top 400 --pick 4
+# 2b. picks + backups on BRAIN's numbers: one live /check per candidate (first
+#     --top), keep POWER_POOL_CORRELATION and SELF_CORRELATION PASS, rank by Sharpe.
+#     Prints BRAIN's pyramid tally, each value with its age, which picks still need
+#     a tag + description, and the submit line. Feed it a WIDE dedup (e.g.
+#     --max-per-field 3 --max-per-dataset 6 --max-per-shape 15): the tight caps
+#     threw away good candidates (see below).
+python3 scripts/pick_powerpool.py --from-file pp_dedup_wide.json --top 40 --pick 4 --backups 4
 
 # 3. deep-verify a small slice of the deduped list. The output order already
 #    spreads pyramids, so --top N is a spread, not just the N highest Sharpes.
@@ -1037,9 +1040,12 @@ python3 scripts/tag_powerpool.py pp_deep.json --descriptions hand_written.json
 #    --include-unverified also tags a record whose ONLY unresolved gate is
 #    POWER_POOL_CORRELATION (see the note on a stuck queue, below).
 
-# 5. submit by id — dry run unless --live; re-reads the alpha and confirms ACTIVE
-python3 scripts/submit_powerpool.py ID1 ID2 ID3 ID4
-python3 scripts/submit_powerpool.py ID1 ID2 ID3 ID4 --live
+# 5. submit picks then backups, IN ORDER — dry run unless --live. Goes down the list
+#    until the day's slots are full: a candidate BRAIN's live /check rejects (a twin
+#    of one just sent) or refuses at POST is skipped and the next takes its slot; a
+#    submission BRAIN has not decided stops the run. Confirms ACTIVE before counting.
+python3 scripts/submit_powerpool.py P1 P2 P3 P4 B1 B2 B3 B4
+python3 scripts/submit_powerpool.py P1 P2 P3 P4 B1 B2 B3 B4 --live
 ```
 
 After `POST /submit` both submit paths re-read the alpha every 5 s for up to 2 min
@@ -1094,10 +1100,10 @@ platform before relying on it.
   roughly forty `/check` calls on 2026-09-20, `POWER_POOL_CORRELATION` stayed
   `PENDING` on every candidate for over an hour — including one that had resolved
   earlier the same day — consistent with issue #4's report that volume aggravates
-  the queue. Tagging does not need the value, and `corr_powerpool.py` measures it
-  without touching `/check`, so the pattern is: measure locally, tag with
-  `--include-unverified`, let the queue drain, and let the submit attempt itself
-  do the authoritative recompute.
+  the queue. Tagging does not need the value, so the pattern is: tag with
+  `--include-unverified`, let the queue drain, then `pick_powerpool.py` (a few
+  `/check` calls, `--top` sane) and let the submit attempt itself do the
+  authoritative check.
 * **Rank by recent performance, not whole-period Sharpe.** Every number in a
   screening report is a full-history aggregate, so a signal that earned Sharpe 3
   early and nothing since sorts to the top. On the real 2026-09-20 pull **11,715
@@ -1141,16 +1147,13 @@ platform before relying on it.
   with one `ts_regression` reversal alpha already submitted and `--max-per-shape
   3`, two more of that shape are still allowed, and `returns` is exempt from the
   field cap — so `qMjaRoNP` was still on the list after its rejection. The gate
-  that does is `corr_powerpool.py` (next bullet); `--max-per-shape 1` is the
-  conservative setting.
-* **Screen wide, then measure; do not screen tight and hope.** The tight dedup
+  that does is BRAIN's live `/check` at submit time, with backups to take the
+  rejected one's slot (see "Platform numbers only" below); `--max-per-shape 1` is
+  the conservative setting.
+* **Screen wide, then check; do not screen tight and hope.** The tight dedup
   (1 per field, 2 per dataset, 3 per shape) left 41 candidates, and 28 of the 33
-  non-reversal ones measured over 0.5. Widening to 171 and measuring every one
-  found candidates the tight caps had discarded — Sharpe 2.25 / 2Y 3.22 and
-  Sharpe 2.41 / ladder 2.58 among them — and a greedy pick (take the best, add it
-  to the book, recompute the rest) gave **15 alphas that are mutually compatible**
-  at ≥ 0.10 under both limits. The order matters: fix what is already verified
-  and tagged into the book *first*, or a higher-Sharpe newcomer displaces it.
+  non-reversal ones were over 0.5. Widening to 171 found candidates the tight caps
+  had discarded — Sharpe 2.25 / 2Y 3.22 and Sharpe 2.41 / ladder 2.58 among them.
 * **The earlier batch of 52 was not deduped, and it shows.** Listed with
   `GET /users/self/alphas?status=UNSUBMITTED&tag=PowerPoolSelected` (the singular
   `tag` filters; `tags` is silently ignored and returns everything), 50 remain
@@ -1158,41 +1161,45 @@ platform before relying on it.
   `inst6_num_of_institutional_holders`, five on `search_interest_1y_corporate_name`),
   and about half are variants of the four already submitted, at **correlation
   1.000** with them. Only a handful clear 0.5.
-* **Pick by pyramid progress, not by Sharpe alone.** A pyramid (region × delay × dataset
-  category) counts toward Genius tier only once it holds 3 alphas, and Expert needs 10
-  such pyramids. The Power Pool alphas submitted by 2026-09-20 sat in two pyramids
-  (OTHER 4, MODEL 3, PV 2, ANALYST 1), and the four prepared for the next day put two more
-  into the already-full MODEL. `corr_powerpool.py --pick N` chooses a batch greedily —
-  best remaining, add it to the book, re-measure the rest against the grown book — with
-  Sharpe plus a tilt for **progress toward completing a pyramid**
-  (`config.PYRAMID_PICK_WEIGHT` × (k+1)/3 for taking one from k to k+1). The hard floors
-  (Sharpe ≥ 1.0, recent performance not decayed, the correlation margins) apply first and
-  are never traded against the tilt. The first version gave a flat credit per pyramid
-  touched, which ranked "0 → 1 in a new pyramid" level with "2 → 3"; only the latter changes
-  the number of formulated pyramids. On the real book, ANALYST sat at 2 with exactly one
-  feasible candidate, which lost to a 0 → 1 pick until the credit became proportional to
-  progress. With it, the same pool yields a batch that takes formulated pyramids from 4 to
-  5. The weight is a judgement ("completing a pyramid ≈ one Sharpe point"), not a
-  measurement; the tool prints every pick's Sharpe so a 1.03 that only completes a pyramid
-  is visible as what it is.
-* **BRAIN correlates over the last four years, and the book is the WHOLE book.**
-  `scripts/corr_powerpool.py` recomputes each candidate's correlation from PnL
-  against every ACTIVE alpha — Power Pool ones (limit 0.5) and regular ones
-  (`SELF_CORRELATION`, limit 0.7) — with `correlate.aligned_corr(years=4)`. The
-  window is the finding: Pearson on daily PnL *changes* over the last four calendar
-  years reproduces BRAIN's own numbers **to four decimals, eleven times** (`SELF`
-  0.3434, `POWER_POOL` 0.3365, 0.1637, 0.7162 and seven earlier `/check` values such
-  as 0.6258, 0.5404, 0.4797, 0.4938); the whole 10-year history read 0.03–0.05
-  **low** every time — the unsafe direction for a "too correlated?" gate. One
-  number does not reproduce (`SELF_CORRELATION 0.2271` for one alpha, mine 0.1791),
-  unexplained. Two mistakes this corrected, both mine: the first pass measured
-  candidates against only *that day's* submissions and missed the alphas submitted
-  the day before, so `qMWWmAnK` — a Power Pool alpha that turns out to be the
-  worst-correlated member of the book for almost every candidate — never entered
-  the comparison; and it used the full window. Of 33 recency-healthy, non-reversal
-  candidates, **28 were over 0.5**, several I had called safe (`zqYRPw6o` 0.56,
-  `P07YOQlM` 0.62, `zqYW73a1` 0.62). Run it again immediately before each
-  submission: the book changes with every alpha sent.
+* **Platform numbers only: pyramid progress and correlation are BRAIN's, never
+  recomputed here.** Both used to be computed locally, and both were wrong when it
+  mattered.
+  - *Pyramids.* Progress was the sum of every alpha's `MATCHES_PYRAMID` list,
+    and picks were tilted toward "completing" a pyramid by that count. On
+    2026-09-28 it claimed 9 formulated pyramids; BRAIN's own tally
+    (`GET /users/self/activities/pyramid-alphas`) said **4**, its counts summing
+    to 40 against 46 ACTIVE alphas. How BRAIN assigns an alpha among the
+    pyramids it matches is not published (neither the lowest multiplier nor the
+    first listed reproduced it). So the tilt is gone, `pick_powerpool.py` and
+    `report --pyramid --online` print BRAIN's tally, and a candidate's
+    `MATCHES_PYRAMID` list is shown only as "which of these BRAIN credits is its
+    call".
+  - *BRAIN's tally is not stable either.* Hours later, after four more
+    submissions, the same endpoint alternated between two answers seconds apart:
+    40 alphas / 4 formulated (the morning's numbers, unchanged) and 55 alphas / 8
+    formulated (50 ACTIVE by then, so some alphas count more than once there) --
+    five reads of six gave the second. Most likely a stale replica, but which
+    answer is authoritative is BRAIN's to say. `client.pyramid_tallies` reads it
+    several times, and both tools print every distinct answer
+    (`metrics.tally_disagreement`) instead of silently picking one. The
+    morning's "4" may itself have been the stale answer.
+  - *Correlation.* `corr_powerpool.py` recomputed correlation from PnL (daily
+    changes, last four years). It matched BRAIN's number to four decimals most of
+    the time, but not always (`SELF_CORRELATION 0.2271`, recomputed 0.1791). On
+    2026-09-28 a candidate it passed, `vRrZ83pd`, drew a
+    `POWER_POOL_CORRELATION` WARNING from BRAIN's live check: the 10%-Sharpe
+    exception did not apply, and the submit would have been refused.
+    `corr_powerpool.py`, `correlate.py` (the regular pipeline's
+    `CorrelationBook` / greedy `select`) and `verify_corr_window.py` are deleted.
+  - *What is shown instead.* BRAIN's value, with the time it was read
+    (`metrics.stale_note`), e.g. `BRAIN, 2d ago -- may have drifted as alphas
+    joined`. These values rise as the book grows, and are shown for what they are.
+  - *What decides.* BRAIN's live `/check` right before each submit.
+  - *The one gap.* BRAIN cannot say whether two *unsubmitted* candidates are
+    twins; that shows only once one is live. Hence picks + backups:
+    `submit_powerpool.py` (and `submit` in the regular pipeline) goes down the
+    list in order, each candidate's live check already sees the ones sent a
+    moment earlier, and a rejected one's slot goes to the next.
 * **Operator/field counts are parsed heuristically** from the expression against
   the live `/operators` list. Usually right, not a substitute for the counts on
   the alpha's own page.

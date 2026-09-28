@@ -29,16 +29,16 @@ from .config import (AutoGates, RunConfig, SimSettings, Gates,
                      pyramid_tilt, neutralization_tilt,
                      NEUTRALIZATION_SURVIVAL_PRIOR)
 from .priors import MODEL as MODEL_NAME
-from .correlate import CorrelationBook, fetch_book, greedy_select
 from .executor import Executor
 from .generator import generate
 from . import priors as P
-from .metrics import (Verdict, corr_profile, headroom, pnl_series,
-                      quality_verdict)
+from .metrics import (Verdict, check_value, completed_pyramids, corr_profile,
+                      headroom, quality_verdict, stale_note,
+                      tally_disagreement)
 from .refine import Refiner
 from . import templates as T
 from .store import Store
-from .submit import Submitter, sync_active_submissions
+from .submit import Submitter, submit_in_order, sync_active_submissions
 
 
 def _load_env(path: str = ".env") -> None:
@@ -392,17 +392,26 @@ def cmd_refine(args):
 
 
 def cmd_select(args):
+    """Rank the submittable gated alphas. Correlation is BRAIN's, never ours.
+
+    There used to be a local correlation book here (PnL of every ACTIVE alpha,
+    greedy max-marginal-value). It reproduced BRAIN's number most of the time,
+    and was wrong exactly when it mattered, so it is gone. What is shown is the
+    SELF_CORRELATION BRAIN reported in the last deep check, with its age -- it
+    drifts as alphas join the book. Whether two candidates in this basket are
+    twins cannot be known in advance: `submit` goes down the basket in order and
+    BRAIN's live /check before each one catches it, so the basket is longer than
+    a day's quota on purpose.
+    """
     cfg, store, client = _setup(args)
     g = cfg.gates
-    book = fetch_book(client, store)
     rows = store.sims_where(
         "s.status='OK' AND c.stage='gated' ORDER BY abs(s.sharpe) DESC LIMIT 200")
     sub = Submitter(cfg, store, client)
     bandit = Bandit(store, [], seed=getattr(args, "seed", 0))
     cands = []
-    qualified = 0            # cleared quality_verdict, regardless of PnL
+    qualified = 0            # cleared quality_verdict
     blocked_deep = []         # cleared the metrics but not the deep gate
-    no_pnl = []               # qualified but PnL fetch came back empty
     for r in rows:
         rec = {k: r[k] for k in r.keys()}
         rec["checks"] = json.loads(r["checks"] or "[]")
@@ -424,37 +433,24 @@ def cmd_select(args):
         if not dv.ok:
             blocked_deep.append(f"{aid} ({dv.reasons[0] if dv.reasons else '?'})")
             continue
-        cached = store.load_pnl(aid)
-        if cached is None:
-            d, v = pnl_series(client.alpha_pnl(aid))
-            if not d:
-                # A gate-passing alpha with no PnL is very likely a transient
-                # API hiccup (records not yet available right after a fresh
-                # login), not a real absence -- don't let it silently look
-                # identical to "nothing passed the gate".
-                no_pnl.append(aid)
-                continue
-            store.save_pnl(aid, d, v)
-        else:
-            d, v = cached
-        # Payout tilt on the selection value, which greedy_select uses as
-        # quality * (1 - corr). Multiplicative because quality is already a
+        deep = store.load_deep(aid, cfg.deep_check_ttl_hours) or {}
+        # Payout tilt, multiplicative because quality is already a
         # multiplicative term; at weight 0.15 a 1.4x alpha gains 6%, enough to
-        # break a tie between two submittable alphas and nowhere near enough to
-        # outrank diversity, which is still the binding constraint.
+        # break a tie between two submittable alphas.
         cands.append({"alpha_id": aid,
                       "quality": headroom(rec, g)
                       * (1.0 + pyramid_tilt(rec.get("pyramid_multiplier"))),
-                      "dates": d, "pnl": v, "expr": r["expr"],
+                      "self_corr": check_value(deep.get("checks") or [],
+                                               "SELF_CORRELATION"),
+                      "measured": deep.get("fetched"), "expr": r["expr"],
                       "sharpe": r["sharpe"], "fitness": r["fitness"],
                       "turnover": r["turnover"]})
     print(f"{qualified} metric-gate passing candidate(s); "
-          f"{len(cands)} submittable with usable PnL; selecting {args.n}")
+          f"{len(cands)} submittable; selecting {args.n}")
     if cands:
         # A distinct, greppable marker for scripts/autoloop.py: a candidate
         # that cleared BOTH the metric and deep gates is the rare event this
         # whole pipeline exists to surface, worth paging for even mid-loop.
-        # Two full days of running produced zero of these before today.
         best = max(cands, key=lambda c: c["sharpe"])
         print(f"CLEARED_DEEP_GATE: {len(cands)} candidate(s), "
               f"best sharpe={best['sharpe']:.2f} alpha={best['alpha_id']}")
@@ -463,17 +459,25 @@ def cmd_select(args):
               f"(yearly consistency / PROD_CORRELATION):")
         for b in blocked_deep[:5]:
             print(f"      {b}")
-    if no_pnl:
-        print(f"  NOTE: {len(no_pnl)} cleared the gate but returned no PnL "
-              f"data ({', '.join(no_pnl)}) -- likely transient, rerun select "
-              f"to retry rather than assuming they are unsubmittable")
-    picked = greedy_select(cands, book, max_corr=g.max_self_corr, n=args.n)
+    picked = rank_basket(cands, args.n)
     store.put("selected_basket", [p["alpha_id"] for p in picked])
     print(f"\n{'alpha':<14}{'sharpe':>8}{'fitness':>9}{'turn':>7}"
-          f"{'maxcorr':>9}  expression")
+          f"{'selfcorr':>10}  measured")
     for p in picked:
+        sc = "?" if p["self_corr"] is None else f"{p['self_corr']:.2f}"
         print(f"{p['alpha_id']:<14}{p['sharpe']:>8.2f}{p['fitness']:>9.2f}"
-              f"{p['turnover']:>7.3f}{p['max_corr']:>9.2f}  {p['expr'][:70]}")
+              f"{p['turnover']:>7.3f}{sc:>10}  {stale_note(p['measured'])}")
+        print(f"{'':<14}{p['expr'][:90]}")
+    if len(picked) > 1:
+        print("\nnot checked: correlation between these candidates -- BRAIN "
+              "cannot report it before one is submitted. `submit` tries them in "
+              "order and its live /check skips a twin of one just sent.")
+
+
+def rank_basket(cands: list[dict], n: int) -> list[dict]:
+    """Pure: best `quality` first, ties by Sharpe. No correlation: see cmd_select."""
+    return sorted(cands, key=lambda c: (-(c.get("quality") or 0.0),
+                                        -(c.get("sharpe") or 0.0)))[:n]
 
 
 def cmd_submit(args):
@@ -487,7 +491,6 @@ def cmd_submit(args):
               else "select found nothing submittable -- nothing to submit. "
                    "Run `gatelog --passing` to see what is blocking candidates.")
         return
-    book = fetch_book(client, store)
     # The daily cap is read from the platform (Submitter.submitted_today), not from
     # this table. Refreshing the local ledger is bookkeeping and best-effort.
     try:
@@ -502,7 +505,7 @@ def cmd_submit(args):
 
     if getattr(args, "auto", False):
         cfg.auto_submit = True
-        res = sub.auto_submit_batch(basket[:args.n], book=book, live=args.live)
+        res = sub.auto_submit_batch(basket, live=args.live, limit=args.n)
         ag = cfg.auto_gates
         print(f"\nauto tier: sharpe>={ag.sharpe} fitness>={ag.fitness} "
               f"turnover<={ag.turnover_max} self-corr<{ag.max_self_corr} "
@@ -522,22 +525,36 @@ def cmd_submit(args):
               f"need your eyes, {len(res['rejected'])} rejected")
         return
 
-    for aid in basket[:args.n]:
-        d = sub.submit(aid, dry_run=not args.live, book=book)
+    # The whole basket, in order, until --n are in: a candidate BRAIN's live
+    # /check rejects (a twin of one just sent, say) makes way for the next.
+    res = submit_in_order(basket, args.n,
+                          lambda aid: sub.submit(aid, dry_run=not args.live),
+                          budget_left=sub.remaining_today if args.live else None)
+    for d in res["sent"] + res["skipped"] + ([res["pending"]] if res["pending"] else []):
+        aid = d["alpha_id"]
         tag = ("SUBMITTED" if d.get("submitted") else
-               "WOULD SUBMIT" if d.get("ok") and not args.live else "BLOCKED")
+               "WOULD SUBMIT" if d.get("would_submit") else
+               "UNDECIDED" if d.get("verdict") == "PENDING" else
+               "SKIPPED" if d.get("skipped") else "BLOCKED")
         print(f"\n{aid}: {tag}")
+        if d.get("skipped"):
+            print(f"   {d['skipped']}")
         for k in ("platform", "quality", "consistency"):
             v = d.get(k)
             if v and not v["ok"]:
                 print(f"   {k}: {'; '.join(v['reasons'][:3])}")
-        if d.get("local_max_corr"):
-            lc = d["local_max_corr"]
-            print(f"   local max corr {lc['value']:.2f} vs {lc['against']}")
         if d.get("server_check", {}).get("fails"):
-            print(f"   server check FAIL: {d['server_check']['fails']}")
-        if d.get("final_status") and d["final_status"] != "ACTIVE":
-            print(f"   final status {d['final_status']} -- NOT live: {d.get('reason')}")
+            print(f"   server check FAIL (BRAIN, live): {d['server_check']['fails']}")
+        if d.get("final_status") != "ACTIVE" and d.get("reason"):
+            print(f"   final status {d.get('final_status')} -- NOT live: {d['reason']}")
+    if res["pending"]:
+        print("\nstopped: BRAIN has not decided the last submission yet -- check "
+              "it before sending more, so no slot is spent twice")
+    if res["unused"]:
+        print(f"\nnot tried (backups): {', '.join(res['unused'])}")
+    if not args.live and len(res["sent"]) > 1:
+        print("\ndry run: whether these are twins of each other only shows once "
+              "one is live; --live re-checks each against what was just sent")
 
 
 def cmd_priors(args):
@@ -731,8 +748,9 @@ def _corr_profile_table(store) -> None:
               f"{_avg(rs,'max_corr'):>9.4f}")
 
 
-def _pyramid_table(store) -> None:
-    """Payout and Genius-coverage view, entirely from disk.
+def _pyramid_table(store, client=None) -> None:
+    """Payout and Genius-coverage view. Multipliers come from disk; coverage
+    only from BRAIN (`client`, i.e. `report --pyramid --online`).
 
     Two questions this answers that nothing else did: how much of the available
     Dynamic Pyramid Multiplier the budget is actually earning, and how far the
@@ -779,30 +797,35 @@ def _pyramid_table(store) -> None:
           "expression matches,\n  so one PV token holds the whole alpha at "
           "the PV rate")
 
-    # Genius coverage: submitted alphas per pyramid, >= PYRAMID_MIN_ALPHAS
-    # counts as "formulated". Joined through sims, which is where the names are.
-    sub: Counter = Counter()
-    for r in c.execute("SELECT s.pyramid_names ns FROM submissions b "
-                       "JOIN sims s ON s.alpha_id=b.alpha_id "
-                       "WHERE b.final_status='ACTIVE'"):
-        try:
-            for nm in json.loads(r["ns"] or "[]"):
-                sub[nm] += 1
-        except ValueError:
-            pass
-    formed = sum(1 for v in sub.values() if v >= PYRAMID_MIN_ALPHAS)
+    # Genius coverage is BRAIN's own tally, never a local count: how BRAIN
+    # assigns an alpha among the pyramids MATCHES_PYRAMID lists is not
+    # published, and the local sum disagreed with BRAIN's tally.
     need = "  ".join(f"{k.replace('_', ' ').title()} {v}"
                      for k, v in GENIUS_PYRAMIDS.items())
-    print(f"\ngenius coverage: {formed} pyramid(s) formulated "
-          f"(>= {PYRAMID_MIN_ALPHAS} submitted alphas each)\n  needs: {need}")
+    sub: dict[str, int] | None = None
+    if client is None:
+        print("\ngenius coverage: not shown offline -- rerun with --online for "
+              "BRAIN's own tally (no local estimate: it would be wrong)")
+    else:
+        try:
+            tallies = client.pyramid_tallies(reads=5)
+            tally = tallies[0]
+            sub = {r["name"]: r["alphas"] for r in tally}
+            print(f"\ngenius coverage (BRAIN, read {time.strftime('%Y-%m-%d %H:%M')}): "
+                  f"{len(completed_pyramids(tally))} pyramid(s) formulated "
+                  f"(>= {PYRAMID_MIN_ALPHAS} alphas each)\n  needs: {need}")
+            if tally_disagreement(tallies):
+                print(f"  NOTE: {tally_disagreement(tallies)}")
+        except Exception as e:
+            print(f"\ngenius coverage: BRAIN's tally unavailable ({e})")
 
     print(f"\n{'pyramid':<26}{'x':>6}{'sims':>8}{'submitted':>11}")
     for nm in sorted(sims_per, key=lambda k: (-rate.get(k, 0.0), -sims_per[k])):
-        got = sub.get(nm, 0)
-        mark = "  <- formulated" if got >= PYRAMID_MIN_ALPHAS else ""
+        got = None if sub is None else sub.get(nm, 0)
+        mark = "  <- formulated" if (got or 0) >= PYRAMID_MIN_ALPHAS else ""
         mu = rate.get(nm)
         print(f"  {nm:<24}{(f'{mu:.2f}' if mu else '?'):>6}"
-              f"{sims_per[nm]:>8}{got:>11}{mark}")
+              f"{sims_per[nm]:>8}{('?' if got is None else got):>11}{mark}")
 
 
 def _neutralization_table(store) -> None:
@@ -842,7 +865,7 @@ def cmd_report(args):
         _prod_corr_table(store)
         return
     if getattr(args, "pyramid", False):
-        _pyramid_table(store)
+        _pyramid_table(store, client)
         return
     if getattr(args, "neutralization", False):
         _neutralization_table(store)

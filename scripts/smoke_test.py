@@ -7,7 +7,6 @@ from alphamachine import templates as T
 from alphamachine.bandit import Bandit, arm_name
 from alphamachine.catalog import Catalog, infer_theme, retheme
 from alphamachine.config import Gates, SimSettings, fitness, FITNESS_TURNOVER_KNEE
-from alphamachine.correlate import CorrelationBook, aligned_corr, daily_returns, greedy_select
 from alphamachine.generator import generate
 from alphamachine.metrics import extract, quality_verdict, headroom, yearly_consistency, pnl_series
 from alphamachine.refine import suggest_decay, Refiner
@@ -99,20 +98,50 @@ d = suggest_decay(0.50, 0)
 check("high turnover proposes decay", len(d) > 0 and max(d) > 4, f"{d}")
 check("at-knee turnover proposes nothing", suggest_decay(0.10, 0) == [])
 
-print("\n[5] correlation uses daily returns, not cumulative")
-rng = np.random.default_rng(0)
-dates = [f"2020-{m:02d}-{dd:02d}" for m in range(1,13) for dd in range(1,26)]
-a = np.cumsum(rng.normal(0.01, 1, len(dates)))
-b = np.cumsum(rng.normal(0.01, 1, len(dates)))
-cum = float(np.corrcoef(a, b)[0,1])
-dly = aligned_corr(daily_returns(dates, a), daily_returns(dates, b))
-check("independent series: daily corr ~0 while cumulative is inflated",
-      abs(dly) < 0.15 and abs(dly) < abs(cum), f"daily={dly:.3f} cumulative={cum:.3f}")
-check("self-correlation is 1.0",
-      abs(aligned_corr(daily_returns(dates,a), daily_returns(dates,a)) - 1.0) < 1e-9)
-half = dates[:150]
-check("misaligned dates align on overlap",
-      abs(aligned_corr(daily_returns(dates,a), daily_returns(half,a[:150])) - 1.0) < 1e-6)
+print("\n[5] pyramid progress and correlation come from BRAIN, never computed here")
+from alphamachine.client import pyramid_rows
+from alphamachine.metrics import completed_pyramids, stale_note, tally_disagreement
+# BRAIN's tally on 2026-09-28 (before that day's submissions), trimmed to shape
+_body5 = {"pyramids": [
+    {"category": {"id": c, "name": c}, "region": r, "delay": d, "alphaCount": n}
+    for r, d, c, n in [("USA", 1, "model", 11), ("USA", 1, "other", 8), ("USA", 1, "pv", 6),
+                       ("USA", 1, "institutions", 3), ("USA", 1, "analyst", 2),
+                       ("USA", 1, "fundamental", 1), ("GLB", 1, "pv", 1),
+                       ("EUR", 1, "pv", 2), ("ASI", 1, "imbalance", 1), ("USA", 0, "pv", 0)]]}
+_rows5 = pyramid_rows(_body5)
+check("pyramid tally names match MATCHES_PYRAMID's format and drop empty pyramids",
+      _rows5[0] == {"name": "USA/D1/MODEL", "alphas": 11}
+      and "USA/D0/PV" not in [r["name"] for r in _rows5] and len(_rows5) == 9, str(_rows5[:2]))
+check("completed pyramids are BRAIN's counts >= 3: 4 on 2026-09-28, not the 9 a local sum claimed",
+      completed_pyramids(_rows5) == ["USA/D1/MODEL", "USA/D1/OTHER", "USA/D1/PV",
+                                     "USA/D1/INSTITUTIONS"])
+check("an empty or malformed tally is zero pyramids, not an error",
+      pyramid_rows({}) == [] and completed_pyramids([]) == [])
+check("stale_note: fresh values carry no drift warning, old ones do, unknown time says so",
+      stale_note(1000, 1300) == "BRAIN, 5m ago"
+      and "may have drifted" in stale_note(1000, 1000 + 3 * 86400)
+      and "3d ago" in stale_note(1000, 1000 + 3 * 86400)
+      and "time unknown" in stale_note(None))
+_old5 = _rows5[:3]
+check("tally_disagreement: silent when reads agree, names both answers when BRAIN flips",
+      tally_disagreement([_rows5]) is None
+      and "35 alphas / 4 formulated vs 25 alphas / 3 formulated"
+      in (tally_disagreement([_rows5, _old5]) or ""), str(tally_disagreement([_rows5, _old5])))
+class _FC5:
+    def __init__(self, bodies): self.bodies = list(bodies)
+    def get(self, path):
+        b = self.bodies.pop(0)
+        return type("R", (), {"status_code": 200, "text": "", "json": lambda self, b=b: b})()
+from alphamachine.client import BrainClient as _BC5
+_fc5 = _FC5([_body5, {"pyramids": []}, _body5])
+_tl5 = _BC5.pyramid_tallies(_fc5, reads=3, pause=0)
+check("pyramid_tallies: distinct answers, most frequent first",
+      len(_tl5) == 2 and _tl5[0] == _rows5 and _tl5[1] == [])
+import importlib.util as _iu5
+check("no local correlation code is left to drift from BRAIN's number",
+      _iu5.find_spec("alphamachine.correlate") is None)
+from alphamachine import config as _cfg5
+check("the local pyramid-progress weight is gone", not hasattr(_cfg5, "PYRAMID_PICK_WEIGHT"))
 
 print("\n[6] quality gate rejects marginal alphas")
 g = Gates()
@@ -215,19 +244,67 @@ check("portability rung tightens the universe",
       any(v.settings.universe != "TOP3000" for v in port),
       f"{[v.settings.universe for v in port]}")
 
-print("\n[11] greedy diversity beats top-N-by-quality")
-book = CorrelationBook()
-base = rng.normal(0, 1, len(dates))
-twin = base + rng.normal(0, 0.12, len(dates))      # ~0.99 corr with base
-orth = rng.normal(0, 1, len(dates))
-cands = [
-    {"alpha_id":"best",  "quality":2.0, "dates":dates, "pnl":np.cumsum(base)},
-    {"alpha_id":"twin",  "quality":1.9, "dates":dates, "pnl":np.cumsum(twin)},
-    {"alpha_id":"orthog","quality":1.4, "dates":dates, "pnl":np.cumsum(orth)},
-]
-picked = [p["alpha_id"] for p in greedy_select(cands, book, max_corr=0.55, n=2)]
-check("picks the orthogonal alpha over the higher-quality twin",
-      picked == ["best","orthog"], f"picked={picked}")
+print("\n[11] a basket is ranked, then filled in order: BRAIN's live check picks the twin out")
+from alphamachine.cli import rank_basket
+from alphamachine.submit import submit_in_order, refused_submission
+from alphamachine.client import BrainError as _BE11
+_rb = rank_basket([{"alpha_id": "a", "quality": 1.2, "sharpe": 2.0},
+                   {"alpha_id": "b", "quality": 1.5, "sharpe": 1.8},
+                   {"alpha_id": "c", "quality": 1.5, "sharpe": 1.9}], 2)
+check("rank_basket: best quality first, Sharpe breaks the tie, capped at n",
+      [x["alpha_id"] for x in _rb] == ["c", "b"])
+_fate = {"w": {"ok": False, "submitted": False, "verdict": None},        # live check WARNING
+         "r": {"ok": False, "submitted": False, "verdict": "REJECTED"},  # refused at submit
+         "a1": {"submitted": True, "verdict": "ACCEPTED"},
+         "a2": {"submitted": True, "verdict": "ACCEPTED"},
+         "p": {"submitted": False, "verdict": "PENDING"}}
+_tried = []
+def _try11(aid):
+    _tried.append(aid)
+    return {"alpha_id": aid, **_fate[aid]}
+_o = submit_in_order(["w", "r", "a1", "a2", "p"], 2, _try11)
+check("a candidate BRAIN rejects makes way for the next; stops once `want` are in",
+      [d["alpha_id"] for d in _o["sent"]] == ["a1", "a2"]
+      and [d["alpha_id"] for d in _o["skipped"]] == ["w", "r"]
+      and _o["unused"] == ["p"] and _tried == ["w", "r", "a1", "a2"], str(_o))
+_tried.clear()
+_o = submit_in_order(["a1", "p", "a2"], 3, _try11)
+check("an undecided (PENDING) submission stops the run: no slot spent twice",
+      (_o["pending"] or {}).get("alpha_id") == "p" and _o["unused"] == ["a2"] and _tried == ["a1", "p"])
+_tried.clear()
+_left = iter([2, 1, 0])
+_o = submit_in_order(["a1", "a2", "w"], 5, _try11, budget_left=lambda: next(_left))
+check("the platform's remaining slots are re-read before each try and end the run at 0",
+      [d["alpha_id"] for d in _o["sent"]] == ["a1", "a2"] and _o["unused"] == ["w"])
+_o = submit_in_order(["x"], 1, lambda aid: {"alpha_id": aid, "would_submit": True})
+check("a dry run counts would-submit toward `want`", len(_o["sent"]) == 1)
+_rf = refused_submission({"alpha_id": "z"}, _BE11("submit [403]: correlation"))
+_un = refused_submission({"alpha_id": "z"}, _BE11("submit [502]: bad gateway"))
+check("a 4xx on POST /submit is a refusal (next may go); anything else is undecided (stop)",
+      _rf["verdict"] == "REJECTED" and not _rf["submitted"]
+      and _un["verdict"] == "PENDING" and _un["final_status"] == "UNKNOWN")
+
+from alphamachine.config import RunConfig as _RC11
+from alphamachine.submit import Submitter as _S11
+class _FC11:
+    def __init__(self, check): self._check = check
+    def alpha(self, aid): return {"id": aid, "is": {"sharpe": 2.0, "checks": []}}
+    def alpha_yearly(self, aid): return {}
+    def alpha_check(self, aid):
+        if isinstance(self._check, Exception): raise self._check
+        return {"is": {"checks": self._check}}
+def _ae11(check):
+    return _S11(_RC11(), None, _FC11(check)).auto_eligible("Q")[1]["reasons"]
+_lim11 = _RC11().auto_gates.max_self_corr
+check("auto tier reads BRAIN's live SELF_CORRELATION: over the limit refuses",
+      any("SELF_CORRELATION" in r and "BRAIN" in r for r in
+          _ae11([{"name": "SELF_CORRELATION", "result": "PASS", "value": _lim11 + 0.05}])))
+check("...under the limit raises no correlation reason",
+      not any("CORRELATION" in r for r in
+              _ae11([{"name": "SELF_CORRELATION", "result": "PASS", "value": _lim11 - 0.2}])))
+check("...and no value from BRAIN (missing, or the call failed) refuses rather than guess",
+      any("blind" in r for r in _ae11([]))
+      and any("blind" in r for r in _ae11(RuntimeError("boom"))))
 
 print("\n[12] session lifetime: read expiry, refresh EARLY, halt on persona")
 import time as _t, base64 as _b64, threading as _th, requests as _rq
@@ -2652,26 +2729,6 @@ check("recency_from_db fills old reports from the local db (2Y, ladder), skips t
       _n40 == 2 and _old40[0]["recency"]["ok"] is False and _old40[1]["recency"]["ok"] is True
       and "recency" not in _old40[2] and "recency" not in _old40[3], str(_old40))
 
-# --- BRAIN correlates over the LAST 4 YEARS, not the whole history -----------
-from alphamachine.correlate import BRAIN_CORR_YEARS, aligned_corr as _ac40
-import numpy as _np40
-_rng40 = _np40.random.default_rng(7)
-_dates40 = [f"{y}-{m:02d}-{d:02d}" for y in range(2014, 2024) for m in range(1, 13) for d in range(1, 22)]
-_x40 = _rng40.normal(size=len(_dates40))
-_n_old = sum(1 for d in _dates40 if d < "2020-01-01")
-# identical in the last four years, opposite before -> the window decides the answer
-_y40 = _np40.where(_np40.array(_dates40) < "2020-01-01", -_x40, _x40)
-_A40, _B40 = (_dates40, _x40), (_dates40, _y40)
-check("BRAIN_CORR_YEARS is 4", BRAIN_CORR_YEARS == 4)
-check("a 4-year window sees only 2020-2023 (perfectly correlated there)",
-      abs(_ac40(_A40, _B40, years=4) - 1.0) < 1e-9)
-check("the whole-history default still sees the opposite years too (unchanged behaviour)",
-      _ac40(_A40, _B40) < 0.5, f"{_ac40(_A40, _B40):.3f}")
-check("the window starts on Jan 1 of (last year - N + 1), not a rolling 1461 days",
-      abs(_ac40(_A40, _B40, years=4) - 1.0) < 1e-9 and _ac40(_A40, _B40, years=5) < 1.0)
-check("a window with too little overlap returns 0.0, not garbage",
-      _ac40((_dates40[:30], _x40[:30]), (_dates40[:30], _x40[:30]), years=4) == 0.0)
-
 _v40 = {"alpha_id": "v", "eligible": True, "verified": True, "pending_gates": []}
 _u40 = {"alpha_id": "u", "eligible": True, "verified": False, "pending_gates": ["POWER_POOL_CORRELATION"]}
 _t40 = {"alpha_id": "t", "eligible": True, "verified": False, "pending_gates": ["POWER_POOL_CORRELATION", "LOW_TURNOVER"]}
@@ -2833,70 +2890,38 @@ check("status: a candidate that can never pass is flagged (turnover 1.299 was li
       "turnover>0.7" in ST41.blockers(3.05, 1.16, 1.299, _G41())
       and ST41.blockers(2.0, 1.2, 0.3, _G41()) == [])
 
-# --- pick_batch: greedy, pyramid-aware, floors are never traded off ----------
-import corr_powerpool as CP42
-from collections import Counter as _Ctr42
-_rng42 = np.random.default_rng(11)
-_dates42 = [f"{y}-{m:02d}-{d:02d}" for y in range(2014, 2024) for m in range(1, 13) for d in range(1, 23)]
-def _s42(base=None, noise=1.0):
-    x = _rng42.normal(size=len(_dates42))
-    return (_dates42, x if base is None else base[1] + noise * x)
-_bk42 = _s42(); _bk2_42 = _s42()
-def _c42(aid, sharpe, pyr, rec=True, **kw):
-    return {"alpha_id": aid, "sharpe": sharpe, "pyramids": pyr,
-            "recency": {"ok": rec}, **kw}
-_full = ["USA/D1/MODEL"]; _new = ["USA/D1/ANALYST"]
-_ser42 = {"X": _s42(), "Y": _s42(), "Z": _s42()}
-_pool42 = {"BK": _bk42}; _reg42 = {"RG": _bk2_42}
-_cnt42 = _Ctr42({"USA/D1/MODEL": 3, "USA/D1/ANALYST": 2})   # ANALYST is one alpha from completing
-
-def _ids42(picks): return [p["alpha_id"] for p in picks]
-check("an alpha that COMPLETES a pyramid outranks a slightly better alpha in a full one",
-      _ids42(CP42.pick_batch([_c42("X", 2.0, _full), _c42("Y", 1.7, _new)], _ser42, _pool42, _reg42, _cnt42, 1)) == ["Y"])
-check("...but not a much better one: the tilt breaks near-ties, it does not buy a weak alpha",
-      _ids42(CP42.pick_batch([_c42("X", 3.0, _full), _c42("Y", 1.7, _new)], _ser42, _pool42, _reg42, _cnt42, 1)) == ["X"])
-check("weight 0 ignores pyramids entirely",
-      _ids42(CP42.pick_batch([_c42("X", 2.0, _full), _c42("Y", 1.7, _new)], _ser42, _pool42, _reg42, _cnt42, 1, weight=0.0)) == ["X"])
-
-# Y and Z share a pyramid at 2 of 3; W is in a full one. Picking Y completes it, so Z
-# loses its bonus and W (better Sharpe) comes next.
-_ser42.update({"W": _s42()})
-_two = _Ctr42({"USA/D1/ANALYST": 2, "USA/D1/MODEL": 3})
-_r = CP42.pick_batch([_c42("Y", 1.5, _new), _c42("Z", 1.45, _new), _c42("W", 1.8, _full)],
-                     _ser42, _pool42, _reg42, _two, 3)
-check("counts update after each pick: once a pyramid is complete its bonus is gone",
-      _ids42(_r) == ["Y", "W", "Z"], str(_ids42(_r)))
-# completion is worth more than early progress: 2->3 (full weight) vs 0->1 (a third)
-_ser42.update({"C1": _s42(), "C2": _s42()})
-_prog = _Ctr42({"USA/D1/ANALYST": 2, "USA/D1/SOCIALMEDIA": 0, "USA/D1/MODEL": 3})
-_rp = CP42.pick_batch([_c42("C2", 1.5, ["USA/D1/SOCIALMEDIA"]), _c42("C1", 1.4, ["USA/D1/ANALYST"])],
-                      _ser42, _pool42, _reg42, _prog, 2)
-check("crossing the threshold (2->3) beats a slightly higher-Sharpe alpha that only starts a pyramid (0->1)",
-      _ids42(_rp) == ["C1", "C2"], str(_ids42(_rp)))
-check("a pick records which pyramid it advanced and from what count",
-      _r[0]["advances"] == ["USA/D1/ANALYST"] and _r[0]["counts_before"] == {"USA/D1/ANALYST": 2}
-      and _r[1]["advances"] == [])
-
-# floors
-check("Sharpe under 1.0 is excluded however good its pyramid",
-      CP42.pick_batch([_c42("Y", 0.9, _new)], _ser42, _pool42, _reg42, _cnt42, 1) == [])
-check("a decayed alpha (recency.ok False) is excluded; unknown recency is not",
-      CP42.pick_batch([_c42("Y", 2.0, _new, rec=False)], _ser42, _pool42, _reg42, _cnt42, 1) == []
-      and _ids42(CP42.pick_batch([{"alpha_id": "Y", "sharpe": 2.0, "pyramids": _new}], _ser42, _pool42, _reg42, _cnt42, 1)) == ["Y"])
-_ser42["TWIN"] = _s42(_bk42, noise=0.2)
-check("an alpha nearly identical to one already in the book is excluded",
-      CP42.pick_batch([_c42("TWIN", 2.5, _new)], _ser42, _pool42, _reg42, _cnt42, 1) == [])
-# the pool GROWS: B is fine against the original book but is a twin of A, which is picked first
-_ser42["A"] = _s42(); _ser42["B"] = _s42(_ser42["A"], noise=0.25)
-_r2 = CP42.pick_batch([_c42("A", 2.0, _new), _c42("B", 1.9, _new)], _ser42, _pool42, _reg42, _cnt42, 2)
-check("a twin of an alpha picked earlier in the same batch drops out (the book grows)",
-      _ids42(_r2) == ["A"], str(_ids42(_r2)))
-check("an empty pool is 'nothing to correlate with', not a reason to reject",
-      _ids42(CP42.pick_batch([_c42("Y", 1.5, _new)], _ser42, {}, {}, _cnt42, 1)) == ["Y"])
-check("asking for more than exist returns what cleared the floors, without error",
-      len(CP42.pick_batch([_c42("Y", 1.5, _new)], _ser42, _pool42, _reg42, _cnt42, 5)) == 1)
-check("pyramid_coverage counts pyramids at or above the formulated threshold",
-      CP42.pyramid_coverage(_Ctr42({"a": 3, "b": 2, "c": 5})) == 2)
+# --- pick_powerpool: BRAIN's live /check decides; picks, then backups -----------
+import pick_powerpool as PK42
+def _ck42(pp="PASS", sc="PASS", extra=()):
+    return ([{"name": "POWER_POOL_CORRELATION", "result": pp, "value": 0.41},
+             {"name": "SELF_CORRELATION", "result": sc, "value": 0.33},
+             {"name": "LOW_2Y_SHARPE", "result": "PASS", "value": 2.0, "limit": 1.58},
+             {"name": "MATCHES_PYRAMID", "result": "PASS",
+              "pyramids": [{"name": "USA/D1/PV"}, {"name": "USA/D1/ANALYST"}]}]
+            + [{"name": n, "result": r} for n, r in extra])
+_j = PK42.judge({"alpha_id": "A", "sharpe": 1.8}, _ck42(), 123.0)
+check("pick: a clean live check is ok and carries BRAIN's values with their time",
+      _j["ok"] and _j["pp_corr"] == 0.41 and _j["self_corr"] == 0.33
+      and _j["checked_at"] == 123.0 and _j["pyramids"] == ["USA/D1/PV", "USA/D1/ANALYST"])
+check("pick: a POWER_POOL_CORRELATION WARNING (exception not granted -> 403) is excluded",
+      not PK42.judge({"alpha_id": "A", "sharpe": 1.8}, _ck42(pp="WARNING"), 0)["ok"])
+check("pick: SELF_CORRELATION not PASS is excluded, including still PENDING",
+      not PK42.judge({"alpha_id": "A", "sharpe": 1.8}, _ck42(sc="FAIL"), 0)["ok"]
+      and not PK42.judge({"alpha_id": "A", "sharpe": 1.8}, _ck42(sc="PENDING"), 0)["ok"])
+check("pick: a blocking FAIL is excluded; a Power-Pool-exempt one is not",
+      not PK42.judge({"alpha_id": "A", "sharpe": 1.8}, _ck42(extra=[("LOW_TURNOVER", "FAIL")]), 0)["ok"]
+      and PK42.judge({"alpha_id": "A", "sharpe": 1.8}, _ck42(extra=[("LOW_FITNESS", "FAIL")]), 0)["ok"])
+_jp = PK42.judge({"alpha_id": "A", "sharpe": 1.8}, _ck42(pp="PENDING", sc="PENDING"), 0)
+check("pick: correlation BRAIN has not computed yet is 'pending' -- excluded, but not called rejected",
+      not _jp["ok"] and _jp["pending"]
+      and not PK42.judge({"alpha_id": "A", "sharpe": 1.8}, _ck42(pp="PENDING", sc="FAIL"), 0)["pending"])
+check("pick: Sharpe under 1.0 is excluded",
+      not PK42.judge({"alpha_id": "A", "sharpe": 0.9}, _ck42(), 0)["ok"])
+_js = [{"alpha_id": a, "sharpe": sh, "ok": ok} for a, sh, ok in
+       [("a", 1.5, True), ("b", 2.5, True), ("c", 3.0, False), ("d", 1.9, True), ("e", 1.2, True)]]
+_pk, _bk = PK42.order(_js, 2, 2)
+check("pick: best Sharpe first among the ok, then the backups in the same order",
+      [x["alpha_id"] for x in _pk] == ["b", "d"] and [x["alpha_id"] for x in _bk] == ["a", "e"])
 
 # --- a full-slots 429 is CAPACITY: wait for a slot, never record an ERROR -------
 import requests as _rq43, time as _t43

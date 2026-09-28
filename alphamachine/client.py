@@ -790,6 +790,34 @@ class BrainClient:
             params["status"] = status
         return self._paged("/users/self/alphas", params)
 
+    def pyramid_tallies(self, reads: int = 3, pause: float = 1.0) -> list[list[dict]]:
+        """BRAIN's own count of your submitted alphas per pyramid, read `reads`
+        times: the distinct answers, the most frequent first.
+
+        The only source for Genius pyramid progress -- never a local sum of
+        MATCHES_PYRAMID. Read more than once because on 2026-09-28 the endpoint
+        alternated between two answers seconds apart (40 alphas / 4 formulated
+        and 55 / 8), apparently a stale replica; one read would have reported
+        either. More than one element back means BRAIN disagrees with itself,
+        and the caller must say so rather than pick silently.
+        Names use the MATCHES_PYRAMID format, e.g. "USA/D1/PV".
+        """
+        seen: dict[str, list] = {}
+        for i in range(max(1, reads)):
+            r = self.get("/users/self/activities/pyramid-alphas")
+            if r.status_code != 200:
+                raise BrainError(f"pyramid-alphas [{r.status_code}]: {r.text[:200]}")
+            rows = pyramid_rows(_json(r) or {})
+            key = json.dumps(rows, sort_keys=True)
+            seen.setdefault(key, [0, rows])[0] += 1
+            if i + 1 < reads:
+                time.sleep(pause)
+        return [rows for _n, rows in sorted(seen.values(), key=lambda v: -v[0])]
+
+    def pyramid_tally(self) -> list[dict]:
+        """The most frequent of pyramid_tallies()."""
+        return self.pyramid_tallies()[0]
+
     def submit(self, alpha_id: str) -> dict:
         r = self.post(f"/alphas/{alpha_id}/submit")
         if r.status_code not in (200, 201, 202):
@@ -799,6 +827,17 @@ class BrainClient:
             return self._await_record(f"/alphas/{alpha_id}/submit")
         except BrainError:
             return _json(r) or {}
+
+
+def pyramid_rows(body: dict) -> list[dict]:
+    """`/users/self/activities/pyramid-alphas` -> [{"name", "alphas"}], nonzero only."""
+    out = []
+    for p in (body or {}).get("pyramids") or []:
+        cat = ((p.get("category") or {}).get("id") or "").upper()
+        n = p.get("alphaCount") or 0
+        if cat and p.get("region") and n:
+            out.append({"name": f"{p['region']}/D{p.get('delay')}/{cat}", "alphas": int(n)})
+    return sorted(out, key=lambda r: (-r["alphas"], r["name"]))
 
 
 def _json(r: requests.Response) -> Any:

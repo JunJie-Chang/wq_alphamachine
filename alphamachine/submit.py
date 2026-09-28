@@ -4,8 +4,8 @@ Submission slots are limited and irreversible in practice: a submitted alpha
 occupies book space and drags your score if it underperforms. So the gate is
 belt-and-braces:
 
-  local quality gate -> yearly consistency -> local correlation vs your book
-  -> BRAIN's own /check (the only source of PROD_CORRELATION) -> submit
+  local quality gate -> yearly consistency -> BRAIN's own live /check
+  (SELF_CORRELATION, PROD_CORRELATION -- never recomputed locally) -> submit
   -> RE-READ THE ALPHA and confirm status == ACTIVE.
 
 That last step is not paranoia. POST /submit returning 201 means "accepted for
@@ -16,15 +16,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
 from .bandit import Bandit, arm_name
 from .config import Gates, RunConfig
-from .correlate import CorrelationBook, daily_returns
-from .metrics import (Verdict, extract, failed_checks, headroom,
-                      platform_verdict, pnl_series, quality_verdict,
-                      yearly_consistency)
+from .client import BrainError
+from .metrics import (Verdict, check_value, extract, failed_checks, headroom,
+                      platform_verdict, quality_verdict, yearly_consistency)
 
 log = logging.getLogger("alphamachine.submit")
 
@@ -42,7 +42,7 @@ class Submitter:
         self.g: Gates = cfg.gates
 
     # ------------------------------------------------------------- vetting
-    def vet(self, alpha_id: str, book: CorrelationBook | None = None) -> dict:
+    def vet(self, alpha_id: str) -> dict:
         """Full pre-submission dossier for one alpha. No side effects."""
         alpha = self.c.alpha(alpha_id)
         rec = extract(alpha)
@@ -69,23 +69,9 @@ class Submitter:
                                  if yc is None else
                                  {"ok": yc.ok, "reasons": yc.reasons})
 
-        # Local correlation against our own book (cheap, catches most twins).
-        if book is not None:
-            cached = self.store.load_pnl(alpha_id)
-            if cached is None:
-                d, v = pnl_series(self.c.alpha_pnl(alpha_id))
-                if d:
-                    self.store.save_pnl(alpha_id, d, v)
-            else:
-                d, v = cached
-            if d:
-                corr, who = book.max_corr(d, v)
-                report["local_max_corr"] = {"value": corr, "against": who,
-                                            "ok": corr < self.g.max_self_corr}
-
         report["ok"] = all(
             report[k]["ok"] for k in ("platform", "quality", "consistency")
-        ) and report.get("local_max_corr", {"ok": True})["ok"]
+        )
         return report
 
     # -------------------------------------------------------- deep verdict
@@ -176,8 +162,7 @@ class Submitter:
         return {"checks": checks, "fails": fails, "ok": not fails}
 
     # ------------------------------------------------------------- submit
-    def submit(self, alpha_id: str, *, dry_run: bool = True,
-               book: CorrelationBook | None = None) -> dict:
+    def submit(self, alpha_id: str, *, dry_run: bool = True) -> dict:
         try:
             if self._daily_budget_spent():
                 return {"alpha_id": alpha_id, "skipped": "daily submit budget spent"}
@@ -186,7 +171,7 @@ class Submitter:
                     "skipped": f"could not read today's submissions from the platform "
                                f"({e}); not submitting on a guess"}
 
-        dossier = self.vet(alpha_id, book=book)
+        dossier = self.vet(alpha_id)
         if not dossier["ok"]:
             dossier["submitted"] = False
             return dossier
@@ -200,15 +185,20 @@ class Submitter:
 
         if dry_run:
             dossier["submitted"] = False
+            dossier["would_submit"] = True
             dossier["note"] = "dry run -- would have submitted"
             return dossier
 
-        resp = self.c.submit(alpha_id)
+        try:
+            resp = self.c.submit(alpha_id)
+        except BrainError as e:
+            return refused_submission(dossier, e)
         final = await_submission(self.c, alpha_id)
         status = final.get("status")
         verdict = submission_verdict(status)
         dossier["submitted"] = status == "ACTIVE"
         dossier["final_status"] = status
+        dossier["verdict"] = verdict
         dossier["response"] = resp
         if status != "ACTIVE":
             # 201 != live. Surface the reason rather than reporting success.
@@ -305,8 +295,7 @@ class Submitter:
         return max(0, self.cfg.max_auto_submits_per_day - self.submitted_today())
 
     # ------------------------------------------------------- auto submission
-    def auto_eligible(self, alpha_id: str, book: CorrelationBook | None = None
-                      ) -> tuple[bool, dict]:
+    def auto_eligible(self, alpha_id: str) -> tuple[bool, dict]:
         """Is this alpha unambiguous enough to send with nobody watching?
 
         Every manual gate must pass at the STRICTER auto thresholds, every
@@ -345,33 +334,30 @@ class Submitter:
             reasons.append(f"yearly stats unavailable ({e}) -- refusing to "
                            f"auto-submit without them")
 
-        if book is not None:
-            cached = self.store.load_pnl(alpha_id)
-            if cached is None:
-                d, v = pnl_series(self.c.alpha_pnl(alpha_id))
-                if d:
-                    self.store.save_pnl(alpha_id, d, v)
-            else:
-                d, v = cached
-            if not d:
-                reasons.append("no PnL available -- cannot verify correlation")
-            else:
-                corr, who = book.max_corr(d, v)
-                if corr > ag.max_self_corr:
-                    reasons.append(f"auto-tier: corr {corr:.2f} vs {who} "
-                                   f"> {ag.max_self_corr}")
+        # BRAIN's own SELF_CORRELATION, read live: the stricter auto-tier limit
+        # is applied to the platform's number, never to a local recomputation.
+        try:
+            body = self.c.alpha_check(alpha_id)
+            sc = check_value((body.get("is") or {}).get("checks")
+                             or body.get("checks") or [], "SELF_CORRELATION")
+        except Exception as e:
+            sc, why = None, f" ({e})"
         else:
-            reasons.append("no correlation book loaded -- refusing to "
-                           "auto-submit blind")
+            why = ""
+        if sc is None:
+            reasons.append(f"BRAIN reported no SELF_CORRELATION{why} -- refusing "
+                           f"to auto-submit blind")
+        elif sc > ag.max_self_corr:
+            reasons.append(f"auto-tier: SELF_CORRELATION {sc:.2f} (BRAIN, live) "
+                           f"> {ag.max_self_corr}")
 
         return (not reasons), {"alpha_id": alpha_id, "headroom": h,
                                "reasons": reasons, "metrics": {
                                    k: rec.get(k) for k in
                                    ("sharpe", "fitness", "turnover", "drawdown")}}
 
-    def auto_submit_batch(self, alpha_ids: list[str],
-                          book: CorrelationBook | None = None,
-                          *, live: bool = False) -> dict:
+    def auto_submit_batch(self, alpha_ids: list[str], *, live: bool = False,
+                          limit: int | None = None) -> dict:
         """Submit only the unambiguous ones; hand everything else back."""
         if not self.cfg.auto_submit:
             return {"enabled": False, "submitted": [], "queued_for_review": [],
@@ -379,6 +365,8 @@ class Submitter:
         out = {"enabled": True, "submitted": [], "queued_for_review": [],
                "rejected": []}
         budget = self.remaining_today()
+        if limit is not None:
+            budget = min(budget, limit)
         out["held_for_tomorrow"] = []
         sent = 0
         for aid in alpha_ids:
@@ -391,7 +379,7 @@ class Submitter:
                                  f"/{self.cfg.max_auto_submits_per_day} already "
                                  f"submitted this scoring day"]})
                 continue
-            ok, dossier = self.auto_eligible(aid, book=book)
+            ok, dossier = self.auto_eligible(aid)
             if not ok:
                 # "Not automatic" is not "not good" -- borderline alphas go to
                 # the human queue, they are not thrown away.
@@ -403,7 +391,7 @@ class Submitter:
                 dossier["reasons"] = [f"server check: {sc['fails']}"]
                 out["queued_for_review"].append(dossier)
                 continue
-            res = self.submit(aid, dry_run=not live, book=book)
+            res = self.submit(aid, dry_run=not live)
             if res.get("submitted") or (not live and res.get("ok")):
                 out["submitted"].append({**dossier, "live": live})
                 sent += 1
@@ -418,6 +406,51 @@ class Submitter:
             log.info("daily submit budget reached (%d since midnight ET)", used)
             return True
         return False
+
+
+def refused_submission(dossier: dict, err: Exception) -> dict:
+    """POST /submit raised. A 4xx is BRAIN refusing the alpha -- nothing was
+    submitted, so the next candidate may go. Anything else (a 5xx, the network)
+    leaves it unknown whether the alpha went in: PENDING, which stops a
+    fill-in-order run rather than risk spending a slot twice."""
+    msg = str(err)
+    refused = bool(re.match(r"submit \[4\d\d\]", msg))
+    dossier.update(ok=False, submitted=False, reason=msg[:300],
+                   final_status=None if refused else "UNKNOWN",
+                   verdict="REJECTED" if refused else "PENDING")
+    return dossier
+
+
+def submit_in_order(ids: list[str], want: int, try_one, *,
+                    budget_left=None) -> dict:
+    """Go down an ordered list of candidates until `want` are in.
+
+    BRAIN cannot say whether two unsubmitted candidates are twins, and nothing
+    here recomputes it. So the list is longer than the day's quota: each
+    candidate gets BRAIN's live /check in `try_one` (which sees every alpha sent
+    before it), and one that fails or is refused makes way for the next.
+
+    try_one(aid) -> dossier with `submitted` / `would_submit` / `verdict`.
+    budget_left() (optional) re-reads the platform's remaining slots first.
+    A PENDING verdict stops the run: BRAIN has not decided, and carrying on
+    could spend one slot more than intended.
+    """
+    out: dict = {"sent": [], "skipped": [], "unused": [], "pending": None}
+    for i, aid in enumerate(ids):
+        if len(out["sent"]) >= want or (budget_left is not None
+                                        and budget_left() <= 0):
+            out["unused"] = list(ids[i:])
+            break
+        d = try_one(aid)
+        if d.get("verdict") == "PENDING":
+            out["pending"] = d
+            out["unused"] = list(ids[i + 1:])
+            break
+        if d.get("submitted") or d.get("would_submit"):
+            out["sent"].append(d)
+        else:
+            out["skipped"].append(d)
+    return out
 
 
 def _et():

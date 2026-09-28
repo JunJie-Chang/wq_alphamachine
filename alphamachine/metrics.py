@@ -14,7 +14,8 @@ import math
 from dataclasses import dataclass, field as dc_field
 from typing import Any
 
-from .config import Gates, PLATFORM_CHECKS, fitness, subuniverse_floor
+from .config import (PYRAMID_MIN_ALPHAS, Gates, PLATFORM_CHECKS, fitness,
+                     subuniverse_floor)
 
 
 @dataclass
@@ -429,6 +430,44 @@ def headroom(rec: dict, g: Gates) -> float:
     if port is not None:
         slacks.append(port / max(g.min_portability_ratio, 1e-9))
     return min(slacks)
+
+
+def completed_pyramids(tally: list[dict], min_alphas: int = PYRAMID_MIN_ALPHAS
+                       ) -> list[str]:
+    """Pyramids BRAIN counts as formulated, from client.pyramid_tally() rows."""
+    return [r["name"] for r in tally or [] if (r.get("alphas") or 0) >= min_alphas]
+
+
+def tally_disagreement(tallies: list[list[dict]],
+                       min_alphas: int = PYRAMID_MIN_ALPHAS) -> str | None:
+    """None when every read of BRAIN's pyramid tally agreed; else a line naming
+    each answer, so a report never silently picks one of BRAIN's two stories."""
+    if len(tallies) < 2:
+        return None
+    alts = [f"{sum(r['alphas'] for r in t)} alphas / "
+            f"{len(completed_pyramids(t, min_alphas))} formulated" for t in tallies]
+    return ("BRAIN's pyramid tally disagreed between reads (" + " vs ".join(alts)
+            + "); showing the most frequent -- re-read later")
+
+
+def stale_note(measured_at: float | None, now: float | None = None) -> str:
+    """When BRAIN measured a value that drifts as new alphas join the book
+    (SELF / POWER_POOL / PROD correlation). The value is shown as BRAIN gave it,
+    never recomputed locally; this says how old it is so nobody mistakes it for
+    a live reading. The live /check right before a submit is what decides.
+    """
+    if not measured_at:
+        return "BRAIN, time unknown -- may have drifted"
+    import time as _t
+    age = max(0.0, (now if now is not None else _t.time()) - measured_at)
+    if age < 3600:
+        when = f"{int(age // 60)}m ago"
+    elif age < 86400:
+        when = f"{age / 3600:.0f}h ago"
+    else:
+        when = f"{age / 86400:.0f}d ago"
+    return (f"BRAIN, {when}" if age < 3600
+            else f"BRAIN, {when} -- may have drifted as alphas joined")
 
 
 def _f(x) -> float | None:
