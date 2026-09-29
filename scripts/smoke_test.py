@@ -2950,6 +2950,23 @@ check("pick: correlation BRAIN has not computed yet is 'pending' -- excluded, bu
       and not PK42.judge({"alpha_id": "A", "sharpe": 1.8}, _ck42(pp="PENDING", sc="FAIL"), 0)["pending"])
 check("pick: Sharpe under 1.0 is excluded",
       not PK42.judge({"alpha_id": "A", "sharpe": 0.9}, _ck42(), 0)["ok"])
+_CH = PK42.CHALLENGE_PYRAMIDS
+check("challenge score: one preferred pyramid scores 1, a non-preferred one dilutes it",
+      PK42.pyramid_score(["EUR/D1/PV"], _CH) == 1.0
+      and PK42.pyramid_score(["EUR/D1/PV", "EUR/D1/SENTIMENT"], _CH) == 0.5
+      and PK42.pyramid_score(["EUR/D1/OTHER"], _CH) == 0.0
+      and PK42.pyramid_score([], _CH) == 0.0)
+check("challenge list uses BRAIN's INSTITUTIONS spelling; 'challenge' and a custom list parse",
+      "USA/D1/INSTITUTIONS" in _CH and PK42.parse_prefer("challenge") == _CH
+      and PK42.parse_prefer("usa/d1/pv, EUR/D1/PV") == {"USA/D1/PV", "EUR/D1/PV"}
+      and PK42.parse_prefer(None) == frozenset())
+_jc = [{"alpha_id": "hi", "sharpe": 3.0, "ok": True, "pyramids": ["EUR/D1/OTHER"]},
+       {"alpha_id": "half", "sharpe": 2.5, "ok": True, "pyramids": ["EUR/D1/PV", "EUR/D1/SENTIMENT"]},
+       {"alpha_id": "full", "sharpe": 1.4, "ok": True, "pyramids": ["GLB/D1/MODEL"]}]
+_pc, _bc = PK42.order(_jc, 2, 1, _CH)
+check("with --prefer, the challenge score outranks Sharpe; without it, Sharpe alone",
+      [x["alpha_id"] for x in _pc + _bc] == ["full", "half", "hi"]
+      and [x["alpha_id"] for x in PK42.order(_jc, 3, 0)[0]] == ["hi", "half", "full"])
 _js = [{"alpha_id": a, "sharpe": sh, "ok": ok} for a, sh, ok in
        [("a", 1.5, True), ("b", 2.5, True), ("c", 3.0, False), ("d", 1.9, True), ("e", 1.2, True)]]
 _pk, _bk = PK42.order(_js, 2, 2)

@@ -1026,6 +1026,10 @@ python3 scripts/dedup_powerpool.py pp.json --against pp_active.json \
 #     --max-per-field 3 --max-per-dataset 6 --max-per-shape 15): the tight caps
 #     threw away good candidates (see below).
 python3 scripts/pick_powerpool.py --from-file pp_dedup_wide.json --top 40 --pick 4 --backups 4
+#     A pyramid challenge (2026-09-29..10-25: score = preferred pyramids matched / all
+#     matched, 10 alphas to qualify): --prefer challenge ranks by that score first and
+#     --min-score 1 skips diluted candidates before any /check call.
+python3 scripts/pick_powerpool.py --from-file pp_new.json --prefer challenge --min-score 1 --top 30
 
 # 3. deep-verify a small slice of the deduped list. The output order already
 #    spreads pyramids, so --top N is a spread, not just the N highest Sharpes.

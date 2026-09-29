@@ -20,6 +20,13 @@ two unsubmitted candidates are twins of each other; that shows only once one is
 live, and submit_powerpool.py's live /check before each submit catches it. A
 backup takes the slot of a pick it rejects.
 
+`--prefer A,B,...` (or `--prefer challenge`, the 2026-09-29..10-25 pyramid challenge)
+ranks by the challenge score first, Sharpe second. The score is the challenge's own rule
+applied to BRAIN's MATCHES_PYRAMID list: matched preferred pyramids / all matched
+pyramids, so an alpha in one preferred pyramid scores 1 and one that also touches a
+non-preferred pyramid is diluted (PV + SENTIMENT with only PV preferred = 0.5).
+`--min-score` drops lower scorers from the file BEFORE any /check call.
+
 A POWER_POOL_CORRELATION WARNING means BRAIN did not grant the 10%-Sharpe
 exception, and the submit would be refused, so WARNING is excluded, not waved
 through. The values drift as alphas join the book: each is shown with its age.
@@ -42,6 +49,28 @@ from alphamachine.metrics import (check_result, check_value, completed_pyramids,
 from check_powerpool import blocking_fails, pyramid_names, recency
 
 CORR_CHECKS = ("POWER_POOL_CORRELATION", "SELF_CORRELATION")
+
+# The pyramid challenge announced 2026-09-29 (runs 9/29-10/25 ET, 10 alphas to
+# qualify). Its list says "USA/D1/INSTITUTION"; BRAIN's name is INSTITUTIONS.
+CHALLENGE_PYRAMIDS = frozenset({
+    "USA/D1/MODEL", "EUR/D1/PV", "USA/D1/INSTITUTIONS", "GLB/D1/INSTITUTIONS",
+    "GLB/D1/RISK", "GLB/D1/MODEL", "GLB/D1/OTHER"})
+
+
+def pyramid_score(pyramids, preferred) -> float:
+    """Pure: share of an alpha's matched pyramids that are preferred (0 when none)."""
+    names = list(dict.fromkeys(pyramids or []))
+    if not names or not preferred:
+        return 0.0
+    return sum(1 for p in names if p in preferred) / len(names)
+
+
+def parse_prefer(spec: str | None) -> frozenset:
+    if not spec:
+        return frozenset()
+    if spec.strip().lower() == "challenge":
+        return CHALLENGE_PYRAMIDS
+    return frozenset(p.strip().upper() for p in spec.split(",") if p.strip())
 
 
 def judge(rec: dict, checks: list[dict], checked_at: float) -> dict:
@@ -67,9 +96,13 @@ def judge(rec: dict, checks: list[dict], checked_at: float) -> dict:
             "pending": bool(why) and all(w.endswith(" PENDING") for w in why)}
 
 
-def order(judged: list[dict], pick: int, backups: int) -> tuple[list[dict], list[dict]]:
-    """Pure: (picks, backups) among the ok ones, best Sharpe first."""
-    ok = sorted((j for j in judged if j["ok"]), key=lambda j: -j["sharpe"])
+def order(judged: list[dict], pick: int, backups: int,
+          preferred=frozenset()) -> tuple[list[dict], list[dict]]:
+    """Pure: (picks, backups) among the ok ones -- best preferred-pyramid score
+    first when `preferred` is given, then best Sharpe."""
+    for j in judged:
+        j["score"] = pyramid_score(j.get("pyramids"), preferred)
+    ok = sorted((j for j in judged if j["ok"]), key=lambda j: (-j["score"], -j["sharpe"]))
     return ok[:pick], ok[pick:pick + backups]
 
 
@@ -81,11 +114,23 @@ def main() -> int:
     ap.add_argument("--exclude", nargs="*", default=[])
     ap.add_argument("--pick", type=int, default=4)
     ap.add_argument("--backups", type=int, default=4)
+    ap.add_argument("--prefer", default=None,
+                    help="comma-separated pyramids to rank first, or 'challenge'")
+    ap.add_argument("--min-score", type=float, default=0.0,
+                    help="skip candidates whose screened pyramids score below this "
+                         "(needs --prefer); saves /check calls")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
+    preferred = parse_prefer(args.prefer)
 
     with open(args.from_file) as fh:
         recs = [r for r in json.load(fh) if r["alpha_id"] not in set(args.exclude)]
+    if preferred:
+        # screened MATCHES_PYRAMID (BRAIN's list) decides who is worth a /check
+        recs = [r for r in recs if r.get("eligible", True)
+                and pyramid_score(r.get("pyramids"), preferred) >= args.min_score]
+        recs.sort(key=lambda r: (-pyramid_score(r.get("pyramids"), preferred),
+                                 -(r.get("sharpe") or 0.0)))
     recs = recs[:args.top]
     if not recs:
         print("no candidates", file=sys.stderr)
@@ -116,7 +161,7 @@ def main() -> int:
         checks = (body.get("is") or {}).get("checks") or body.get("checks") or []
         judged.append(judge({"alpha_id": r["alpha_id"], "sharpe": r.get("sharpe")},
                             checks, time.time()))
-    picks, backups = order(judged, args.pick, args.backups)
+    picks, backups = order(judged, args.pick, args.backups, preferred)
     for p in picks + backups:
         al = client.alpha(p["alpha_id"])
         p["tagged_and_described"] = ("PowerPoolSelected" in (al.get("tags") or [])
@@ -138,7 +183,8 @@ def main() -> int:
 
     def show(i, p):
         print(f"  {i}. {p['alpha_id']}  sharpe={p['sharpe']:.2f}  "
-              f"PP corr={p['pp_corr']}  SELF corr={p['self_corr']}  "
+              + (f"score={p['score']:.2f}  " if preferred else "")
+              + f"PP corr={p['pp_corr']}  SELF corr={p['self_corr']}  "
               f"[{stale_note(p['checked_at'])}]  "
               f"{'TAGGED+described' if p['tagged_and_described'] else 'NEEDS tag + description'}")
         print(f"       matches {p['pyramids']} (which of these BRAIN credits is its call)")
