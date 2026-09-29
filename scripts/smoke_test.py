@@ -306,6 +306,39 @@ check("...and no value from BRAIN (missing, or the call failed) refuses rather t
       any("blind" in r for r in _ae11([]))
       and any("blind" in r for r in _ae11(RuntimeError("boom"))))
 
+import submit_powerpool as _SP11
+from alphamachine.metrics import Verdict as _V11
+_SP11.platform_verdict = lambda rec: _V11(True)       # only the live check is under test
+class _FCK11:
+    def __init__(self, check): self.check = check; self.posted = []
+    def alpha(self, aid): return {"id": aid, "is": {"sharpe": 2.0, "checks": []}}
+    def alpha_check(self, aid):
+        if isinstance(self.check, Exception): raise self.check
+        return {"is": {"checks": self.check}}
+    def submit(self, aid): self.posted.append(aid)
+for _lbl, _ck in (("a timed-out", RuntimeError("timed out waiting for /check")), ("an empty", [])):
+    _fk = _FCK11(_ck)
+    _rp = _SP11.submit_as_power_pool(_fk, None, "Z", dry_run=False)
+    check(f"PP submit: {_lbl} live check is a skip before any POST, not a crash or a pass",
+          _rp["ok"] is False and _rp["submitted"] is False and not _fk.posted
+          and "unavailable" in _rp["reason"], str(_rp))
+class _FSC11:
+    def __init__(self, check): self.check = check
+    def alpha_check(self, aid):
+        if isinstance(self.check, Exception): raise self.check
+        return {"is": {"checks": self.check}}
+_sub11 = _S11(_RC11(), None, _FSC11(RuntimeError("timed out")))
+_sub11._daily_budget_spent = lambda: False
+_sub11.vet = lambda aid: {"alpha_id": aid, "ok": True}
+_d11 = _sub11.submit("Z", dry_run=False)
+check("regular submit: a timed-out live check is a skip, never a crash",
+      _d11["ok"] is False and _d11["submitted"] is False
+      and "unavailable" in _d11["server_check"]["fails"][0])
+_sub11.c = _FSC11([])
+_d11 = _sub11.submit("Z", dry_run=True)
+check("regular submit: an empty live check is not a pass",
+      _d11["ok"] is False and not _d11.get("would_submit"))
+
 print("\n[12] session lifetime: read expiry, refresh EARLY, halt on persona")
 import time as _t, base64 as _b64, threading as _th, requests as _rq
 from alphamachine.client import BrainClient

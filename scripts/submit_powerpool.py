@@ -67,8 +67,19 @@ def submit_as_power_pool(client: BrainClient, store: Store, alpha_id: str,
     # Live, uncached -- the stored `is.checks` can be stale; POWER_POOL_CORRELATION
     # and the others must be re-verified against BRAIN's current state right
     # before submitting, same principle as submit.py's server_check().
-    body = client.alpha_check(alpha_id)
+    # Nothing has been sent yet, so a check that cannot be read is a skip: the
+    # next candidate may take the slot. An empty list is BRAIN still computing,
+    # never "nothing failed".
+    try:
+        body = client.alpha_check(alpha_id)
+    except Exception as e:
+        body, err = {}, str(e)
+    else:
+        err = "BRAIN returned no checks (still computing)"
     checks = (body.get("is") or {}).get("checks") or body.get("checks") or []
+    if not checks:
+        report.update(ok=False, submitted=False, reason=f"live check unavailable: {err}")
+        return report
     fails = failed_checks(checks)
     report["server_check"] = {"ok": not fails, "fails": fails}
     if fails:

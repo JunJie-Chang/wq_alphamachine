@@ -176,7 +176,14 @@ class Submitter:
             dossier["submitted"] = False
             return dossier
 
-        sc = self.server_check(alpha_id)
+        # Before any POST, so an unreadable check is a skip, never a guess.
+        try:
+            sc = self.server_check(alpha_id)
+        except Exception as e:
+            sc = {"checks": [], "fails": [f"live check unavailable: {e}"], "ok": False}
+        if not sc["checks"] and sc["ok"]:
+            sc = {"checks": [], "fails": ["live check unavailable: BRAIN returned "
+                                          "no checks (still computing)"], "ok": False}
         dossier["server_check"] = sc
         if not sc["ok"]:
             dossier["ok"] = False
