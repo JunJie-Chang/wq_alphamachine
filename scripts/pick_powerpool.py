@@ -157,10 +157,17 @@ def main() -> int:
         except Exception as e:
             judged.append({"alpha_id": r["alpha_id"], "sharpe": r.get("sharpe") or 0.0,
                            "ok": False, "why": [f"check unavailable ({e})"]})
+            print(f"  [{len(judged)}/{len(recs)}] {r['alpha_id']}: check unavailable ({e})",
+                  file=sys.stderr, flush=True)
             continue
         checks = (body.get("is") or {}).get("checks") or body.get("checks") or []
         judged.append(judge({"alpha_id": r["alpha_id"], "sharpe": r.get("sharpe")},
                             checks, time.time()))
+        # One line per candidate as it lands: /check can take minutes each, and a
+        # run cut off by a timeout must not lose what it already learned.
+        j = judged[-1]
+        print(f"  [{len(judged)}/{len(recs)}] {j['alpha_id']}: "
+              f"{'ok' if j['ok'] else '; '.join(j['why'][:2])}", file=sys.stderr, flush=True)
     picks, backups = order(judged, args.pick, args.backups, preferred)
     for p in picks + backups:
         al = client.alpha(p["alpha_id"])
